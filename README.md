@@ -122,7 +122,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `/` | Search; `Esc` ends it |
 | `J` / `K` | Reading: the next / previous message |
 | `Space` / `b` | Reading: a page down / up |
-| `o` / `A` | Reading: the links (`Enter` open, `y` copy) / attachments (`Enter` open, `s` save) |
+| `o` / `A` | Reading: links (`Enter` open, `y` copy) / attachments (`Enter` open, `v` all with viewer, `s` save) |
 | `H` | Reading: HTML or plain text |
 | `U` | Unsubscribe from a mailing list |
 | `R` | Check for mail now |
@@ -307,11 +307,19 @@ Each rule matches the final filename extension, without the dot and ignoring
 case (`pdf` also matches `report.PDF`). With no matching rule, tuimail uses the
 system's usual app. Saving with `s` is unchanged.
 
+With a configured viewer, `v` opens all attachments in this message that share
+the selected file's complete rule: the same command, arguments and `terminal`
+value, even across different extensions. They go to one viewer process, in
+message order; the viewer must accept multiple filenames. For example, matching
+`png` and `jpg` rules with `command = ["rview"]` and `terminal = true` let rview
+browse all those pictures together. Without a matching rule, `Enter` uses the
+system's app for one file; the batch action is unavailable.
+
 `command` is the program followed by its arguments. Use a full program path or
-a name found on `PATH`; the saved attachment's full path is appended as one
-literal argument. No shell runs it: quotes, `$VARIABLES`, `~` and placeholders
-aren't expanded. A missing or failing terminal viewer is reported in tuimail,
-not retried through the system opener.
+a name found on `PATH`; each saved attachment's full path is appended as a
+separate literal argument. No shell runs it: quotes, `$VARIABLES`, `~` and
+placeholders aren't expanded. A missing or failing terminal viewer is reported
+in tuimail, not retried through the system opener.
 
 `terminal = true` gives the viewer the screen and keyboard until it exits,
 then restores tuimail, as `Ctrl-e` does for the editor. Returning from either
@@ -319,8 +327,9 @@ program repaints the screen without requesting the terminal's cursor position.
 pdfterm needs a terminal with Kitty graphics support, such as Ghostty or Kitty.
 Leave `terminal` out (or set it to `false`) for a graphical viewer that runs
 detached without terminal input or output. Files still open from tuimail's private
-`opened/` folder, and risky file types still ask before opening, regardless of
-their viewer.
+`opened/` folder. If any file in a batch is risky, tuimail asks before opening
+any of them, regardless of their viewer. If any file can't be extracted, the
+viewer is not started.
 
 ## AI agents (MCP)
 

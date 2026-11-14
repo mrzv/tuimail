@@ -604,15 +604,35 @@ fn extract(part: &MessagePart) -> File {
     }
 }
 
-/// The bytes of attachment `index`, and its safe file name.
-pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
+/// Takes the listed attachments in message order from one parse, checking
+/// each name before decoding it. `take` saves or copies one file at a time,
+/// so opening a batch needn't hold every decoded file in memory.
+pub fn attachments<T>(
+    raw: &[u8],
+    listed: &[(u32, String)],
+    mut take: impl FnMut(&str, &[u8]) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
     read(raw, |message| {
-        let part = attachment_parts(message, &bodies(message)).nth(index as usize)?;
-        let file = extract(&part);
-        Some((file.name, file.bytes))
+        let body = bodies(message);
+        let mut parts = attachment_parts(message, &body).enumerate();
+        listed
+            .iter()
+            .map(|(index, listed)| {
+                let (_, part) = parts
+                    .find(|(i, _)| *i == *index as usize)
+                    .ok_or("That attachment can't be read")?;
+                let name = part_name(&part, &mime_of(&part));
+                if name != *listed {
+                    return Err(
+                        "The message changed since its files were listed: open it again".into(),
+                    );
+                }
+                take(&name, &part.decoded())
+            })
+            .collect()
     })
     .flatten()
-    .flatten()
+    .unwrap_or_else(|| Err("That attachment can't be read".into()))
 }
 
 /// A file name from a sender, made safe to save under: no folders, no
@@ -1506,7 +1526,12 @@ see https://example.com/menu. Thanks!\r\n\
 --b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\nPGh0bWw+PC9odG1sPg==\r\n--b--\r\n";
         let listed = parse(raw).unwrap().attachments[0].name.clone();
         assert_eq!(listed, "image.png");
-        assert_eq!(attachment(raw, 0).unwrap().0, listed);
+        attachments(raw, &[(0, listed)], |name, bytes| {
+            assert_eq!(name, "image.png");
+            assert_eq!(bytes, b"<html></html>");
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1533,11 +1558,11 @@ Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\naGVs
         assert_eq!(a.name, "invoicefdp.exe");
         assert_eq!(a.mime, "application/pdf");
         assert_eq!(a.size, 5);
-        let (name, data) = attachment(raw, 0).unwrap();
-        assert_eq!(
-            (name.as_str(), data.as_slice()),
-            ("invoicefdp.exe", &b"hello"[..])
-        );
+        attachments(raw, &[(0, a.name.clone())], |name, bytes| {
+            assert_eq!((name, bytes), ("invoicefdp.exe", &b"hello"[..]));
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1892,7 +1917,15 @@ Content-Disposition: attachment; filename=\"print.html\"\r\n\r\n<p>print</p>\r\n
         let parsed = parse(raw).unwrap();
         assert_eq!(parsed.attachments.len(), 1, "{:?}", parsed.attachments);
         assert_eq!(parsed.attachments[0].mime, "text/html");
-        assert_eq!(attachment(raw, 0).unwrap().1, b"<p>two</p>");
+        attachments(
+            raw,
+            &[(0, parsed.attachments[0].name.clone())],
+            |_, bytes| {
+                assert_eq!(bytes, b"<p>two</p>");
+                Ok(())
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2051,8 +2084,10 @@ Content-Type: multipart/alternative; boundary=x\r\n\r\n\
             if let Some(Some(last)) = all.get(parsed.attachments.len().wrapping_sub(1)) {
                 let index = parsed.attachments.len() as u32 - 1;
                 assert_eq!(
-                    attachment(raw, index),
-                    Some((last.name.clone(), last.bytes.clone()))
+                    attachments(raw, &[(index, last.name.clone())], |name, bytes| {
+                        Ok((name.to_owned(), bytes.to_vec()))
+                    }),
+                    Ok(vec![(last.name.clone(), last.bytes.clone())])
                 );
             }
         }

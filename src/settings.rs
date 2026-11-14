@@ -64,10 +64,10 @@ pub struct Settings {
     pub attachment_openers: BTreeMap<String, AttachmentOpener>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentOpener {
-    /// Program and arguments; the saved file's full path is appended.
+    /// Program and arguments; saved files' full paths are appended.
     pub command: Vec<String>,
     /// Give the program the terminal and wait for it to exit.
     #[serde(default)]

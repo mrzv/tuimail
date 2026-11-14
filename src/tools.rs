@@ -113,9 +113,9 @@ pub fn open_externally(target: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// An attachment opener with the file as one literal, absolute argument.
+/// An attachment opener with each file as a literal, absolute argument.
 /// Like the system opener, it runs from home, not beside untrusted files.
-pub fn attachment_command(argv: &[String], path: &Path) -> Result<Command> {
+pub fn attachment_command(argv: &[String], paths: &[PathBuf]) -> Result<Command> {
     let name = argv
         .first()
         .filter(|name| !name.is_empty())
@@ -129,7 +129,7 @@ pub fn attachment_command(argv: &[String], path: &Path) -> Result<Command> {
     let mut command = Command::new(program);
     command
         .args(&argv[1..])
-        .arg(path)
+        .args(paths)
         .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
     Ok(command)
 }
@@ -491,8 +491,12 @@ mod tests {
     #[test]
     fn attachment_openers_receive_literal_arguments_and_report_foreground_failure() {
         let dir = private_temp_dir().unwrap();
-        let path = dir.join("report $(echo unsafe); two.PDF");
-        std::fs::write(&path, b"attachment bytes\n").unwrap();
+        let paths = [
+            dir.join("report $(echo unsafe); two.PDF"),
+            dir.join("second file.txt"),
+        ];
+        std::fs::write(&paths[0], b"attachment bytes\n").unwrap();
+        std::fs::write(&paths[1], b"second attachment\n").unwrap();
         let literal = "--title=$(echo unsafe); *";
         for terminal in [true, false] {
             let output = dir.join(if terminal { "foreground" } else { "detached" });
@@ -500,12 +504,12 @@ mod tests {
             let argv = vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "cat \"$2\" > \"$0\"; printf '%s' \"$1\" >> \"$0\"; mv \"$0\" \"$0.done\"; exit 7"
+                "cat \"$2\" \"$3\" > \"$0\"; printf '%s' \"$1\" >> \"$0\"; mv \"$0\" \"$0.done\"; exit 7"
                     .into(),
                 output.to_string_lossy().into_owned(),
                 literal.into(),
             ];
-            let result = open_attachment(attachment_command(&argv, &path).unwrap(), terminal);
+            let result = open_attachment(attachment_command(&argv, &paths).unwrap(), terminal);
             assert_eq!(
                 result.is_err(),
                 terminal,
@@ -517,11 +521,11 @@ mod tests {
             }
             assert_eq!(
                 std::fs::read_to_string(&done).unwrap(),
-                format!("attachment bytes\n{literal}")
+                format!("attachment bytes\nsecond attachment\n{literal}")
             );
         }
-        assert!(attachment_command(&[], &path).is_err());
-        assert!(attachment_command(&["./untrusted-viewer".into()], &path).is_err());
+        assert!(attachment_command(&[], &paths).is_err());
+        assert!(attachment_command(&["./untrusted-viewer".into()], &paths).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -531,7 +535,7 @@ mod tests {
         const CHILD: &str = "TUIMAIL_TEST_FOREGROUND_INTERRUPT";
         if std::env::var_os(CHILD).is_some() {
             let argv = ["/bin/sh".into(), "-c".into(), "kill -INT 0".into()];
-            let command = attachment_command(&argv, Path::new("/attachment.pdf")).unwrap();
+            let command = attachment_command(&argv, &[PathBuf::from("/attachment.pdf")]).unwrap();
             assert!(open_attachment(command, true).is_err());
             return;
         }

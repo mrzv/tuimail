@@ -632,11 +632,11 @@ mod tests {
         };
         let id = new_message_id("me@example.org").unwrap();
         let built = build(&draft, &me(), &id, 0, false).unwrap();
-        let (name, bytes) = mail::attachment(&built.raw, 0).unwrap();
-        assert_eq!(
-            (name.as_str(), bytes.as_slice()),
-            ("report.pdf", &b"REPORT"[..])
-        );
+        mail::attachments(&built.raw, &[(0, "report.pdf".into())], |name, bytes| {
+            assert_eq!((name, bytes), ("report.pdf", &b"REPORT"[..]));
+            Ok(())
+        })
+        .unwrap();
         // Not a plain file: refused, without waiting.
         assert!(Attachment::snapshot(&dir).is_err());
         #[cfg(unix)]

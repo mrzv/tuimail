@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::imap::FlagKind;
 use crate::mail::{self, Addr, Body, Parsed};
 use crate::notify::{self, Notifications, Notifier};
 use crate::secrets::{Credentials, Secret};
-use crate::settings::Settings;
+use crate::settings::{AttachmentOpener, Settings};
 use crate::setup::{self, Setup};
 use crate::store::{self, Change, Changed, Flags, Folder, Known, Message, Role, Store, What};
 use crate::theme::{self, Colors};
@@ -104,12 +104,14 @@ pub enum AppEvent {
         /// Attachments listed that a forward couldn't read, so lacks.
         lost: usize,
     },
-    /// An attachment taken out of its message: saved, or to open.
+    /// Attachments taken out of a message: saved, or to open together.
     Extracted {
         open: bool,
-        /// The user said yes to opening it.
+        /// The user said yes to opening these files.
         confirmed: bool,
-        result: Result<PathBuf, String>,
+        /// A batch keeps the viewer its files were grouped by.
+        opener: Option<AttachmentOpener>,
+        result: Result<Vec<PathBuf>, String>,
     },
     /// The start of messages' text, for the list, made in the background.
     Previews {
@@ -553,9 +555,9 @@ pub enum Confirm {
     /// Esc in a composer with something written: `y` saves a draft, `n`
     /// discards it.
     CloseComposer,
-    OpenAttachment {
-        index: u32,
-        name: String,
+    OpenAttachments {
+        files: Vec<(u32, String)>,
+        opener: Option<AttachmentOpener>,
     },
     RemoveAccount(usize),
     /// `U`'s web page, shown before it opens.
@@ -1421,24 +1423,30 @@ impl App {
             AppEvent::Extracted {
                 open,
                 confirmed,
+                opener,
                 result,
             } => match result {
-                // What's opened without a yes is checked again, by the name
-                // it was saved under.
-                Ok(path)
+                Ok(paths) => {
+                    // Recheck every saved name before opening any of them.
                     if open
                         && !confirmed
-                        && !path
-                            .file_name()
-                            .is_some_and(|n| tools::safe_to_open(&n.to_string_lossy())) =>
-                {
-                    self.error(format!(
-                        "Not opened: {} is a kind of file that asks first",
-                        crate::config::shown(&path)
-                    ))
+                        && let Some(path) = paths.iter().find(|path| {
+                            !path
+                                .file_name()
+                                .is_some_and(|n| tools::safe_to_open(&n.to_string_lossy()))
+                        })
+                    {
+                        return self.error(format!(
+                            "Not opened: {} is a kind of file that asks first",
+                            crate::config::shown(path)
+                        ));
+                    }
+                    if open {
+                        self.open_attachments(&paths, opener.as_ref());
+                    } else if let Some(path) = paths.first() {
+                        self.info(format!("Saved {}", crate::config::shown(path)));
+                    }
                 }
-                Ok(path) if open => self.open_attachment(path),
-                Ok(path) => self.info(format!("Saved {}", crate::config::shown(&path))),
                 Err(e) => self.error(e),
             },
             AppEvent::Previews { account, previews } => {
@@ -4756,18 +4764,64 @@ impl App {
         });
     }
 
-    /// Saves attachment `index` of the reader's message to the downloads
-    /// folder; with `open`, into tuimail's own folder and opens it.
-    /// Saves or opens attachment `index`, which was listed as `listed`;
-    /// `confirmed` when the user said yes to opening it.
-    fn extract(&mut self, index: u32, listed: &str, open: bool, confirmed: bool) {
+    /// The configured viewer of an attachment picker row, if any.
+    pub fn attachment_opener(&self, index: usize) -> Option<&AttachmentOpener> {
+        let attachment = self
+            .reader
+            .as_ref()?
+            .parsed
+            .as_ref()?
+            .attachments
+            .get(index)?;
+        self.settings.attachment_opener(Path::new(&attachment.name))
+    }
+
+    /// Opens one attachment, or every file sharing its complete viewer rule.
+    fn view_attachments(&mut self, index: usize, all: bool) {
+        let Some(parsed) = self.reader.as_ref().and_then(|r| r.parsed.as_ref()) else {
+            return;
+        };
+        let Some(attachment) = parsed.attachments.get(index) else {
+            return;
+        };
+        let opener = self.attachment_opener(index);
+        if all && opener.is_none() {
+            return self.info("No viewer configured for this file");
+        }
+        let files = if all {
+            parsed
+                .attachments
+                .iter()
+                .filter(|a| self.settings.attachment_opener(Path::new(&a.name)) == opener)
+                .map(|a| (a.index, a.name.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(attachment.index, attachment.name.clone())]
+        };
+        let opener = if all { opener.cloned() } else { None };
+        self.picker = None;
+        if files.iter().any(|(_, name)| !tools::safe_to_open(name)) {
+            self.confirm(Confirm::OpenAttachments { files, opener });
+        } else {
+            self.extract(files, true, false, opener);
+        }
+    }
+
+    /// Saves the listed files from one parse, opening them only once the
+    /// whole batch is ready. A viewer keeps its files in our private folder.
+    fn extract(
+        &mut self,
+        files: Vec<(u32, String)>,
+        open: bool,
+        confirmed: bool,
+        opener: Option<AttachmentOpener>,
+    ) {
         let Some(raw) = self.reader.as_ref().and_then(|r| r.raw.clone()) else {
             return;
         };
         if self.demo {
             return self.info("The demo's files are made up: nothing is saved");
         }
-        let listed = listed.to_string();
         let dir = if open {
             self.data_dir.as_ref().map(|d| d.join("opened"))
         } else {
@@ -4779,33 +4833,29 @@ impl App {
         let tx = self.tx.clone();
         mail::in_background(
             move || {
-                let (name, bytes) =
-                    mail::attachment(&raw, index).ok_or("That attachment can't be read")?;
-                // The message under the reader may have been fetched again
-                // since its files were listed: the file is the one shown, or
-                // nothing.
-                if name != listed {
-                    return Err(
-                        "The message changed since its files were listed: open it again"
-                            .to_string(),
-                    );
-                }
-                tools::save_new(&dir, &name, &bytes).map_err(|e| format!("{e:#}"))
+                mail::attachments(&raw, &files, |name, bytes| {
+                    tools::save_new(&dir, name, bytes).map_err(|e| format!("{e:#}"))
+                })
             },
             move |result| {
                 let result = result.unwrap_or_else(|| Err("That attachment can't be read".into()));
                 let _ = tx.send(AppEvent::Extracted {
                     open,
                     confirmed,
+                    opener,
                     result,
                 });
             },
         );
     }
 
-    fn open_attachment(&mut self, path: PathBuf) {
-        let result = if let Some(opener) = self.settings.attachment_opener(&path) {
-            tools::attachment_command(&opener.command, &path).and_then(|command| {
+    fn open_attachments(&mut self, paths: &[PathBuf], opener: Option<&AttachmentOpener>) {
+        let Some(path) = paths.first() else {
+            return;
+        };
+        let result = if let Some(opener) = opener.or_else(|| self.settings.attachment_opener(path))
+        {
+            tools::attachment_command(&opener.command, paths).and_then(|command| {
                 if opener.terminal {
                     self.terminal_requests
                         .push_back(TerminalRequest::Attachment(command));
@@ -5421,6 +5471,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => picker.selected = 0,
             KeyCode::Char('G') | KeyCode::End => picker.selected = last,
+            KeyCode::Char('v') if picker.kind == PickerKind::Attachments => {
+                let n = picker.selected;
+                self.view_attachments(n, true);
+            }
             KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('y') => {
                 let Some(picker) = self.picker.take() else {
                     return;
@@ -5490,25 +5544,15 @@ impl App {
                             }
                         }
                     }
-                    (PickerKind::Attachments, code) => {
+                    (PickerKind::Attachments, KeyCode::Enter) => self.view_attachments(n, false),
+                    (PickerKind::Attachments, KeyCode::Char('s')) => {
                         let attachment = self
                             .reader
                             .as_ref()
                             .and_then(|r| r.parsed.as_ref())
                             .and_then(|p| p.attachments.get(n).cloned());
                         if let Some(a) = attachment {
-                            if code == KeyCode::Char('s') {
-                                self.extract(a.index, &a.name, false, false);
-                            } else if code == KeyCode::Enter {
-                                if tools::safe_to_open(&a.name) {
-                                    self.extract(a.index, &a.name, true, false);
-                                } else {
-                                    self.confirm(Confirm::OpenAttachment {
-                                        index: a.index,
-                                        name: a.name,
-                                    });
-                                }
-                            }
+                            self.extract(vec![(a.index, a.name)], false, false, None);
                         }
                     }
                     _ => {}
@@ -5601,8 +5645,8 @@ impl App {
                 self.composer = None;
                 self.info("Discarded");
             }
-            Confirm::OpenAttachment { index, name } if yes => {
-                self.extract(index, &name, true, true)
+            Confirm::OpenAttachments { files, opener } if yes => {
+                self.extract(files, true, true, opener)
             }
             Confirm::OpenLink { url } if yes => self.open_link(&url),
             Confirm::RemoveAccount(i) if yes => self.remove_account(i),
@@ -7497,13 +7541,167 @@ pub mod tests {
 --b\r\nContent-Type: text/plain\r\n\r\nx\r\n\
 --b\r\nContent-Type: application/octet-stream; name=\"run.desktop\"\r\n\r\nx\r\n--b--\r\n";
         app.reader.as_mut().unwrap().raw = Some(Arc::new(other.to_vec()));
-        app.extract(0, "photo.jpg", true, false);
+        app.extract(vec![(0, "photo.jpg".into())], true, false, None);
         app.wait_until(|a| a.status.as_ref().is_some_and(|s| s.error))
             .await;
         let status = app.status.as_ref().unwrap().text.clone();
         assert!(status.contains("changed"), "{status}");
         assert!(!dir.join("opened").join("run.desktop").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn reader_files(app: &mut App, files: &[(&str, &str)]) {
+        let mut raw = String::from(
+            "From: a@b.c\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n",
+        );
+        for (name, bytes) in files {
+            raw.push_str(&format!(
+                "--b\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=\"{name}\"\r\n\r\n{bytes}\r\n"
+            ));
+        }
+        raw.push_str("--b--\r\n");
+        let reader = app.reader.as_mut().unwrap();
+        reader.parsed = Some(Arc::new(mail::parse(raw.as_bytes()).unwrap()));
+        reader.raw = Some(Arc::new(raw.into_bytes()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_batches_match_the_whole_viewer_and_enter_still_opens_one() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        reader_files(
+            &mut app,
+            &[
+                ("report $(echo unsafe); two.PDF", "one"),
+                ("other.csv", "different arguments"),
+                ("report $(echo unsafe); two.PDF", "two"),
+                ("notes.txt", "three"),
+                ("other.html", "different terminal mode"),
+                ("unknown.bin", "no viewer"),
+            ],
+        );
+        let dir = tools::private_temp_dir().unwrap();
+        app.data_dir = Some(dir.clone());
+        app.demo = false;
+        let output = dir.join("viewer-output");
+        let viewer = AttachmentOpener {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'call\\n' >> \"$0\"; for path do printf '%s\\n' \"$path\" >> \"$0\"; cat \"$path\" >> \"$0\"; printf '\\n' >> \"$0\"; done".into(),
+                output.to_string_lossy().into_owned(),
+            ],
+            terminal: true,
+        };
+        // No rule means no batch fallback to the operating system.
+        app.on_key(key(KeyCode::Char('A')));
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.picker.is_some());
+        assert!(!dir.join("opened").exists());
+
+        for extension in ["pdf", "txt"] {
+            app.settings
+                .attachment_openers
+                .insert(extension.into(), viewer.clone());
+        }
+        let mut different = viewer.clone();
+        different.command.push("another argument".into());
+        app.settings
+            .attachment_openers
+            .insert("csv".into(), different);
+        let mut different = viewer;
+        different.terminal = false;
+        app.settings
+            .attachment_openers
+            .insert("html".into(), different);
+
+        for (code, expected) in [
+            (KeyCode::Char('v'), &["one", "two", "three"][..]),
+            (KeyCode::Enter, &["one"][..]),
+        ] {
+            let before = std::fs::read_to_string(&output).unwrap_or_default();
+            app.pick_attachment();
+            app.status = None;
+            app.on_key(key(code));
+            app.wait_until(|a| {
+                !a.terminal_requests.is_empty() || a.status.as_ref().is_some_and(|s| s.error)
+            })
+            .await;
+            while let Some(request) = app.terminal_requests.pop_front() {
+                let TerminalRequest::Attachment(command) = request else {
+                    panic!("an attachment viewer was expected");
+                };
+                tools::open_attachment(command, true).unwrap();
+            }
+            let after = std::fs::read_to_string(&output).unwrap();
+            let mut lines = after.strip_prefix(&before).unwrap().lines();
+            assert_eq!(lines.next(), Some("call"), "one process for the selection");
+            for bytes in expected {
+                let path = Path::new(lines.next().unwrap());
+                assert!(path.is_absolute());
+                assert_eq!(path.parent(), Some(dir.join("opened").as_path()));
+                assert_eq!(lines.next(), Some(*bytes));
+            }
+            assert_eq!(lines.next(), None, "no other files or viewer invocations");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_batches_ask_if_any_member_is_risky_and_cancel_opens_nothing() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        reader_files(&mut app, &[("safe.pdf", "one"), ("risky.desktop", "two")]);
+        let dir = tools::private_temp_dir().unwrap();
+        app.data_dir = Some(dir.clone());
+        app.demo = false;
+        let output = dir.join("viewer-output");
+        let viewer = AttachmentOpener {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat \"$@\" > \"$0\"".into(),
+                output.to_string_lossy().into_owned(),
+            ],
+            terminal: true,
+        };
+        for extension in ["pdf", "desktop"] {
+            app.settings
+                .attachment_openers
+                .insert(extension.into(), viewer.clone());
+        }
+        app.pick_attachment();
+        app.on_key(key(KeyCode::Char('v')));
+        let shown = crate::ui::tests::screen(&mut app, 100, 24);
+        assert!(shown.contains("risky.desktop"), "{shown}");
+        assert!(!dir.join("opened").exists());
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(!output.exists());
+        assert!(!dir.join("opened").exists());
+
+        app.pick_attachment();
+        app.on_key(key(KeyCode::Char('v')));
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('y')));
+        app.wait_until(|a| {
+            !a.terminal_requests.is_empty() || a.status.as_ref().is_some_and(|s| s.error)
+        })
+        .await;
+        while let Some(request) = app.terminal_requests.pop_front() {
+            let TerminalRequest::Attachment(command) = request else {
+                panic!("an attachment viewer was expected");
+            };
+            tools::open_attachment(command, true).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "onetwo");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
