@@ -129,6 +129,11 @@ pub enum AppEvent {
     Quit,
 }
 
+enum TerminalRequest {
+    Editor,
+    Attachment(std::process::Command),
+}
+
 /// A message held on to for later (the one being replied to, the saved
 /// draft being replaced): its account by id, so switching From or removing
 /// another account can't point it at someone else's mail, and what its
@@ -606,8 +611,8 @@ pub struct App {
     pending_g: bool,
     pub quit: bool,
     pub demo: bool,
-    /// The editor to open, run by the event loop (it has the terminal).
-    edit_request: bool,
+    /// Foreground programs waiting for the event loop to release the terminal.
+    terminal_requests: VecDeque<TerminalRequest>,
     clipboard: Option<arboard::Clipboard>,
     /// Tests read the app's own events here.
     #[cfg(test)]
@@ -767,7 +772,7 @@ impl App {
             pending_g: false,
             quit: false,
             demo,
-            edit_request: false,
+            terminal_requests: VecDeque::new(),
             clipboard: None,
             #[cfg(test)]
             test_rx: None,
@@ -875,11 +880,20 @@ impl App {
             if self.quit {
                 break;
             }
-            if std::mem::take(&mut self.edit_request) {
-                // The editor gets the terminal: key reading stops, the screen
-                // goes back to normal, and both come back after.
+            if let Some(request) = self.terminal_requests.pop_front() {
+                // Only one program reads keys or draws on the terminal at a time.
                 drop(keys);
-                self.run_editor();
+                let _ =
+                    crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+                ratatui::restore();
+                match request {
+                    TerminalRequest::Editor => self.run_editor(),
+                    TerminalRequest::Attachment(command) => {
+                        if let Err(e) = tools::open_attachment(command, true) {
+                            self.error(format!("Couldn't open it: {e:#}"));
+                        }
+                    }
+                }
                 *terminal = ratatui::init();
                 let _ =
                     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
@@ -1213,11 +1227,7 @@ impl App {
                         crate::config::shown(&path)
                     ))
                 }
-                Ok(path) if open => {
-                    if let Err(e) = tools::open_externally(&path.to_string_lossy()) {
-                        self.error(format!("Couldn't open it: {e}"));
-                    }
-                }
+                Ok(path) if open => self.open_attachment(path),
                 Ok(path) => self.info(format!("Saved {}", crate::config::shown(&path))),
                 Err(e) => self.error(e),
             },
@@ -4074,7 +4084,7 @@ impl App {
             composer::Action::Attach => {
                 self.prompt = Some(Prompt::new(PromptKind::Attach, ""));
             }
-            composer::Action::Edit => self.edit_request = true,
+            composer::Action::Edit => self.terminal_requests.push_back(TerminalRequest::Editor),
             composer::Action::SwitchAccount(by) => {
                 let n = self.accounts.len() as isize;
                 if n > 1 {
@@ -4102,8 +4112,6 @@ impl App {
                 Err(e) => return self.error(format!("{e:#}")),
             },
         };
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-        ratatui::restore();
         let result = tools::edit(&argv, &dir, &composer.draft().body);
         if temporary {
             let _ = std::fs::remove_dir(&dir);
@@ -4511,6 +4519,25 @@ impl App {
                 });
             },
         );
+    }
+
+    fn open_attachment(&mut self, path: PathBuf) {
+        let result = if let Some(opener) = self.settings.attachment_opener(&path) {
+            tools::attachment_command(&opener.command, &path).and_then(|command| {
+                if opener.terminal {
+                    self.terminal_requests
+                        .push_back(TerminalRequest::Attachment(command));
+                    Ok(())
+                } else {
+                    tools::open_attachment(command, false)
+                }
+            })
+        } else {
+            tools::open_externally(&path.to_string_lossy()).map_err(Into::into)
+        };
+        if let Err(e) = result {
+            self.error(format!("Couldn't open it: {e:#}"));
+        }
     }
 
     /// Opens a web link in the browser; a `mailto:` one is written here,

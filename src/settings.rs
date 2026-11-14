@@ -1,6 +1,7 @@
 //! User settings, kept in `settings.toml` in the data directory. Accounts
 //! are in `accounts.toml` beside it (`account.rs`).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,18 @@ pub struct Settings {
     /// program as a full path: `["/usr/bin/vim"]`. Default: `$VISUAL` or
     /// `$EDITOR` found on `PATH`, else vi.
     pub editor: Vec<String>,
+    /// Programs to open attachments, by their final file extension.
+    pub attachment_openers: BTreeMap<String, AttachmentOpener>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentOpener {
+    /// Program and arguments; the saved file's full path is appended.
+    pub command: Vec<String>,
+    /// Give the program the terminal and wait for it to exit.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 impl Default for Settings {
@@ -81,6 +94,7 @@ impl Default for Settings {
             agents: false,
             confirm_agents: true,
             editor: Vec::new(),
+            attachment_openers: BTreeMap::new(),
         }
     }
 }
@@ -148,6 +162,14 @@ impl Settings {
             .or_else(dirs::home_dir)
     }
 
+    pub fn attachment_opener(&self, path: &Path) -> Option<&AttachmentOpener> {
+        let extension = path.extension()?.to_str()?;
+        self.attachment_openers
+            .iter()
+            .find(|(ext, _)| ext.eq_ignore_ascii_case(extension))
+            .map(|(_, opener)| opener)
+    }
+
     /// Sets one setting in settings.toml, as the file is now: whatever was
     /// written there since tuimail started (by hand, or by another tuimail)
     /// stays. A file that no longer reads is left alone. Returns the
@@ -196,7 +218,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 17] = [
+const KNOWN: [&str; 18] = [
     "theme",
     "icons",
     "notifications",
@@ -214,6 +236,7 @@ const KNOWN: [&str; 17] = [
     "agents",
     "confirm_agents",
     "editor",
+    "attachment_openers",
 ];
 
 pub fn path(data_dir: &Path) -> PathBuf {
@@ -229,9 +252,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tuimail-save-one-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = path(&dir);
-        std::fs::write(&file, "mark_read = false\nmark_raed = 1\n").unwrap();
+        std::fs::write(
+            &file,
+            "mark_read = false\nmark_raed = 1\n\
+             [attachment_openers.pdf]\ncommand = [\"pdfterm\"]\nterminal = true\n",
+        )
+        .unwrap();
         let saved = Settings::save_one(&file, "prefer_plain", true.into()).unwrap();
         assert!(!saved.mark_read && saved.prefer_plain);
+        let opener = saved.attachment_opener(Path::new("report.PDF")).unwrap();
+        assert_eq!(opener.command, ["pdfterm"]);
+        assert!(opener.terminal);
         let (loaded, unknown) = Settings::load_checked(&file).unwrap();
         assert_eq!(loaded, saved);
         assert_eq!(
@@ -253,6 +284,22 @@ mod tests {
             "mark_read = \"no\""
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attachment_openers_match_only_the_last_extension_ignoring_case() {
+        let settings: Settings =
+            toml::from_str("[attachment_openers.PDF]\ncommand = [\"pdfterm\"]\nterminal = true\n")
+                .unwrap();
+        for name in ["report.pdf", "report (1).PdF", "report.part.PDF"] {
+            assert_eq!(
+                settings.attachment_opener(Path::new(name)),
+                settings.attachment_openers.get("PDF")
+            );
+        }
+        for name in ["report.pdf.exe", "pdf", ".pdf", "report"] {
+            assert!(settings.attachment_opener(Path::new(name)).is_none());
+        }
     }
 
     #[test]
