@@ -12,7 +12,7 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 
-**[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Settings](#settings)** · **[AI agents](#ai-agents-mcp)** · **[Privacy](#privacy-and-security)**
+**[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Google Contacts](#google-contacts)** · **[Settings](#settings)** · **[AI agents](#ai-agents-mcp)** · **[Privacy](#privacy-and-security)**
 
 <img src="docs/hero.png" alt="tuimail: a sidebar with All inboxes and two accounts' folders, beside the work inbox's messages with stars, replies and attachments marked, and Alice's message 'Lunch tomorrow?' open in the reader: its sender, the attached menu, an underlined link and quotes colored by depth">
 
@@ -182,6 +182,37 @@ password_command = ["/opt/homebrew/bin/pass", "show", "mail/work"]
 
 The program is given by its full path and run without a shell; tuimail uses the first line it prints. It runs once at start with your terminal, so it can ask you to unlock something.
 
+### Google Contacts
+
+An existing Google mail account can read its personal contacts through CardDAV for To/Cc/Bcc completion, offline command-line lookup, and read-only MCP tools. Nothing edits Google Contacts.
+
+**App-password compatibility is experimental.** Google's [CardDAV documentation](https://developers.google.com/people/carddav) specifies OAuth2. App passwords work for some accounts, but Google may refuse them even when mail still works. There is no automatic OAuth fallback; a Contacts failure preserves the cache and never invalidates your mail login.
+
+In the Google account's `[[account]]` table in `accounts.toml`, add:
+
+```toml
+contacts = "google_carddav"
+```
+
+This explicitly allows Contacts to reuse that account's mail app password. It requires `auth = "password"` (the default), `imap.gmail.com` or `pop.gmail.com`, and `smtp.gmail.com`, with email and both login names identifying the same Google account. Passwords still come from the keychain, your password command, or the TUI prompt; do not put one in this setting.
+
+Restart tuimail after editing the account. Contacts sync at startup and during mail checks once 30 minutes have elapsed; `R` forces a refresh. If a password was unavailable at startup, enter it in tuimail and press `R` to retry. All valid email addresses become suggestions, deduplicated by address. The sending account's contact names take precedence; learned correspondents remain a separate source.
+
+```sh
+tuimail contacts sync --account you@gmail.com
+tuimail contacts list --account you@gmail.com --json
+tuimail contacts search "Alice" --account you@gmail.com --json
+tuimail contacts get "CONTACT_ID_FROM_LIST" --account you@gmail.com --json
+```
+
+Output defaults to JSON. List/search accept `--limit` (1–100, default 50) and `--offset`, returning `contacts`, `more`, `limit`, and `offset`. Each result contains `account`, `synced_at` (Unix seconds), and `contact` with its opaque ID, name, email addresses, phone numbers, organization, and ETag. Raw vCards stay in the local cache and are omitted from JSON/MCP.
+
+List/search/get work offline without a running TUI, keychain access, or executing password commands. Only `contacts sync` connects: it uses a saved keychain password or the configured password command. With `password = "ask"`, sync inside the TUI instead. `tuimail contacts --help` lists all options; no command accepts a plaintext password argument.
+
+With [AI agents enabled](#ai-agents-mcp), `list_contacts`, `search_contacts`, and `get_contact` read the running TUI's cache through its normal permissions. They cannot synchronize or change contacts.
+
+Complete updates and their sync checkpoint commit together. A failed or partial download preserves the last successful cache; an older concurrent sync cannot overwrite a newer one. `contacts = "none"` stops synchronization but keeps the offline cache. Removing an account in tuimail clears its cached contacts. Google Other Contacts, Workspace directories, groups/labels, contact editing, and an address-book panel are not included.
+
 ### Signing in with Microsoft or Google (OAuth2)
 
 Outlook.com takes only OAuth2, Microsoft 365 is moving to it, and Gmail takes it as well as app passwords. tuimail signs in itself: add the account with `+` and leave the password empty, and `Ctrl-s` opens your browser on Microsoft's or Google's sign-in page. Once you've signed in there, the browser comes back to tuimail (on this computer only), and tuimail keeps the sign-in in your keychain: a token that lasts, never your password. If the sign-in is taken back (your password changed, the app was removed from your account), tuimail says so, and `P` on the account's row signs in again.
@@ -306,6 +337,8 @@ risky file types still ask before opening, regardless of their viewer.
 
 **What agents can do:** list accounts and folders, search what tuimail has on your computer, read a message (its links, wherever they are, shown only by their site), mark read or unread, star, tag, move to a folder of yours, mark spam or not (to Junk and back), move to Trash, and undo their own changes.
 
+For accounts with [Google Contacts](#google-contacts), agents can also list, search, and get cached personal contacts through three read-only tools. Contact data sent to an agent reaches its AI provider just like mail does.
+
 **What they can't:** delete anything for good (mail already in Trash stays there, and an account without a Trash folder takes nothing), move mail into Drafts or Sent, see or touch other users' or shared folders, send, reply or forward, open links or unsubscribe, read attachments, make filters, change settings, or touch passwords. There are no tools for these; tuimail refuses them whatever an agent asks.
 
 **You stay in charge:**
@@ -344,7 +377,7 @@ Everything is in one folder on your machine (`tuimail --help` prints its path):
 | Linux | `~/.local/share/tuimail` |
 | Windows | `%LOCALAPPDATA%\tuimail` |
 
-It holds `accounts.toml`, `settings.toml`, and `tuimail.db`: the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, and the addresses used for completing To, Cc and Bcc. Attachments you open go to its `opened/` folder. Passwords aren't in it: they're in your system's keychain. Deleting the folder starts tuimail afresh; remove the accounts with `x` first to take their passwords out of the keychain too.
+It holds `accounts.toml`, `settings.toml`, and `tuimail.db`: the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, the addresses used for completing To, Cc and Bcc, and any synchronized Google contacts. Attachments you open go to its `opened/` folder. Passwords aren't in it: they're in your system's keychain. Deleting the folder starts tuimail afresh; remove the accounts with `x` first to take their passwords out of the keychain too.
 
 | Variable | Use |
 | --- | --- |

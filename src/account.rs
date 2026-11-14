@@ -61,6 +61,22 @@ pub enum PasswordFrom {
     Command,
 }
 
+/// Optional address-book synchronization, separate from mail transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Contacts {
+    #[default]
+    None,
+    /// Reuse this Google mail account's app password for read-only CardDAV.
+    GoogleCarddav,
+}
+
+impl Contacts {
+    fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Account {
@@ -79,6 +95,9 @@ pub struct Account {
     pub username: String,
     pub auth: Auth,
     pub password: PasswordFrom,
+    /// Explicitly opt in before a mail password is used for contacts.
+    #[serde(skip_serializing_if = "Contacts::is_none")]
+    pub contacts: Contacts,
     /// A program and its arguments that print the password or token:
     /// `["/opt/homebrew/bin/pass", "show", "mail/work"]`. The program as a
     /// full path; no shell runs it.
@@ -128,6 +147,7 @@ impl Default for Account {
             username: String::new(),
             auth: Auth::Password,
             password: PasswordFrom::Keychain,
+            contacts: Contacts::None,
             password_command: Vec::new(),
             oauth_client_id: String::new(),
             oauth_client_secret: String::new(),
@@ -304,6 +324,39 @@ impl Account {
         }
         None
     }
+
+    /// A contacts-only problem must not disable an otherwise usable mailbox.
+    /// Check the provider and identity before requesting its mail password.
+    pub fn contacts_problem(&self) -> Option<String> {
+        if self.contacts == Contacts::None {
+            return None;
+        }
+        if self.auth != Auth::Password {
+            return Some(
+                "Google CardDAV contacts need this account's app password, not an OAuth token"
+                    .into(),
+            );
+        }
+        let incoming = match self.protocol {
+            Protocol::Imap => "imap.gmail.com",
+            Protocol::Pop3 => "pop.gmail.com",
+        };
+        if !self.host.trim().eq_ignore_ascii_case(incoming)
+            || !self.smtp_host.trim().eq_ignore_ascii_case("smtp.gmail.com")
+        {
+            return Some(format!(
+                "Google CardDAV contacts reuse only a Google mail account's password ({incoming} and smtp.gmail.com)"
+            ));
+        }
+        let email = self.email.trim();
+        if !valid_address(email)
+            || !self.username().eq_ignore_ascii_case(email)
+            || !self.smtp_username().eq_ignore_ascii_case(email)
+        {
+            return Some("Google CardDAV contacts require email, username and smtp_username to identify the same Google account".into());
+        }
+        None
+    }
 }
 
 /// Whether `host` is this computer.
@@ -385,6 +438,12 @@ pub fn load(path: &Path) -> Result<(Vec<Account>, Vec<String>)> {
                 text::one_line(&account.email, 60)
             ));
         } else {
+            if let Some(problem) = account.contacts_problem() {
+                warnings.push(format!(
+                    "{}: contacts are disabled: {problem}; mail is still enabled",
+                    account.shown_name()
+                ));
+            }
             accounts.push(account);
         }
     }
@@ -420,6 +479,7 @@ fn unknown_keys(text: &str) -> Vec<String> {
                 "certificate",
                 "oauth_client_id",
                 "oauth_client_secret",
+                "contacts",
             ];
             if !known.contains(key) && !optional.contains(&key.as_str()) {
                 unknown.push(format!(
@@ -671,6 +731,57 @@ mod tests {
         let (outlook, _) = guess("me@outlook.com", Protocol::Imap);
         assert_eq!(outlook.auth, Auth::Oauth2);
         assert_eq!(outlook.smtp_port(), 587);
+    }
+
+    #[test]
+    fn google_contacts_require_opt_in_and_the_google_accounts_password() {
+        let mut gmail = guess("me@gmail.com", Protocol::Imap).0;
+        assert_eq!(gmail.contacts, Contacts::None);
+        assert!(!toml::to_string(&gmail).unwrap().contains("contacts"));
+        gmail.contacts = Contacts::GoogleCarddav;
+        assert_eq!(gmail.contacts_problem(), None);
+        let saved = toml::to_string(&gmail).unwrap();
+        assert_eq!(
+            toml::from_str::<Account>(&saved).unwrap().contacts,
+            Contacts::GoogleCarddav
+        );
+        assert!(unknown_keys(&format!("[[account]]\n{saved}")).is_empty());
+        gmail.email = "me@workspace.example".into();
+        assert_eq!(gmail.contacts_problem(), None);
+        gmail.auth = Auth::Oauth2;
+        assert!(gmail.contacts_problem().is_some());
+        gmail.auth = Auth::Password;
+        gmail.username = "someone-else@workspace.example".into();
+        assert!(gmail.contacts_problem().is_some());
+        gmail.username.clear();
+        gmail.smtp_username = "other@workspace.example".into();
+        assert!(gmail.contacts_problem().is_some());
+        gmail.smtp_username.clear();
+        gmail.host = "imap.gmail.com.example.org".into();
+        assert!(gmail.contacts_problem().is_some());
+        gmail.host = "imap.gmail.com".into();
+        gmail.smtp_host = "smtp.example.org".into();
+        assert!(gmail.contacts_problem().is_some());
+        let mut pop = guess("me@gmail.com", Protocol::Pop3).0;
+        pop.contacts = Contacts::GoogleCarddav;
+        assert_eq!(pop.contacts_problem(), None);
+    }
+
+    #[test]
+    fn invalid_contacts_configuration_does_not_disable_mail() {
+        let dir = dir("contacts-configuration");
+        let file = path(&dir);
+        let account = Account {
+            contacts: Contacts::GoogleCarddav,
+            ..guess("me@example.org", Protocol::Imap).0
+        };
+        assert_eq!(account.problem(), None);
+        assert!(account.contacts_problem().is_some());
+        save(&file, &account).unwrap();
+        let (loaded, warnings) = load(&file).unwrap();
+        assert_eq!(loaded, vec![account]);
+        assert_eq!(warnings.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

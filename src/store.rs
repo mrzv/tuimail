@@ -7,11 +7,15 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::config;
 use crate::mail::{self, Addr, Summary};
 use crate::{tags, text};
+
+#[path = "store_contacts.rs"]
+mod contact_cache;
+pub use contact_cache::CachedContact;
 
 pub struct Store {
     db: Connection,
@@ -276,8 +280,40 @@ CREATE TABLE IF NOT EXISTS addresses (
     addr TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     used INTEGER NOT NULL DEFAULT 0,
-    last INTEGER NOT NULL DEFAULT 0
+    last INTEGER NOT NULL DEFAULT 0,
+    normalized_addr TEXT NOT NULL DEFAULT '',
+    name_fold TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS contact_sources (
+    account TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    address_book TEXT NOT NULL,
+    sync_token TEXT NOT NULL,
+    discovered_at INTEGER NOT NULL,
+    last_sync INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS contacts (
+    account TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    name_fold TEXT NOT NULL,
+    phones TEXT NOT NULL,
+    organization TEXT NOT NULL,
+    search_text TEXT NOT NULL,
+    etag TEXT NOT NULL,
+    vcard TEXT NOT NULL,
+    PRIMARY KEY (account, id)
+);
+CREATE TABLE IF NOT EXISTS contact_emails (
+    account TEXT NOT NULL,
+    contact_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    normalized_email TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (account, contact_id, normalized_email)
+);
+CREATE INDEX IF NOT EXISTS contact_emails_by_address
+    ON contact_emails(normalized_email, account);
 ";
 
 const MESSAGE_COLUMNS: &str = "folder, uid, message_id, in_reply_to, refs, date, from_name, \
@@ -370,6 +406,7 @@ impl Store {
                 ))?;
             }
         }
+        Self::migrate_contact_addresses(db)?;
         Ok(())
     }
 
@@ -1018,48 +1055,38 @@ impl Store {
             if !crate::account::valid_address(&a.addr) {
                 continue;
             }
+            let name = text::one_line(&a.name, mail::MAX_NAME);
+            let normalized = a.addr.to_lowercase();
             self.db.execute(
-                "INSERT INTO addresses (addr, name, used, last) VALUES (lower(?1), ?2, ?3, ?4)
+                "INSERT INTO addresses (addr, name, used, last, normalized_addr, name_fold)
+                 VALUES (COALESCE(
+                     (SELECT addr FROM addresses WHERE normalized_addr=?5
+                      ORDER BY used DESC,(name<>'') DESC,last DESC,addr LIMIT 1), lower(?6)),
+                     ?1,?2,?3,?5,?4)
                  ON CONFLICT(addr) DO UPDATE SET
                      name = CASE
                          WHEN excluded.name = '' THEN addresses.name
                          WHEN addresses.name = '' THEN excluded.name
                          WHEN excluded.used = 1 AND addresses.used = 0 THEN excluded.name
                          ELSE addresses.name END,
-                     used = addresses.used + excluded.used, last = MAX(addresses.last, excluded.last)",
-                params![a.addr, a.name, i64::from(used), now],
+                     name_fold = CASE
+                         WHEN excluded.name = '' THEN addresses.name_fold
+                         WHEN addresses.name = '' THEN excluded.name_fold
+                         WHEN excluded.used = 1 AND addresses.used = 0 THEN excluded.name_fold
+                         ELSE addresses.name_fold END,
+                     used = addresses.used + excluded.used,
+                     last = MAX(addresses.last, excluded.last)",
+                params![
+                    name,
+                    i64::from(used),
+                    now,
+                    name.to_lowercase(),
+                    normalized,
+                    a.addr
+                ],
             )?;
         }
         Ok(())
-    }
-
-    /// Known addresses starting with `prefix` (or whose name has a word
-    /// starting with it), the most written to first.
-    pub fn complete(&self, prefix: &str, limit: usize) -> Result<Vec<Addr>> {
-        let prefix = prefix.trim().to_lowercase();
-        if prefix.is_empty() {
-            return Ok(Vec::new());
-        }
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let mut stmt = self.db.prepare(
-            "SELECT name, addr FROM addresses
-             WHERE addr LIKE ?1 ESCAPE '\\' OR lower(name) LIKE ?1 ESCAPE '\\'
-                OR lower(name) LIKE ?2 ESCAPE '\\'
-             ORDER BY used DESC, last DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            params![format!("{escaped}%"), format!("% {escaped}%"), limit as i64],
-            |r| {
-                Ok(Addr {
-                    name: text::one_line(&r.get::<_, String>(0)?, mail::MAX_NAME),
-                    addr: text::one_line(&r.get::<_, String>(1)?, mail::MAX_NAME),
-                })
-            },
-        )?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // Changes.
@@ -1277,6 +1304,28 @@ impl Store {
 
     /// Forgets everything about an account: it was removed.
     pub fn forget_account(&self, account: &str) -> Result<()> {
+        // Keep a generation tombstone even if the first sync is still
+        // running in another process, so its result cannot revive this account.
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM contact_sources WHERE account=?1",
+                [account],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let revision = revision
+            .checked_add(1)
+            .context("contacts revision overflow")?;
+        tx.execute(
+            "INSERT INTO contact_sources
+                 (account,revision,address_book,sync_token,discovered_at,last_sync)
+             VALUES (?1,?2,'','',0,0)
+             ON CONFLICT(account) DO UPDATE SET revision=excluded.revision,
+                 address_book='',sync_token='',discovered_at=0,last_sync=0",
+            params![account, revision],
+        )?;
         for table in [
             "folders",
             "messages",
@@ -1286,16 +1335,19 @@ impl Store {
             "pending_deletes",
             "changed",
             "local_uids",
+            "contact_emails",
+            "contacts",
         ] {
-            self.db.execute(
+            tx.execute(
                 &format!("DELETE FROM {table} WHERE account = ?1"),
                 params![account],
             )?;
         }
-        self.db.execute(
+        tx.execute(
             "DELETE FROM changes WHERE id NOT IN (SELECT change_id FROM changed)",
             [],
         )?;
+        tx.commit()?;
         self.scrub();
         Ok(())
     }
@@ -1694,7 +1746,7 @@ Hi,\r\n\r\nthe numbers are in.\r\n> old quote\r\n-- \r\nAlice\r\n";
             addr: "bob@example.org".into(),
         };
         store.remember(&[spoofed], false, 3).unwrap();
-        assert_eq!(store.complete("bob", 5).unwrap()[0].name, "Bob");
+        assert_eq!(store.complete_for("", "bob", 5).unwrap()[0].name, "Bob");
         // Nor a name sent on: Alice, written to, keeps hers when a reply-all
         // carries another sender's name for her.
         let renamed = Addr {
@@ -1702,11 +1754,17 @@ Hi,\r\n\r\nthe numbers are in.\r\n> old quote\r\n-- \r\nAlice\r\n";
             addr: "alice@example.com".into(),
         };
         store.remember(&[renamed], true, 4).unwrap();
-        assert_eq!(store.complete("riv", 5).unwrap()[0].name, "Alice Rivera");
-        let found = store.complete("riv", 5).unwrap();
+        assert_eq!(
+            store.complete_for("", "riv", 5).unwrap()[0].name,
+            "Alice Rivera"
+        );
+        let found = store.complete_for("", "riv", 5).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addr, "alice@example.com");
-        assert_eq!(store.complete("b", 5).unwrap()[0].addr, "bob@example.org");
-        assert!(store.complete("", 5).unwrap().is_empty());
+        assert_eq!(
+            store.complete_for("", "b", 5).unwrap()[0].addr,
+            "bob@example.org"
+        );
+        assert!(store.complete_for("", "", 5).unwrap().is_empty());
     }
 }

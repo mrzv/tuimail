@@ -4,6 +4,8 @@ mod app;
 mod compose;
 mod composer;
 mod config;
+mod contacts;
+mod contacts_cli;
 mod demo;
 mod icons;
 mod imap;
@@ -65,6 +67,7 @@ async fn run() -> Result<()> {
         None => {}
         Some("--check") => check = true,
         Some("--demo") => return demo::run().await,
+        Some("contacts") => return contacts_cli::run(args.collect()).await,
         // An agent's: stdout is the agent's, for MCP only.
         Some("mcp") => {
             let demo = match args.next().as_deref() {
@@ -249,6 +252,7 @@ keys or vim keys.
 
 Usage: tuimail [-h | --help] [-V | --version] [--check] [--demo]
        tuimail mcp [--demo]
+       tuimail contacts <sync | list | search | get> [options]
 
 Inside the app, ? lists the keys and q quits. The first start asks for
 an account: your address and password, the servers filled in for the
@@ -262,6 +266,10 @@ tag, move and move to Trash; each change shows, can be undone with z,
 and asks you first unless you turn that off. Nothing is deleted or sent.
 tuimail mcp --demo reaches tuimail --demo instead, to try it on made-up
 mail.
+
+tuimail contacts reads your cached Google contacts as JSON; only its sync
+command connects to Google. See tuimail contacts --help for setup and
+account, search and pagination options.
 
 Passwords are kept in the system's keychain (or asked for each start,
 or printed by a command of yours: see the README). Accounts, settings

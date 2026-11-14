@@ -15,7 +15,7 @@ use ratatui::DefaultTerminal;
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::account::{self, Account, PasswordFrom, Protocol};
+use crate::account::{self, Account, Contacts, PasswordFrom, Protocol};
 use crate::agent::{self, Call};
 use crate::compose::{self, Draft};
 use crate::composer::{self, Composer, Kind};
@@ -29,7 +29,7 @@ use crate::setup::{self, Setup};
 use crate::store::{self, Change, Changed, Flags, Folder, Known, Message, Role, Store, What};
 use crate::theme::{self, Colors};
 use crate::worker::{self, Endpoints, Request, State, Worker};
-use crate::{net, tags, text, tools};
+use crate::{contacts, net, tags, text, tools};
 
 /// The longest search or path typed or pasted, in characters.
 const MAX_PROMPT: usize = 4096;
@@ -60,6 +60,8 @@ const AGENT_GRACE: Duration = Duration::from_millis(1500);
 const HELP_PAGE: isize = 5;
 /// Every this many checks, each folder's counts are asked for too.
 const FOLDERS_EVERY: u32 = 4;
+/// Address books change less often than inboxes; R still asks at once.
+const CONTACTS_EVERY: Duration = Duration::from_secs(30 * 60);
 
 pub enum AppEvent {
     /// An AI agent's request (`agent.rs`), answered on `reply`.
@@ -71,6 +73,11 @@ pub enum AppEvent {
     Worker {
         account: String,
         event: worker::Event,
+    },
+    ContactsSynced {
+        account: String,
+        generation: u64,
+        result: Result<contacts::SyncBatch, String>,
     },
     /// The SMTP server took the message, or didn't.
     Sent {
@@ -212,6 +219,8 @@ pub struct AccountState {
     pub id: String,
     pub worker: Option<Worker>,
     pub state: State,
+    contacts_last_check: Option<Instant>,
+    contacts_sync: Option<ContactSync>,
     pub folders: Vec<Folder>,
     pub expanded: bool,
     /// Folders a check is running for.
@@ -231,6 +240,21 @@ pub struct AccountState {
     password_put_off: bool,
     /// Changes (moves, flags, deletes) not yet made on the server.
     waiting: std::cell::Cell<usize>,
+}
+
+/// A result belongs to one account instance and one cache revision.
+struct ContactSync {
+    generation: u64,
+    revision: i64,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ContactSync {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 impl AccountState {
@@ -533,6 +557,8 @@ pub struct App {
     pub colors: Colors,
     pub icons: Icons,
     pub accounts: Vec<AccountState>,
+    /// Never reused when an account is removed and added again.
+    next_contacts_sync: u64,
     tx: UnboundedSender<AppEvent>,
     /// The system's keychain can be used.
     keychain: bool,
@@ -723,6 +749,7 @@ impl App {
             colors,
             icons,
             accounts: Vec::new(),
+            next_contacts_sync: 0,
             tx,
             keychain,
             place: Place::AllInboxes,
@@ -845,6 +872,8 @@ impl App {
             id,
             worker,
             state,
+            contacts_last_check: None,
+            contacts_sync: None,
             folders,
             expanded: true,
             syncing: HashSet::new(),
@@ -1030,6 +1059,7 @@ impl App {
         if self.demo {
             return;
         }
+        self.maybe_sync_contacts(i, all);
         self.accounts[i].last_check = Some(Instant::now());
         if self.accounts[i].is_pop() {
             self.pop_check(i);
@@ -1049,6 +1079,112 @@ impl App {
             self.sync_folder(i, &folder);
         }
         self.sync_sent(i);
+    }
+
+    /// A CardDAV refusal never invalidates otherwise working mail credentials.
+    fn maybe_sync_contacts(&mut self, i: usize, force: bool) {
+        if self.demo
+            || self.accounts[i].account.contacts == Contacts::None
+            || self.accounts[i].contacts_sync.is_some()
+            || (!force
+                && self.accounts[i]
+                    .contacts_last_check
+                    .is_some_and(|at| at.elapsed() < CONTACTS_EVERY))
+        {
+            return;
+        }
+        self.accounts[i].contacts_last_check = Some(Instant::now());
+        if let Some(problem) = self.accounts[i].account.contacts_problem() {
+            self.contacts_failed(i, problem);
+            return;
+        }
+        let Some(creds) = self.accounts[i].worker.as_ref().map(|w| w.creds.clone()) else {
+            self.contacts_failed(i, "The mail account has no credentials available".into());
+            return;
+        };
+        let (revision, state) = match self.store.contact_sync_state(&self.accounts[i].id) {
+            Ok(state) => state,
+            Err(e) => {
+                self.contacts_failed(i, format!("Cannot read the contacts cache: {e:#}"));
+                return;
+            }
+        };
+        let Some(generation) = self.next_contacts_sync.checked_add(1) else {
+            self.contacts_failed(i, "Restart tuimail before syncing contacts again".into());
+            return;
+        };
+        self.next_contacts_sync = generation;
+        let account = self.accounts[i].id.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            let result = async {
+                let password = creds.get().await?;
+                contacts::sync_google(&account, &password, state).await
+            }
+            .await;
+            let _ = tx.send(AppEvent::ContactsSynced {
+                account,
+                generation,
+                result: result.map_err(|e: anyhow::Error| text::one_line(&format!("{e:#}"), 300)),
+            });
+        });
+        self.accounts[i].contacts_sync = Some(ContactSync {
+            generation,
+            revision,
+            task: Some(task),
+        });
+    }
+
+    fn contacts_failed(&mut self, i: usize, error: String) {
+        let error = text::one_line(&error, 300);
+        self.error(format!(
+            "{}: contacts: {error}; cached contacts are kept",
+            self.account_name(i)
+        ));
+    }
+
+    fn on_contacts_synced(
+        &mut self,
+        account: &str,
+        generation: u64,
+        result: Result<contacts::SyncBatch, String>,
+    ) {
+        let Some(i) = self.account_index(account) else {
+            return;
+        };
+        let Some(flight) = self.accounts[i].contacts_sync.as_ref() else {
+            return;
+        };
+        if flight.generation != generation {
+            return;
+        }
+        let revision = flight.revision;
+        self.accounts[i].contacts_sync = None;
+        if self.accounts[i].account.contacts == Contacts::None {
+            return;
+        }
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(e) => return self.contacts_failed(i, e),
+        };
+        match self
+            .store
+            .apply_contact_sync(account, revision, &batch, now())
+        {
+            Ok(applied) => {
+                if !applied {
+                    // A concurrent CLI sync committed a newer snapshot.
+                    self.accounts[i].contacts_last_check = None;
+                }
+                if let Some(composer) = self.composer.as_mut() {
+                    composer.complete_from(&self.accounts[composer.account].id, &self.store);
+                }
+                if applied {
+                    self.info(format!("{}: contacts synced", self.account_name(i)));
+                }
+            }
+            Err(e) => self.contacts_failed(i, format!("Cannot save contacts: {e:#}")),
+        }
     }
 
     fn pop_check(&mut self, i: usize) {
@@ -1145,6 +1281,11 @@ impl App {
                     self.on_worker(i, event);
                 }
             }
+            AppEvent::ContactsSynced {
+                account,
+                generation,
+                result,
+            } => self.on_contacts_synced(&account, generation, result),
             AppEvent::Sent {
                 account,
                 result,
@@ -1197,6 +1338,7 @@ impl App {
                         ""
                     };
                     let mut composer = Composer::new(account, kind, draft);
+                    composer.complete_from(&self.accounts[account].id, &self.store);
                     composer.replying = replying;
                     composer.draft_of = draft_of;
                     self.composer = Some(composer);
@@ -2958,6 +3100,16 @@ impl App {
             Call::ListAccounts(_) => Ok(self.agent_accounts()),
             Call::ListFolders(args) => self.agent_folders(&args.account),
             Call::SearchMessages(args) => self.agent_search(&args),
+            Call::ListContacts(args) => {
+                self.agent_contacts(args.account.as_deref(), None, args.limit, args.offset)
+            }
+            Call::SearchContacts(args) => self.agent_contacts(
+                args.account.as_deref(),
+                Some(&args.query),
+                args.limit,
+                args.offset,
+            ),
+            Call::GetContact(args) => self.agent_contact(&args.account, &args.id),
             Call::ListChanges(args) => Ok(self.agent_changes(args.limit)),
             Call::ReadMessage(args) => return self.agent_read(args, reply),
             _ => Err("That isn't something tuimail does".into()),
@@ -3284,12 +3436,27 @@ impl App {
     /// The account an agent names, by its name or address.
     fn agent_account(&self, name: &str) -> Result<usize, String> {
         let name = name.trim();
-        self.accounts
+        if let Some(i) = self
+            .accounts
             .iter()
-            .position(|a| {
-                a.id.eq_ignore_ascii_case(name) || a.account.shown_name().eq_ignore_ascii_case(name)
-            })
-            .ok_or_else(|| format!("There's no account {name:?}: see list_accounts"))
+            .position(|a| a.id.eq_ignore_ascii_case(name))
+        {
+            return Ok(i);
+        }
+        let mut matches = self
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.account.shown_name().eq_ignore_ascii_case(name));
+        let Some((i, _)) = matches.next() else {
+            return Err(format!("There's no account {name:?}: see list_accounts"));
+        };
+        if matches.next().is_some() {
+            return Err(format!(
+                "More than one account is named {name:?}: use its email address"
+            ));
+        }
+        Ok(i)
     }
 
     /// A folder of account `i` an agent names: by its role, server name or
@@ -3488,6 +3655,48 @@ impl App {
             })
             .collect();
         Ok(serde_json::json!(folders))
+    }
+
+    fn agent_contacts(
+        &self,
+        account: Option<&str>,
+        query: Option<&str>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> agent::Answer {
+        let account = account
+            .map(|name| {
+                self.agent_account(name)
+                    .map(|i| self.accounts[i].id.as_str())
+            })
+            .transpose()?;
+        let limit = limit
+            .unwrap_or(agent::CONTACT_RESULTS)
+            .clamp(1, agent::MAX_CONTACT_RESULTS);
+        let offset = offset.unwrap_or(0);
+        if i64::try_from(offset).is_err() {
+            return Err("The contacts offset is too large".into());
+        }
+        let query = query.map(|q| text::one_line(q, MAX_PROMPT));
+        let mut contacts = self
+            .store
+            .cached_contacts(account, query.as_deref(), limit + 1, offset)
+            .map_err(|e| format!("Cannot read cached contacts: {e:#}"))?;
+        let more = contacts.len() > limit;
+        contacts.truncate(limit);
+        Ok(
+            serde_json::json!({ "contacts": contacts, "more": more, "limit": limit, "offset": offset }),
+        )
+    }
+
+    fn agent_contact(&self, account: &str, id: &str) -> agent::Answer {
+        let i = self.agent_account(account)?;
+        let contact = self
+            .store
+            .get_cached_contact(&self.accounts[i].id, id)
+            .map_err(|e| format!("Cannot read cached contacts: {e:#}"))?
+            .ok_or_else(|| "That contact is not in this account's cache".to_string())?;
+        Ok(serde_json::json!(contact))
     }
 
     fn agent_search(&self, args: &agent::SearchArgs) -> agent::Answer {
@@ -3966,7 +4175,9 @@ impl App {
         // A reply waiting for its message is given up: it won't open later
         // over this one.
         self.pending = None;
-        self.composer = Some(Composer::new(account, Kind::New, draft));
+        let mut composer = Composer::new(account, Kind::New, draft);
+        composer.complete_from(&self.accounts[account].id, &self.store);
+        self.composer = Some(composer);
     }
 
     /// Starts a reply, forward or the editing of a draft from the message
@@ -4089,6 +4300,7 @@ impl App {
                 let n = self.accounts.len() as isize;
                 if n > 1 {
                     composer.account = (composer.account as isize + by).rem_euclid(n) as usize;
+                    composer.complete_from(&self.accounts[composer.account].id, &self.store);
                 }
             }
         }
@@ -4446,7 +4658,9 @@ impl App {
             }
             draft.body = "unsubscribe\n".into();
             self.pending = None;
-            self.composer = Some(Composer::new(account, Kind::New, draft));
+            let mut composer = Composer::new(account, Kind::New, draft);
+            composer.complete_from(&self.accounts[account].id, &self.store);
+            self.composer = Some(composer);
         } else {
             self.confirm(Confirm::OpenLink { url: link });
         }
@@ -4551,7 +4765,9 @@ impl App {
                 return;
             };
             self.pending = None;
-            self.composer = Some(Composer::new(account, Kind::New, draft));
+            let mut composer = Composer::new(account, Kind::New, draft);
+            composer.complete_from(&self.accounts[account].id, &self.store);
+            self.composer = Some(composer);
             return;
         }
         if self.demo {
@@ -6001,6 +6217,297 @@ pub mod tests {
         app.status = None;
         app.test_rx = Some(rx);
         app
+    }
+
+    fn contact_batch(name: &str, email: &str) -> contacts::SyncBatch {
+        contacts::SyncBatch {
+            state: contacts::SyncState {
+                address_book: "https://www.googleapis.com/book/".into(),
+                sync_token: "checkpoint".into(),
+                discovered_at: 10,
+            },
+            full: true,
+            contacts: vec![contacts::Contact {
+                id: "https://www.googleapis.com/book/alice.vcf".into(),
+                name: name.into(),
+                emails: vec![email.into()],
+                phones: vec!["+1 555 1234".into()],
+                organization: "Example Lab".into(),
+                etag: "\"one\"".into(),
+                vcard: format!(
+                    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{name}\r\nEMAIL:{email}\r\nNOTE:private original\r\nEND:VCARD\r\n"
+                ),
+            }],
+            deleted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn contacts_never_connect_without_opt_in_in_the_demo_or_for_another_provider() {
+        let mut app = app();
+        app.demo = false;
+        app.maybe_sync_contacts(0, true);
+        assert!(app.accounts[0].contacts_sync.is_none());
+        assert!(app.accounts[0].contacts_last_check.is_none());
+        assert!(app.status.is_none());
+        Arc::make_mut(&mut app.accounts[0].account).contacts = Contacts::GoogleCarddav;
+        app.demo = true;
+        app.maybe_sync_contacts(0, true);
+        assert!(app.accounts[0].contacts_sync.is_none());
+        assert!(app.accounts[0].contacts_last_check.is_none());
+        app.demo = false;
+        app.accounts[0].state = State::Online;
+        app.maybe_sync_contacts(0, true);
+        assert_eq!(app.next_contacts_sync, 0);
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        assert_eq!(app.accounts[0].state, State::Online);
+    }
+
+    #[tokio::test]
+    async fn contacts_authentication_failure_keeps_mail_credentials_and_cached_contacts() {
+        let mut account = account::guess("me@gmail.com", Protocol::Imap).0;
+        account.contacts = Contacts::GoogleCarddav;
+        let id = account.id();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut passwords = HashMap::new();
+        passwords.insert(id.clone(), Secret::new("mail-app-password"));
+        // Workers wait for requests: this injects only a contacts result,
+        // without making any mail or contacts connection.
+        let mut app = App::with_passwords(
+            Store::in_memory(),
+            Settings::default(),
+            vec![account],
+            passwords,
+            false,
+            None,
+            tx,
+        );
+        app.accounts[0].state = State::Online;
+        let creds = app.accounts[0].worker.as_ref().unwrap().creds.clone();
+        app.store
+            .apply_contact_sync(&id, 0, &contact_batch("Alice", "alice@example.org"), 10)
+            .unwrap();
+        app.accounts[0].contacts_sync = Some(ContactSync {
+            generation: 1,
+            revision: 1,
+            task: None,
+        });
+        app.on_event(AppEvent::ContactsSynced {
+            account: id.clone(),
+            generation: 1,
+            result: Err("Google CardDAV refused authentication (HTTP 403)".into()),
+        });
+        assert_eq!(app.accounts[0].state, State::Online);
+        assert_eq!(creds.get().await.unwrap().expose(), "mail-app-password");
+        assert!(app.accounts[0].contacts_sync.is_none());
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        assert_eq!(
+            app.store.cached_contacts(Some(&id), None, 10, 0).unwrap()[0]
+                .contact
+                .name,
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn stale_contacts_results_cannot_replace_another_sync_or_account_instance() {
+        let mut app = app();
+        Arc::make_mut(&mut app.accounts[0].account).contacts = Contacts::GoogleCarddav;
+        let account = app.accounts[0].account.as_ref().clone();
+        let id = account.id();
+        app.accounts[0].contacts_sync = Some(ContactSync {
+            generation: 1,
+            revision: 0,
+            task: None,
+        });
+        app.remove_account(0);
+        let i = app.add_account(account, None);
+        let (revision, checkpoint) = app.store.contact_sync_state(&id).unwrap();
+        assert!(revision > 0);
+        assert!(checkpoint.is_none());
+        app.accounts[i].contacts_sync = Some(ContactSync {
+            generation: 2,
+            revision,
+            task: None,
+        });
+        app.on_contacts_synced(
+            &id,
+            1,
+            Ok(contact_batch("Old account", "alice@example.org")),
+        );
+        assert_eq!(
+            app.accounts[i].contacts_sync.as_ref().unwrap().generation,
+            2
+        );
+        assert!(
+            app.store
+                .cached_contacts(Some(&id), None, 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+        app.store
+            .apply_contact_sync(
+                &id,
+                revision,
+                &contact_batch("Newer cache", "alice@example.org"),
+                20,
+            )
+            .unwrap();
+        app.on_contacts_synced(
+            &id,
+            2,
+            Ok(contact_batch("Stale fetch", "alice@example.org")),
+        );
+        assert!(app.accounts[i].contacts_sync.is_none());
+        assert_eq!(
+            app.store.cached_contacts(Some(&id), None, 10, 0).unwrap()[0]
+                .contact
+                .name,
+            "Newer cache"
+        );
+    }
+
+    #[test]
+    fn contacts_completion_follows_the_composers_sending_account() {
+        let mut app = app();
+        let first = app.accounts[0].id.clone();
+        let second = account::guess("other@gmail.com", Protocol::Imap).0;
+        let second_id = second.id();
+        app.add_account(second, None);
+        app.store
+            .apply_contact_sync(
+                &first,
+                0,
+                &contact_batch("Alice Work", "alice@example.org"),
+                10,
+            )
+            .unwrap();
+        app.store
+            .apply_contact_sync(
+                &second_id,
+                0,
+                &contact_batch("Alice Home", "alice@example.org"),
+                10,
+            )
+            .unwrap();
+        app.compose_new();
+        for c in "ali".chars() {
+            app.on_composer_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.composer.as_ref().unwrap().suggestions[0].name,
+            "Alice Work"
+        );
+        Arc::make_mut(&mut app.accounts[0].account).contacts = Contacts::GoogleCarddav;
+        app.accounts[0].contacts_sync = Some(ContactSync {
+            generation: 1,
+            revision: 1,
+            task: None,
+        });
+        app.on_contacts_synced(
+            &first,
+            1,
+            Ok(contact_batch("Alice Updated", "alice@example.org")),
+        );
+        assert_eq!(
+            app.composer.as_ref().unwrap().suggestions[0].name,
+            "Alice Updated"
+        );
+        app.on_composer_key(key(KeyCode::BackTab));
+        app.on_composer_key(key(KeyCode::Right));
+        app.on_composer_key(key(KeyCode::Tab));
+        app.on_composer_key(key(KeyCode::End));
+        let shown = crate::ui::tests::screen(&mut app, 120, 30);
+        assert!(shown.contains("Alice Home <alice@example.org>"), "{shown}");
+        assert!(!shown.contains("Alice Updated"), "{shown}");
+    }
+
+    #[test]
+    fn contacts_refresh_keeps_the_recipient_selected_for_acceptance() {
+        let mut app = app();
+        let id = app.accounts[0].id.clone();
+        let other = account::guess("other@gmail.com", Protocol::Imap).0;
+        let other_id = other.id();
+        app.add_account(other, None);
+        for account in &mut app.accounts {
+            Arc::make_mut(&mut account.account).contacts = Contacts::GoogleCarddav;
+        }
+        let mut batch = contact_batch("Alice A", "alice-a@example.org");
+        let mut second = contact_batch("Alice B", "alice-b@example.org")
+            .contacts
+            .remove(0);
+        second.id = "https://www.googleapis.com/book/alice-b.vcf".into();
+        batch.contacts.push(second);
+        app.store.apply_contact_sync(&id, 0, &batch, 10).unwrap();
+        app.compose_new();
+        for c in "ali".chars() {
+            app.on_composer_key(key(KeyCode::Char(c)));
+        }
+        app.on_composer_key(key(KeyCode::Down));
+        app.accounts[1].contacts_sync = Some(ContactSync {
+            generation: 1,
+            revision: 0,
+            task: None,
+        });
+        app.on_contacts_synced(&other_id, 1, Ok(contact_batch("Bob", "bob@example.org")));
+        let composer = app.composer.as_ref().unwrap();
+        assert_eq!(
+            composer.suggestions[composer.suggestion].addr,
+            "alice-b@example.org"
+        );
+        app.accounts[0].contacts_sync = Some(ContactSync {
+            generation: 2,
+            revision: 1,
+            task: None,
+        });
+        app.on_contacts_synced(&id, 2, Ok(batch));
+        app.on_composer_key(key(KeyCode::Tab));
+        let shown = crate::ui::tests::screen(&mut app, 120, 30);
+        assert!(shown.contains("Alice B <alice-b@example.org>,"), "{shown}");
+        assert!(!shown.contains("Alice A <alice-a@example.org>,"), "{shown}");
+    }
+
+    #[test]
+    fn agents_read_cached_contacts_without_raw_vcards_or_network_requests() {
+        let mut app = app();
+        let id = app.accounts[0].id.clone();
+        app.store
+            .apply_contact_sync(&id, 0, &contact_batch("Alice", "alice@example.org"), 10)
+            .unwrap();
+        let listed = agent_now(
+            &mut app,
+            Call::ListContacts(agent::ContactListArgs::default()),
+        )
+        .unwrap();
+        assert_eq!(listed["contacts"][0]["account"], id);
+        assert_eq!(listed["contacts"][0]["contact"]["name"], "Alice");
+        assert_eq!(listed["contacts"][0]["synced_at"], 10);
+        assert!(!listed.to_string().contains("private original"));
+        let found = agent_now(
+            &mut app,
+            Call::SearchContacts(agent::ContactSearchArgs {
+                account: Some(id.clone()),
+                query: "alice".into(),
+                limit: Some(1),
+                offset: None,
+            }),
+        )
+        .unwrap();
+        let contact_id = found["contacts"][0]["contact"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let one = agent_now(
+            &mut app,
+            Call::GetContact(agent::ContactGetArgs {
+                account: id,
+                id: contact_id,
+            }),
+        )
+        .unwrap();
+        assert_eq!(one["contact"]["emails"][0], "alice@example.org");
+        assert!(app.accounts[0].contacts_sync.is_none());
+        assert!(app.test_sent.borrow().is_empty());
     }
 
     impl App {

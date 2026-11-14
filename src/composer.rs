@@ -52,6 +52,8 @@ pub enum Kind {
 pub struct Composer {
     /// The account it's from (an index into the app's accounts).
     pub account: usize,
+    /// Stable account id used to prefer its cached address book.
+    completion_account: String,
     pub kind: Kind,
     pub to: TextArea<'static>,
     pub cc: TextArea<'static>,
@@ -118,6 +120,7 @@ impl Composer {
         };
         let mut composer = Self {
             account,
+            completion_account: String::new(),
             kind,
             to: line(&draft.to),
             cc: line(&draft.cc),
@@ -219,7 +222,9 @@ impl Composer {
     fn suggest(&mut self, store: &Store) {
         let word = self.typed_word();
         self.suggestions = if word.chars().count() >= 1 && !word.contains('<') {
-            store.complete(&word, 6).unwrap_or_default()
+            store
+                .complete_for(&self.completion_account, &word, 6)
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -228,6 +233,26 @@ impl Composer {
             self.suggestions.clear();
         }
         self.suggestion = 0;
+    }
+
+    /// Refresh completions, keeping the highlighted address for the same account.
+    pub fn complete_from(&mut self, account: &str, store: &Store) {
+        let same_account = self.completion_account == account;
+        let previous = std::mem::take(&mut self.suggestions);
+        let selected = previous.get(self.suggestion).filter(|_| same_account);
+        if !same_account {
+            account.clone_into(&mut self.completion_account);
+        }
+        if self.is_address() {
+            self.suggest(store);
+            if let Some(selected) = selected {
+                self.suggestion = self
+                    .suggestions
+                    .iter()
+                    .position(|address| address.addr.eq_ignore_ascii_case(&selected.addr))
+                    .unwrap_or(0);
+            }
+        }
     }
 
     /// Puts the chosen suggestion in place of the word being typed.
@@ -445,6 +470,54 @@ mod tests {
         assert!(c.changed());
         assert_eq!(c.on_key(ctrl('s'), &store), Action::Send);
         assert_eq!(c.on_key(key(KeyCode::Esc), &store), Action::Close);
+    }
+
+    #[test]
+    fn switching_accounts_refreshes_and_accepts_their_contact_name() {
+        use crate::contacts::{Contact, SyncBatch, SyncState};
+
+        let mut store = Store::in_memory();
+        for (account, name) in [("home", "Home Name"), ("work", "Work Name")] {
+            store
+                .apply_contact_sync(
+                    account,
+                    0,
+                    &SyncBatch {
+                        state: SyncState {
+                            address_book: "https://www.googleapis.com/book/".into(),
+                            sync_token: "one".into(),
+                            discovered_at: 1,
+                        },
+                        full: true,
+                        contacts: vec![Contact {
+                            id: "https://www.googleapis.com/book/one".into(),
+                            name: name.into(),
+                            emails: vec!["same@example.org".into()],
+                            phones: Vec::new(),
+                            organization: String::new(),
+                            etag: String::new(),
+                            vcard: String::new(),
+                        }],
+                        deleted: Vec::new(),
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let mut composer = Composer::new(0, Kind::New, Draft::default());
+        composer.complete_from("home", &store);
+        typed(&mut composer, "same", &store);
+        assert_eq!(composer.suggestions.len(), 1);
+        assert_eq!(composer.suggestions[0].name, "Home Name");
+        composer.complete_from("work", &store);
+        assert_eq!(composer.suggestions.len(), 1);
+        assert_eq!(composer.suggestions[0].name, "Work Name");
+        composer.on_key(key(KeyCode::Tab), &store);
+        assert_eq!(value(&composer.to), "Work Name <same@example.org>, ");
+        assert_eq!(
+            crate::compose::parse_addresses(&value(&composer.to)).unwrap()[0].addr,
+            "same@example.org"
+        );
     }
 
     #[test]

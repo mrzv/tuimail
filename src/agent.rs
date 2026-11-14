@@ -29,6 +29,9 @@ pub const DEMO_SOCKET: &str = "demo-agent.sock";
 pub const MAX_IDS: usize = 50;
 /// The most messages a search returns.
 pub const MAX_RESULTS: usize = 50;
+/// Contacts returned by default, and the most one cached lookup returns.
+pub const CONTACT_RESULTS: usize = 50;
+pub const MAX_CONTACT_RESULTS: usize = 100;
 /// How much of a message's text is returned, unless asked for less.
 pub const TEXT_CHARS: usize = 8_000;
 /// The most of a message's text that's returned.
@@ -57,6 +60,9 @@ pub struct Request {
 pub enum Call {
     ListAccounts(NoArgs),
     ListFolders(FolderArgs),
+    ListContacts(ContactListArgs),
+    SearchContacts(ContactSearchArgs),
+    GetContact(ContactGetArgs),
     SearchMessages(SearchArgs),
     ReadMessage(ReadArgs),
     MarkRead(ReadFlagArgs),
@@ -90,6 +96,45 @@ impl Call {
 pub struct FolderArgs {
     /// The account, by its name or address (from list_accounts).
     pub account: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContactListArgs {
+    /// Only this account (its name or address). Default: every account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// At most this many cached contacts (default 50, up to 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Skip this many contacts in stable name order (default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContactSearchArgs {
+    /// Text to match in cached names, email addresses, phone numbers or organizations.
+    pub query: String,
+    /// Only this account (its name or address). Default: every account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// At most this many cached contacts (default 50, up to 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Skip this many matching contacts (default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContactGetArgs {
+    /// The contact's account, from list_contacts or search_contacts.
+    pub account: String,
+    /// Its opaque id, from list_contacts or search_contacts; not a URL to visit.
+    pub id: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -535,6 +580,30 @@ mod tests {
         assert!(call(r#"{"tool":"list_accounts"}"#).is_ok());
         assert!(call(r#"{"tool":"list_accounts","delete":true}"#).is_err());
         assert!(call(r#"{"tool":"move_to_trash","ids":[],"forever":true}"#).is_err());
+    }
+
+    #[test]
+    fn contact_calls_cannot_sync_or_take_credentials() {
+        for json in [
+            r#"{"tool":"list_contacts"}"#,
+            r#"{"tool":"search_contacts","query":"Alice","account":"work","limit":10,"offset":20}"#,
+            r#"{"tool":"get_contact","account":"work","id":"opaque-id"}"#,
+        ] {
+            let call: Call = serde_json::from_str(json).unwrap();
+            assert!(!call.changes(), "{json}");
+        }
+        for json in [
+            r#"{"tool":"sync_contacts","account":"work"}"#,
+            r#"{"tool":"list_contacts","sync":true}"#,
+            r#"{"tool":"search_contacts","query":"Alice","password":"secret"}"#,
+            r#"{"tool":"get_contact","account":"work","id":"id","url":"https://elsewhere.test"}"#,
+            r#"{"tool":"search_contacts"}"#,
+            r#"{"tool":"get_contact","id":"id"}"#,
+            r#"{"tool":"get_contact","account":"work"}"#,
+            r#"{"tool":"list_contacts","offset":-1}"#,
+        ] {
+            assert!(serde_json::from_str::<Call>(json).is_err(), "{json}");
+        }
     }
 
     #[test]
