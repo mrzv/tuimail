@@ -314,11 +314,13 @@ aren't expanded. A missing or failing terminal viewer is reported in tuimail,
 not retried through the system opener.
 
 `terminal = true` gives the viewer the screen and keyboard until it exits,
-then restores tuimail, as `Ctrl-e` does for the editor. pdfterm needs a terminal
-with Kitty graphics support, such as Ghostty or Kitty. Leave `terminal` out (or
-set it to `false`) for a graphical viewer that runs detached without terminal
-input or output. Files still open from tuimail's private `opened/` folder, and
-risky file types still ask before opening, regardless of their viewer.
+then restores tuimail, as `Ctrl-e` does for the editor. Returning from either
+program repaints the screen without requesting the terminal's cursor position.
+pdfterm needs a terminal with Kitty graphics support, such as Ghostty or Kitty.
+Leave `terminal` out (or set it to `false`) for a graphical viewer that runs
+detached without terminal input or output. Files still open from tuimail's private
+`opened/` folder, and risky file types still ask before opening, regardless of
+their viewer.
 
 ## AI agents (MCP)
 
