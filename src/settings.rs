@@ -36,6 +36,8 @@ pub struct Settings {
     pub threads: bool,
     /// Include related messages from Sent in conversations.
     pub threads_include_sent: bool,
+    /// Complete on-screen Gmail conversations from All Mail, including Sent.
+    pub threads_complete_gmail: bool,
     /// Ask before deleting mail.
     pub confirm_delete: bool,
     /// Ask before sending.
@@ -85,6 +87,7 @@ impl Default for Settings {
             mark_read: true,
             threads: true,
             threads_include_sent: false,
+            threads_complete_gmail: false,
             confirm_delete: false,
             confirm_send: true,
             check_minutes: 5,
@@ -218,7 +221,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 18] = [
+const KNOWN: [&str; 19] = [
     "theme",
     "icons",
     "notifications",
@@ -227,6 +230,7 @@ const KNOWN: [&str; 18] = [
     "mark_read",
     "threads",
     "threads_include_sent",
+    "threads_complete_gmail",
     "confirm_delete",
     "confirm_send",
     "check_minutes",

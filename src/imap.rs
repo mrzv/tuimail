@@ -5,13 +5,16 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+};
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use futures::TryStreamExt;
 
 use crate::account::{Account, Auth, Security};
 use crate::mail;
 use crate::net::{self, Conn, Endpoint};
-use crate::store::{Flags, Folder, Header, Role};
+use crate::store::{Flags, Folder, Gmail, Header, Role};
 use crate::{tags, text, utf7};
 
 pub type Session = async_imap::Session<Conn>;
@@ -27,6 +30,9 @@ const MAX_FLAGS: usize = 100_000;
 const MAX_KEYWORDS: usize = 100;
 /// UIDs per command, so no command line gets too long.
 const UIDS_PER_COMMAND: usize = 400;
+/// A complete native-thread result is refused, never truncated, above these limits.
+const MAX_CONVERSATION_MESSAGES: usize = 10_000;
+const CONVERSATION_BYTES: usize = 64 << 20;
 
 /// The headers fetched for the list.
 const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID \
@@ -82,6 +88,7 @@ pub struct Caps {
     pub idle: bool,
     pub move_: bool,
     pub uidplus: bool,
+    pub gmail: bool,
 }
 
 /// Connects, starts TLS (STARTTLS if asked), and logs in.
@@ -146,6 +153,7 @@ pub async fn connect(
         idle: caps.has_str("IDLE"),
         move_: caps.has_str("MOVE"),
         uidplus: caps.has_str("UIDPLUS"),
+        gmail: caps.has_str("X-GM-EXT-1"),
     };
     Ok((session, caps))
 }
@@ -584,9 +592,13 @@ fn deleted(fetch: &Fetch) -> bool {
 }
 
 fn flags_of(fetch: &Fetch) -> Flags {
+    flags_from(fetch.flags())
+}
+
+fn flags_from<'a>(raw: impl Iterator<Item = Flag<'a>>) -> Flags {
     let mut flags = Flags::default();
     let mut keywords = Vec::new();
-    for flag in fetch.flags() {
+    for flag in raw {
         match flag {
             Flag::Seen => flags.seen = true,
             Flag::Flagged => flags.flagged = true,
@@ -632,10 +644,308 @@ pub async fn headers(session: &mut Session, uids: &[u32]) -> Result<Vec<Header>>
                 summary,
                 flags: flags_of(fetch),
                 size: fetch.size.unwrap_or(0),
+                gmail: None,
             });
         }
     }
     Ok(out)
+}
+
+/// Gmail's FETCH has no public thread-id accessor in async-imap. Use its
+/// public command/response API and re-exported parser without retaining
+/// unsolicited responses. Interrupted exchanges drop the connection.
+async fn gmail_command(
+    session: &mut Session,
+    command: &str,
+    max_responses: usize,
+    remaining_bytes: &mut usize,
+    mut accept: impl FnMut(&Response<'_>) -> Result<()>,
+) -> Result<()> {
+    drain(session);
+    timed(TIMEOUT, "Gmail conversations", async {
+        let id = session.run_command(command).await?;
+        let mut count = 0usize;
+        while let Some(response) = session.read_response().await? {
+            count += 1;
+            let bytes = response.borrow_owner().len();
+            if count > max_responses || bytes > *remaining_bytes {
+                return Ok(Err(anyhow!("the server sent too much conversation data")));
+            }
+            *remaining_bytes -= bytes;
+            match response.parsed() {
+                Response::Done {
+                    tag,
+                    status,
+                    outcome,
+                } => {
+                    if tag != &id {
+                        return Ok(Err(anyhow!("the server answered a different command")));
+                    }
+                    let words =
+                        || format!("code: {:?}, info: {:?}", outcome.code, outcome.information);
+                    return match status {
+                        Status::Ok => Ok(Ok(())),
+                        Status::No => Err(async_imap::error::Error::No(words())),
+                        Status::Bad => Err(async_imap::error::Error::Bad(words())),
+                        _ => Err(async_imap::error::Error::ConnectionLost),
+                    };
+                }
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => {
+                    return Err(async_imap::error::Error::ConnectionLost);
+                }
+                parsed => {
+                    if let Err(error) = accept(parsed) {
+                        return Ok(Err(error));
+                    }
+                }
+            }
+        }
+        Err(async_imap::error::Error::ConnectionLost)
+    })
+    .await?
+}
+
+fn gmail_uid(attrs: &[AttributeValue<'_>]) -> Option<u32> {
+    if attrs.iter().any(|attr| {
+        matches!(attr, AttributeValue::Flags(flags)
+        if flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Deleted")))
+    }) {
+        return None;
+    }
+    attrs.iter().find_map(|attr| match attr {
+        AttributeValue::Uid(uid) if *uid != 0 => Some(*uid),
+        _ => None,
+    })
+}
+
+/// Native IDs are server-global unsigned numbers, never Message-ID headers.
+fn gmail_of(attrs: &[AttributeValue<'_>]) -> Option<Gmail> {
+    let mut message_id = None;
+    let mut thread_id = None;
+    let mut sent = None;
+    for attr in attrs {
+        match attr {
+            AttributeValue::GmailMsgId(value) => message_id = Some(*value),
+            AttributeValue::GmailThrId(value) => thread_id = Some(*value),
+            AttributeValue::GmailLabels(labels) => {
+                sent = Some(
+                    labels
+                        .iter()
+                        .any(|label| label.eq_ignore_ascii_case("\\Sent")),
+                );
+            }
+            _ => {}
+        }
+    }
+    Some(Gmail {
+        message_id: message_id.filter(|&id| id != 0)?,
+        thread_id: thread_id.filter(|&id| id != 0)?,
+        sent: sent?,
+    })
+}
+
+/// Metadata only, for exactly these source UIDs in the selected mailbox.
+pub async fn gmail_metadata(session: &mut Session, uids: &[u32]) -> Result<Vec<(u32, Gmail)>> {
+    if uids.len() > MAX_CONVERSATION_MESSAGES || uids.contains(&0) {
+        bail!(Said(
+            "too many or invalid conversation UIDs requested".into()
+        ));
+    }
+    let mut out = std::collections::BTreeMap::new();
+    let mut bytes = CONVERSATION_BYTES;
+    for set in uid_sets(uids) {
+        let asked = set_uids(&set);
+        let command = format!("UID FETCH {set} (UID FLAGS X-GM-MSGID X-GM-THRID X-GM-LABELS)");
+        gmail_command(
+            session,
+            &command,
+            asked.len() + 32,
+            &mut bytes,
+            |response| {
+                let Response::Fetch(_, attrs) = response else {
+                    return Ok(());
+                };
+                let Some(uid) =
+                    gmail_uid(attrs).filter(|uid| asked.contains(uid) && !out.contains_key(uid))
+                else {
+                    return Ok(());
+                };
+                if let Some(gmail) = gmail_of(attrs) {
+                    out.insert(uid, gmail);
+                } else if attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        AttributeValue::GmailMsgId(_)
+                            | AttributeValue::GmailThrId(_)
+                            | AttributeValue::GmailLabels(_)
+                    )
+                }) {
+                    bail!("the server omitted native conversation metadata");
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Matching UIDs in the selected mailbox, without an unbounded folder scan.
+pub async fn gmail_thread_uids(session: &mut Session, thread_ids: &[u64]) -> Result<Vec<u32>> {
+    let threads: std::collections::BTreeSet<u64> = thread_ids.iter().copied().collect();
+    if threads.len() > crate::worker::CONVERSATION_BATCH || threads.contains(&0) {
+        bail!(Said(
+            "too many or invalid native conversations requested".into()
+        ));
+    }
+    let mut uids = std::collections::BTreeSet::new();
+    let mut bytes = CONVERSATION_BYTES;
+    // Prefix OR takes two search keys; n-1 ORs form one n-way key.
+    if !threads.is_empty() {
+        let mut criteria = "OR ".repeat(threads.len() - 1);
+        for (index, id) in threads.iter().enumerate() {
+            if index != 0 {
+                criteria.push(' ');
+            }
+            criteria.push_str(&format!("X-GM-THRID {id}"));
+        }
+        gmail_command(
+            session,
+            &format!("UID SEARCH {criteria}"),
+            32,
+            &mut bytes,
+            |response| {
+                if let Response::MailboxData(MailboxDatum::Search(found)) = response {
+                    if found.len() > MAX_CONVERSATION_MESSAGES {
+                        bail!("the conversation has too many messages");
+                    }
+                    uids.extend(found.iter().copied().filter(|&uid| uid != 0));
+                    if uids.len() > MAX_CONVERSATION_MESSAGES {
+                        bail!("the conversation has too many messages");
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    }
+    Ok(uids.into_iter().collect())
+}
+
+/// List headers and native metadata for SEARCH's UIDs, checked against its
+/// requested native threads as well as its UIDs.
+pub async fn gmail_headers(
+    session: &mut Session,
+    uids: &[u32],
+    thread_ids: &[u64],
+) -> Result<Vec<Header>> {
+    if uids.len() > MAX_CONVERSATION_MESSAGES || uids.contains(&0) {
+        bail!(Said(
+            "too many or invalid conversation UIDs requested".into()
+        ));
+    }
+    let threads: std::collections::BTreeSet<u64> = thread_ids.iter().copied().collect();
+    let mut bytes = CONVERSATION_BYTES;
+    let mut out = std::collections::BTreeMap::new();
+    for set in uid_sets(uids) {
+        let asked = set_uids(&set);
+        let command = format!(
+            "UID FETCH {set} (UID FLAGS RFC822.SIZE INTERNALDATE {HEADER_FIELDS} X-GM-MSGID X-GM-THRID X-GM-LABELS)"
+        );
+        gmail_command(
+            session,
+            &command,
+            asked.len() + 32,
+            &mut bytes,
+            |response| {
+                let Response::Fetch(_, attrs) = response else {
+                    return Ok(());
+                };
+                let Some(uid) =
+                    gmail_uid(attrs).filter(|uid| asked.contains(uid) && !out.contains_key(uid))
+                else {
+                    return Ok(());
+                };
+                let gmail = gmail_of(attrs);
+                if gmail.is_some_and(|gmail| !threads.contains(&gmail.thread_id)) {
+                    return Ok(());
+                }
+                let header = attrs.iter().find_map(|attr| match attr {
+                    AttributeValue::BodySection {
+                        section: Some(SectionPath::Full(MessageSection::Header)),
+                        data: Some(header),
+                        ..
+                    }
+                    | AttributeValue::Rfc822Header(Some(header)) => Some(header.as_ref()),
+                    _ => None,
+                });
+                // Ignore genuine unsolicited FLAGS updates, not an incomplete
+                // answer to the header/metadata request.
+                let Some(header) = header else {
+                    if attrs.iter().any(|attr| {
+                        matches!(
+                            attr,
+                            AttributeValue::GmailMsgId(_)
+                                | AttributeValue::GmailThrId(_)
+                                | AttributeValue::GmailLabels(_)
+                                | AttributeValue::BodySection {
+                                    section: Some(SectionPath::Full(MessageSection::Header)),
+                                    ..
+                                }
+                                | AttributeValue::Rfc822Header(_)
+                        )
+                    }) {
+                        bail!("the server omitted conversation headers");
+                    }
+                    return Ok(());
+                };
+                let Some(gmail) = gmail else {
+                    bail!("the server omitted native conversation metadata");
+                };
+                let mut summary = mail::summarize(header);
+                let mut size = 0;
+                for attr in attrs {
+                    match attr {
+                        AttributeValue::InternalDate(date) if summary.date == 0 => {
+                            summary.date =
+                                chrono::DateTime::parse_from_str(date, "%d-%b-%Y %H:%M:%S %z")
+                                    .map(|date| date.timestamp())
+                                    .unwrap_or(0);
+                        }
+                        AttributeValue::Rfc822Size(value) => size = *value,
+                        _ => {}
+                    }
+                }
+                let flags = flags_from(
+                    attrs
+                        .iter()
+                        .filter_map(|attr| match attr {
+                            AttributeValue::Flags(flags) => {
+                                Some(flags.iter().map(|flag| Flag::from(flag.as_ref())))
+                            }
+                            _ => None,
+                        })
+                        .flatten(),
+                );
+                out.insert(
+                    uid,
+                    Header {
+                        uid,
+                        summary,
+                        flags,
+                        size,
+                        gmail: Some(gmail),
+                    },
+                );
+                Ok(())
+            },
+        )
+        .await?;
+    }
+    Ok(out.into_values().collect())
 }
 
 /// The UIDs of the messages at places `start..=end` in the folder. Only
@@ -939,7 +1249,7 @@ pub async fn idle(session: Session, limit: Duration) -> Result<(Session, bool)> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -959,6 +1269,13 @@ mod tests {
     /// A one-connection IMAP server on 127.0.0.1 that answers each
     /// command after LOGIN with `answer(tag, command)`.
     async fn scripted(answer: impl Fn(&str, &str) -> Vec<u8> + Send + 'static) -> (Session, Caps) {
+        scripted_capabilities("IMAP4rev1", answer).await
+    }
+
+    pub(crate) async fn scripted_capabilities(
+        capabilities: &'static str,
+        mut answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static,
+    ) -> (Session, Caps) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -972,7 +1289,7 @@ mod tests {
                 let reply = if command.starts_with("LOGIN") {
                     format!("{tag} OK done\r\n").into_bytes()
                 } else if command.starts_with("CAPABILITY") {
-                    format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n").into_bytes()
+                    format!("* CAPABILITY {capabilities}\r\n{tag} OK done\r\n").into_bytes()
                 } else {
                     answer(tag, command)
                 };
@@ -1170,5 +1487,124 @@ mod tests {
         );
         // Not a tag: searched for as text.
         assert_eq!(search_criteria("tag:a(b").unwrap(), "TEXT \"tag:a(b\"");
+    }
+
+    #[tokio::test]
+    async fn gmail_search_refuses_overlarge_results_instead_of_truncating() {
+        let (mut session, _) = scripted(|tag, command| {
+            assert_eq!(command, "UID SEARCH X-GM-THRID 7");
+            let mut answer = "* SEARCH".to_string();
+            for uid in 1..=MAX_CONVERSATION_MESSAGES + 1 {
+                answer.push_str(&format!(" {uid}"));
+            }
+            format!("{answer}\r\n{tag} OK done\r\n").into_bytes()
+        })
+        .await;
+        let error = gmail_thread_uids(&mut session, &[7]).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<Said>().is_none(),
+            "an unfinished oversized response drops the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_command_limits_count_and_all_response_bytes() {
+        for bytes in [1, CONVERSATION_BYTES] {
+            let (mut session, _) = scripted(|tag, _| {
+                format!("* 1 EXISTS\r\n* 2 EXISTS\r\n* 3 EXISTS\r\n{tag} OK done\r\n").into_bytes()
+            })
+            .await;
+            let mut remaining = bytes;
+            let error = gmail_command(
+                &mut session,
+                "UID SEARCH X-GM-THRID 7",
+                2,
+                &mut remaining,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.downcast_ref::<Said>().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_tagged_refusal_consumes_the_completion_and_keeps_the_session_usable() {
+        for status in ["NO", "BAD"] {
+            let (mut session, _) = scripted(move |tag, command| {
+                if command.starts_with("UID FETCH") {
+                    format!("* 17 EXISTS\r\n{tag} {status} refused\r\n").into_bytes()
+                } else {
+                    assert_eq!(command, "UID SEARCH ALL");
+                    format!("* SEARCH 7\r\n{tag} OK done\r\n").into_bytes()
+                }
+            })
+            .await;
+            let error = gmail_metadata(&mut session, &[7]).await.unwrap_err();
+            assert!(error.downcast_ref::<Said>().is_some(), "{error:#}");
+            assert_eq!(search(&mut session, "ALL").await.unwrap(), [7]);
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_wrong_tag_or_bye_drops_the_session() {
+        for answer in ["wrong OK done\r\n", "* BYE closing\r\n"] {
+            let (mut session, _) = scripted(move |_, _| answer.as_bytes().to_vec()).await;
+            let error = gmail_thread_uids(&mut session, &[7]).await.unwrap_err();
+            assert!(error.downcast_ref::<Said>().is_none(), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_incomplete_native_metadata_never_becomes_a_complete_result() {
+        for with_header in [false, true] {
+            let (mut session, _) = scripted(move |tag, _| {
+                let header = if with_header { " BODY[HEADER] {14}\r\nSubject: x\r\n\r\n" } else { "" };
+                format!("* 1 FETCH (UID 1 FLAGS () X-GM-MSGID 2 X-GM-LABELS (){header})\r\n{tag} OK done\r\n").into_bytes()
+            }).await;
+            let error = if with_header {
+                gmail_headers(&mut session, &[1], &[7]).await.unwrap_err()
+            } else {
+                gmail_metadata(&mut session, &[1]).await.unwrap_err()
+            };
+            assert!(error.downcast_ref::<Said>().is_none(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("omitted native conversation metadata"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_missing_headers_never_become_a_complete_result() {
+        for header in ["", " BODY[HEADER] NIL", " RFC822.HEADER NIL"] {
+            let (mut session, _) = scripted(move |tag, _| {
+                format!(
+                    "* 1 FETCH (UID 1 FLAGS () X-GM-MSGID 2 X-GM-THRID 7 X-GM-LABELS (){header})\r\n{tag} OK done\r\n"
+                )
+                .into_bytes()
+            })
+            .await;
+            let error = gmail_headers(&mut session, &[1], &[7]).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("omitted conversation headers"),
+                "{error:#}"
+            );
+        }
+
+        let (mut session, _) = scripted(|tag, _| {
+            let header = "Subject: Kept\r\n\r\n";
+            format!(
+                "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n\
+                 * 1 FETCH (UID 1 FLAGS () X-GM-MSGID 2 X-GM-THRID 7 X-GM-LABELS () BODY[HEADER] {{{}}}\r\n{header})\r\n\
+                 {tag} OK done\r\n",
+                header.len()
+            )
+            .into_bytes()
+        })
+        .await;
+        let headers = gmail_headers(&mut session, &[1], &[7]).await.unwrap();
+        assert_eq!(headers[0].summary.subject, "Kept");
+        assert!(!headers[0].flags.seen, "the unsolicited update is ignored");
     }
 }

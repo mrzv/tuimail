@@ -96,6 +96,14 @@ pub struct Flags {
     pub tags: Vec<String>,
 }
 
+/// Server-provided Gmail identities and the standard `\Sent` label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gmail {
+    pub message_id: u64,
+    pub thread_id: u64,
+    pub sent: bool,
+}
+
 /// A message in the list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
@@ -104,6 +112,7 @@ pub struct Message {
     pub summary: Summary,
     pub flags: Flags,
     pub size: u32,
+    pub gmail: Option<Gmail>,
     /// The start of its text, once it's been downloaded.
     pub preview: String,
 }
@@ -170,6 +179,7 @@ pub struct Header {
     pub summary: Summary,
     pub flags: Flags,
     pub size: u32,
+    pub gmail: Option<Gmail>,
 }
 
 const SCHEMA: &str = "
@@ -209,6 +219,9 @@ CREATE TABLE IF NOT EXISTS messages (
     preview TEXT NOT NULL DEFAULT '',
     pop_id TEXT,
     tags TEXT NOT NULL DEFAULT '',
+    gmail_message_id TEXT,
+    gmail_thread_id TEXT,
+    gmail_sent INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, folder, uid)
 );
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages(account, folder, date DESC);
@@ -318,7 +331,7 @@ CREATE INDEX IF NOT EXISTS contact_emails_by_address
 
 const MESSAGE_COLUMNS: &str = "folder, uid, message_id, in_reply_to, refs, date, from_name, \
      from_addr, to_list, cc_list, subject, attachments, seen, flagged, answered, draft, size, \
-     preview, tags";
+     preview, tags, gmail_message_id, gmail_thread_id, gmail_sent";
 
 /// Messages bigger than this aren't kept: they're fetched again to read.
 pub const MAX_KEPT_BODY: usize = 25 << 20;
@@ -327,6 +340,22 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     // Cleaned again on the way out: the file could have been changed.
     let one = |i: usize, max: usize| -> rusqlite::Result<String> {
         Ok(text::one_line(&row.get::<_, String>(i)?, max))
+    };
+    // Gmail's unsigned IDs don't fit SQLite's signed integers. Invalid
+    // metadata in an edited cache must not invent a conversation.
+    let gmail = match (
+        row.get::<_, Option<String>>(19)?,
+        row.get::<_, Option<String>>(20)?,
+    ) {
+        (Some(message), Some(thread)) => match (message.parse(), thread.parse()) {
+            (Ok(message_id), Ok(thread_id)) => Some(Gmail {
+                message_id,
+                thread_id,
+                sent: row.get(21)?,
+            }),
+            _ => None,
+        },
+        _ => None,
     };
     Ok(Message {
         folder: row.get(0)?,
@@ -353,6 +382,7 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             tags: tags::from_stored(&row.get::<_, String>(18)?),
         },
         size: row.get(16)?,
+        gmail,
         preview: one(17, 300)?,
     })
 }
@@ -380,7 +410,9 @@ impl Store {
     /// A store that lives only in memory: the demo's, and tests'.
     pub fn in_memory() -> Self {
         let db = Connection::open_in_memory().expect("SQLite opens in memory");
-        db.execute_batch(SCHEMA).expect("the schema is valid");
+        db.execute_batch(SCHEMA)
+            .and_then(|()| Self::migrate(&db))
+            .expect("the schema is valid");
         Self { db }
     }
 
@@ -394,6 +426,29 @@ impl Store {
         if !tagged {
             db.execute_batch("ALTER TABLE messages ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
         }
+        for (column, declaration) in [
+            ("gmail_message_id", "TEXT"),
+            ("gmail_thread_id", "TEXT"),
+            ("gmail_sent", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let there: bool = db.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?1",
+                [column],
+                |r| r.get(0),
+            )?;
+            if !there {
+                db.execute_batch(&format!(
+                    "ALTER TABLE messages ADD COLUMN {column} {declaration};"
+                ))?;
+            }
+        }
+        // Created after adding the columns: SCHEMA also opens old caches.
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS messages_by_gmail_thread
+             ON messages(account, folder, gmail_thread_id);
+             CREATE INDEX IF NOT EXISTS messages_by_gmail_message
+             ON messages(account, gmail_message_id);",
+        )?;
         for column in ["moved_uidvalidity", "moved_floor", "size"] {
             let there: bool = db.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('changed') WHERE name = ?1",
@@ -650,48 +705,201 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Adds fetched headers, or updates the ones already there (keeping
-    /// what was learned from the message's text).
+    /// Adds fetched headers, keeping downloaded text and any Gmail
+    /// identities absent from an ordinary header refresh.
     pub fn add_headers(&mut self, account: &str, folder: &str, headers: &[Header]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        Self::insert_headers(&tx, account, folder, headers)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_headers<'a>(
+        tx: &Transaction<'_>,
+        account: &str,
+        folder: &str,
+        headers: impl IntoIterator<Item = &'a Header>,
+    ) -> Result<()> {
+        let mut stmt = tx.prepare(
+            "INSERT INTO messages (account, folder, uid, message_id, in_reply_to, refs, date,
+                 from_name, from_addr, to_list, cc_list, subject, attachments, seen, flagged,
+                 answered, draft, size, tags, gmail_message_id, gmail_thread_id, gmail_sent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18, ?19, ?20, ?21, ?22)
+             ON CONFLICT(account, folder, uid) DO UPDATE SET
+                 seen = excluded.seen, flagged = excluded.flagged,
+                 answered = excluded.answered, draft = excluded.draft,
+                 tags = excluded.tags,
+                 gmail_message_id = COALESCE(excluded.gmail_message_id, messages.gmail_message_id),
+                 gmail_thread_id = COALESCE(excluded.gmail_thread_id, messages.gmail_thread_id),
+                 gmail_sent = CASE WHEN excluded.gmail_message_id IS NULL THEN messages.gmail_sent
+                     ELSE excluded.gmail_sent END",
+        )?;
+        for h in headers {
+            let s = &h.summary;
+            stmt.execute(params![
+                account,
+                folder,
+                h.uid,
+                s.message_id,
+                s.in_reply_to,
+                s.references,
+                s.date,
+                s.from.name,
+                s.from.addr,
+                s.to,
+                s.cc,
+                s.subject,
+                s.attachments,
+                h.flags.seen,
+                h.flags.flagged,
+                h.flags.answered,
+                h.flags.draft,
+                h.size,
+                tags::to_stored(&h.flags.tags),
+                h.gmail.map(|g| g.message_id.to_string()),
+                h.gmail.map(|g| g.thread_id.to_string()),
+                h.gmail.is_some_and(|g| g.sent)
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Records identities only for UIDs already cached in this folder.
+    pub fn set_gmail(
+        &mut self,
+        account: &str,
+        folder: &str,
+        messages: &[(u32, Gmail)],
+    ) -> Result<()> {
         let tx = self.db.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO messages (account, folder, uid, message_id, in_reply_to, refs, date,
-                     from_name, from_addr, to_list, cc_list, subject, attachments, seen, flagged,
-                     answered, draft, size, tags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19)
-                 ON CONFLICT(account, folder, uid) DO UPDATE SET
-                     seen = excluded.seen, flagged = excluded.flagged,
-                     answered = excluded.answered, draft = excluded.draft,
-                     tags = excluded.tags",
+                "UPDATE messages SET gmail_message_id = ?4, gmail_thread_id = ?5, gmail_sent = ?6
+                 WHERE account = ?1 AND folder = ?2 AND uid = ?3",
             )?;
-            for h in headers {
-                let s = &h.summary;
+            for (uid, gmail) in messages {
                 stmt.execute(params![
                     account,
                     folder,
-                    h.uid,
-                    s.message_id,
-                    s.in_reply_to,
-                    s.references,
-                    s.date,
-                    s.from.name,
-                    s.from.addr,
-                    s.to,
-                    s.cc,
-                    s.subject,
-                    s.attachments,
-                    h.flags.seen,
-                    h.flags.flagged,
-                    h.flags.answered,
-                    h.flags.draft,
-                    h.size,
-                    tags::to_stored(&h.flags.tags)
+                    uid,
+                    gmail.message_id.to_string(),
+                    gmail.thread_id.to_string(),
+                    gmail.sent
                 ])?;
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Cached members of these native threads only, newest first.
+    pub fn gmail_messages(
+        &self,
+        account: &str,
+        folder: &str,
+        thread_ids: &[u64],
+    ) -> Result<Vec<Message>> {
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE account = ?1 AND folder = ?2 AND gmail_thread_id = ?3"
+        ))?;
+        let mut messages = Vec::new();
+        let mut seen = HashSet::new();
+        for thread in thread_ids {
+            if !seen.insert(*thread) {
+                continue;
+            }
+            let rows = stmt.query_map(params![account, folder, thread.to_string()], message_row)?;
+            for row in rows {
+                let message = row?;
+                if message.gmail.is_some() {
+                    messages.push(message);
+                }
+            }
+        }
+        messages
+            .sort_unstable_by(|a, b| b.summary.date.cmp(&a.summary.date).then(b.uid.cmp(&a.uid)));
+        Ok(messages)
+    }
+
+    /// Cached label copies of these native messages, including their source
+    /// identities, without using sender-supplied Message-ID headers.
+    pub fn gmail_copies(
+        &self,
+        account: &str,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<Vec<(String, u32)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.db.prepare(
+            "SELECT copy.folder, copy.uid FROM messages AS source
+             JOIN messages AS copy ON copy.account = source.account
+                 AND copy.gmail_message_id = source.gmail_message_id
+             WHERE source.account = ?1 AND source.folder = ?2 AND source.uid = ?3",
+        )?;
+        let mut copies = HashSet::new();
+        for uid in uids {
+            let rows = stmt.query_map(params![account, folder, uid], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+            })?;
+            for row in rows {
+                copies.insert(row?);
+            }
+        }
+        Ok(copies.into_iter().collect())
+    }
+
+    /// Replaces only these complete native threads, retaining surviving
+    /// UIDs' bodies and previews. This does not claim a contiguous sync
+    /// range or alter the folder's server counts.
+    pub fn replace_gmail_threads(
+        &mut self,
+        account: &str,
+        folder: &str,
+        thread_ids: &[u64],
+        headers: &[Header],
+    ) -> Result<()> {
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        let threads: HashSet<u64> = thread_ids.iter().copied().collect();
+        let matching = || {
+            headers
+                .iter()
+                .filter(|h| h.gmail.is_some_and(|g| threads.contains(&g.thread_id)))
+        };
+        let kept: HashSet<u32> = matching().map(|h| h.uid).collect();
+        let tx = self.db.transaction()?;
+        let mut gone = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT uid FROM messages
+                 WHERE account = ?1 AND folder = ?2 AND gmail_thread_id = ?3",
+            )?;
+            for thread in &threads {
+                let rows = stmt.query_map(params![account, folder, thread.to_string()], |r| {
+                    r.get::<_, u32>(0)
+                })?;
+                for row in rows {
+                    let uid = row?;
+                    if !kept.contains(&uid) {
+                        gone.push(uid);
+                    }
+                }
+            }
+        }
+        Self::remove_messages(&tx, account, folder, &gone)?;
+        Self::insert_headers(&tx, account, folder, matching())?;
+        tx.commit()?;
+        if !gone.is_empty() {
+            self.scrub();
+        }
         Ok(())
     }
 
@@ -751,6 +959,18 @@ impl Store {
             return Ok(());
         }
         let tx = self.db.transaction()?;
+        Self::remove_messages(&tx, account, folder, uids)?;
+        tx.commit()?;
+        self.scrub();
+        Ok(())
+    }
+
+    fn remove_messages(
+        tx: &Transaction<'_>,
+        account: &str,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<()> {
         for table in ["messages", "bodies"] {
             let mut stmt = tx.prepare(&format!(
                 "DELETE FROM {table} WHERE account = ?1 AND folder = ?2 AND uid = ?3"
@@ -759,8 +979,6 @@ impl Store {
                 stmt.execute(params![account, folder, uid])?;
             }
         }
-        tx.commit()?;
-        self.scrub();
         Ok(())
     }
 
@@ -842,6 +1060,7 @@ impl Store {
             summary: mail::summarize(raw),
             flags,
             size: raw.len() as u32,
+            gmail: None,
         };
         self.add_headers(account, folder, &[header])?;
         self.db.execute(
@@ -876,6 +1095,9 @@ impl Store {
                 |r| r.get(0),
             )?;
             let new = self.add_local(account, to, &raw, message.flags, None)?;
+            if let Some(gmail) = message.gmail {
+                self.set_gmail(account, to, &[(new, gmail)])?;
+            }
             self.db.execute(
                 "UPDATE messages SET pop_id = ?4 WHERE account = ?1 AND folder = ?2 AND uid = ?3",
                 params![account, to, new, pop_id],
@@ -1404,6 +1626,7 @@ pub mod tests {
             },
             flags: Flags::default(),
             size: 100,
+            gmail: None,
         }
     }
 
@@ -1417,6 +1640,297 @@ pub mod tests {
             unread: 0,
             total: 0,
         }
+    }
+
+    fn gmail_header(uid: u32, thread_id: u64, sent: bool) -> Header {
+        let mut h = header(uid, "Conversation", i64::from(uid));
+        h.gmail = Some(Gmail {
+            message_id: u64::MAX - u64::from(uid),
+            thread_id,
+            sent,
+        });
+        h
+    }
+
+    #[test]
+    fn gmail_ids_are_unsigned_and_survive_ordinary_header_refreshes() {
+        let mut store = Store::in_memory();
+        let native = gmail_header(1, u64::MAX, true);
+        store
+            .add_headers("a", "All", std::slice::from_ref(&native))
+            .unwrap();
+        store
+            .add_headers("b", "All", std::slice::from_ref(&native))
+            .unwrap();
+        store
+            .add_headers("a", "INBOX", std::slice::from_ref(&native))
+            .unwrap();
+        store.save_body("a", "All", 1, b"kept body").unwrap();
+        store.set_preview("a", "All", 1, "kept preview").unwrap();
+        let mut ordinary = header(1, "Conversation", 1);
+        ordinary.flags.seen = true;
+        store.add_headers("a", "All", &[ordinary]).unwrap();
+        let message = store.message("a", "All", 1).unwrap().unwrap();
+        assert_eq!(message.gmail, native.gmail);
+        assert!(message.flags.seen);
+        assert_eq!(message.preview, "kept preview");
+        assert_eq!(store.body("a", "All", 1).unwrap().unwrap(), b"kept body");
+        let text_ids: (String, String) = store
+            .db
+            .query_row(
+                "SELECT gmail_message_id, gmail_thread_id FROM messages
+                 WHERE account = 'a' AND folder = 'All'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text_ids, ((u64::MAX - 1).to_string(), u64::MAX.to_string()));
+        assert!(store.gmail_messages("a", "All", &[]).unwrap().is_empty());
+        let found = store
+            .gmail_messages("a", "All", &[u64::MAX, u64::MAX])
+            .unwrap();
+        assert_eq!(found.len(), 1, "duplicate queries must not duplicate mail");
+        assert_eq!(found[0].gmail, native.gmail);
+        let changed = Gmail {
+            sent: false,
+            ..native.gmail.unwrap()
+        };
+        store
+            .set_gmail("a", "All", &[(1, changed), (99, changed)])
+            .unwrap();
+        assert_eq!(
+            store.message("a", "All", 1).unwrap().unwrap().gmail,
+            Some(changed)
+        );
+        assert!(store.message("a", "All", 99).unwrap().is_none());
+        assert_eq!(
+            store.message("b", "All", 1).unwrap().unwrap().gmail,
+            native.gmail
+        );
+        assert_eq!(
+            store.message("a", "INBOX", 1).unwrap().unwrap().gmail,
+            native.gmail
+        );
+        store
+            .db
+            .execute(
+                "UPDATE messages SET gmail_message_id = '18446744073709551616'
+                 WHERE account = 'a' AND folder = 'All'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .message("a", "All", 1)
+                .unwrap()
+                .unwrap()
+                .gmail
+                .is_none()
+        );
+        assert!(
+            store
+                .gmail_messages("a", "All", &[u64::MAX])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replacing_gmail_threads_is_targeted_and_keeps_surviving_bodies() {
+        let mut store = Store::in_memory();
+        store.set_folders("a", &[folder("All", None)]).unwrap();
+        let known = Known {
+            uidvalidity: 9,
+            low: 100,
+            high: 200,
+        };
+        store.set_known("a", "All", known).unwrap();
+        store.set_counts("a", "All", 12, 40).unwrap();
+        let thread = u64::MAX;
+        let original = [
+            gmail_header(1, thread, false),
+            gmail_header(2, thread, true),
+            gmail_header(3, 7, false),
+            header(4, "Ordinary", 4),
+        ];
+        store.add_headers("a", "All", &original).unwrap();
+        for uid in 1..=4 {
+            store.save_body("a", "All", uid, &[uid as u8]).unwrap();
+            store.set_preview("a", "All", uid, "kept").unwrap();
+        }
+        for (account, folder) in [("b", "All"), ("a", "INBOX")] {
+            store.add_headers(account, folder, &original).unwrap();
+            store.save_body(account, folder, 1, b"separate").unwrap();
+        }
+        let mut survivor = gmail_header(2, thread, false);
+        survivor.flags.seen = true;
+        store
+            .replace_gmail_threads(
+                "a",
+                "All",
+                &[thread, thread],
+                &[
+                    survivor,
+                    gmail_header(5, thread, true),
+                    gmail_header(1, 99, false),
+                    gmail_header(6, 99, false),
+                    header(7, "Missing metadata", 7),
+                ],
+            )
+            .unwrap();
+        assert!(store.message("a", "All", 1).unwrap().is_none());
+        assert!(store.body("a", "All", 1).unwrap().is_none());
+        let survived = store.message("a", "All", 2).unwrap().unwrap();
+        assert_eq!(survived.gmail, gmail_header(2, thread, false).gmail);
+        assert!(survived.flags.seen);
+        assert_eq!(survived.preview, "kept");
+        for uid in 2..=4 {
+            assert_eq!(store.body("a", "All", uid).unwrap().unwrap(), [uid as u8]);
+        }
+        assert!(store.message("a", "All", 5).unwrap().is_some());
+        for uid in [6, 7] {
+            assert!(store.message("a", "All", uid).unwrap().is_none());
+        }
+        assert_eq!(store.known("a", "All").unwrap(), known);
+        let folders = store.folders("a").unwrap();
+        assert_eq!((folders[0].unread, folders[0].total), (12, 40));
+        for (account, folder) in [("b", "All"), ("a", "INBOX")] {
+            assert_eq!(
+                store.body(account, folder, 1).unwrap().unwrap(),
+                b"separate"
+            );
+            assert_eq!(
+                store
+                    .gmail_messages(account, folder, &[thread])
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        let found = store.gmail_messages("a", "All", &[7, thread]).unwrap();
+        assert_eq!(found.iter().map(|m| m.uid).collect::<Vec<_>>(), [5, 3, 2]);
+        store
+            .replace_gmail_threads("a", "All", &[], &original)
+            .unwrap();
+        assert_eq!(store.uids("a", "All", 0, 10).unwrap().len(), 4);
+        store
+            .replace_gmail_threads("a", "All", &[thread], &[])
+            .unwrap();
+        assert!(
+            store
+                .gmail_messages("a", "All", &[thread])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.body("a", "All", 2).unwrap().is_none());
+        assert!(store.message("a", "All", 3).unwrap().is_some());
+        assert!(store.message("a", "All", 4).unwrap().is_some());
+    }
+
+    #[test]
+    fn replacing_gmail_threads_rolls_back_removals_when_insertion_fails() {
+        let mut store = Store::in_memory();
+        store
+            .add_headers("a", "All", &[gmail_header(1, 9, false)])
+            .unwrap();
+        store.save_body("a", "All", 1, b"kept").unwrap();
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER fail_header BEFORE INSERT ON messages WHEN NEW.uid = 5
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .replace_gmail_threads("a", "All", &[9], &[gmail_header(5, 9, false)])
+                .is_err()
+        );
+        assert!(store.message("a", "All", 1).unwrap().is_some());
+        assert_eq!(store.body("a", "All", 1).unwrap().unwrap(), b"kept");
+        assert!(store.message("a", "All", 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_caches_gain_gmail_metadata_without_changing_existing_mail() {
+        let db = Connection::open_in_memory().unwrap();
+        let old = SCHEMA.replace(
+            "    gmail_message_id TEXT,\n    gmail_thread_id TEXT,\n    gmail_sent INTEGER NOT NULL DEFAULT 0,\n",
+            "",
+        );
+        assert_ne!(old, SCHEMA);
+        db.execute_batch(&old).unwrap();
+        db.execute_batch(
+            "INSERT INTO messages (account, folder, uid, message_id, in_reply_to, refs, date,
+                 from_name, from_addr, to_list, cc_list, subject, preview)
+             VALUES ('a', 'All', 1, 'sender@id', '', '', 1, '', 'a@b.c', '', '', 'Old', 'kept');
+             INSERT INTO bodies (account, folder, uid, raw) VALUES ('a', 'All', 1, X'6162');",
+        )
+        .unwrap();
+        // Opening an existing cache applies SCHEMA before migration.
+        db.execute_batch(SCHEMA).unwrap();
+        Store::migrate(&db).unwrap();
+        Store::migrate(&db).unwrap();
+        let mut store = Store { db };
+        let old = store.message("a", "All", 1).unwrap().unwrap();
+        assert!(old.gmail.is_none());
+        assert_eq!(old.preview, "kept");
+        assert_eq!(old.summary.message_id, "sender@id");
+        assert_eq!(store.body("a", "All", 1).unwrap().unwrap(), b"ab");
+        let gmail = Gmail {
+            message_id: u64::MAX,
+            thread_id: u64::MAX - 1,
+            sent: true,
+        };
+        store.set_gmail("a", "All", &[(1, gmail)]).unwrap();
+        assert_eq!(
+            store
+                .gmail_messages("a", "All", &[gmail.thread_id])
+                .unwrap()[0]
+                .gmail,
+            Some(gmail)
+        );
+        let indexed: bool = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('messages')
+                 WHERE name = 'messages_by_gmail_thread'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(indexed);
+    }
+
+    #[test]
+    fn local_moves_keep_gmail_identities_and_only_remove_copied_mail() {
+        let mut store = Store::in_memory();
+        let raw = b"From: a@b.c\r\n\r\nkept\r\n";
+        let uid = store
+            .add_local("a", "INBOX", raw, Flags::default(), None)
+            .unwrap();
+        let missing = header(2, "Not downloaded", 2);
+        store.add_headers("a", "INBOX", &[missing]).unwrap();
+        let gmail = Gmail {
+            message_id: u64::MAX,
+            thread_id: u64::MAX,
+            sent: true,
+        };
+        store
+            .set_gmail("a", "INBOX", &[(uid, gmail), (2, gmail)])
+            .unwrap();
+        let moved = store.move_local("a", "INBOX", &[uid, 2], "Trash").unwrap();
+        assert_eq!(moved, [(uid, 1)]);
+        assert_eq!(
+            store.message("a", "Trash", 1).unwrap().unwrap().gmail,
+            Some(gmail)
+        );
+        assert_eq!(store.body("a", "Trash", 1).unwrap().unwrap(), raw);
+        assert!(store.message("a", "INBOX", uid).unwrap().is_none());
+        assert_eq!(
+            store.message("a", "INBOX", 2).unwrap().unwrap().gmail,
+            Some(gmail)
+        );
     }
 
     fn tagged(uid: u32, subject: &str, tags: &[&str]) -> Header {

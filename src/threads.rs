@@ -69,22 +69,29 @@ pub fn connected(summaries: &[&Summary], listed: usize) -> Vec<bool> {
 /// `summaries` as threads: each conversation in turn, newest first.
 #[cfg(test)]
 pub fn arrange(summaries: &[&Summary]) -> Vec<Placed> {
-    arrange_arrived(summaries, &[])
+    arrange_arrived(summaries, &[], &[])
 }
 
 /// As [`arrange`], knowing where each message is and its UID there
 /// (`arrived`: a number for its account and folder, and its UID): of
 /// messages with one Message-ID in one folder, the one that came first is
 /// the one replies go under, not one a sender dated later.
-pub fn arrange_arrived(summaries: &[&Summary], arrived: &[(usize, u32)]) -> Vec<Placed> {
+/// Native conversation groups are scoped to an account. Their members stay
+/// together even without reply headers; sender headers can't cross groups.
+pub fn arrange_arrived(
+    summaries: &[&Summary],
+    arrived: &[(usize, u32)],
+    groups: &[Option<(usize, u64)>],
+) -> Vec<Placed> {
     let n = summaries.len();
     // A Message-ID's first message: a copy (in two inboxes) stands alone.
-    let mut by_id: HashMap<&str, usize> = HashMap::new();
+    let group = |i: usize| groups.get(i).copied().flatten();
+    let mut by_id = HashMap::new();
     for (i, s) in summaries.iter().enumerate() {
         if s.message_id.is_empty() {
             continue;
         }
-        let first = by_id.entry(s.message_id.as_str()).or_insert(i);
+        let first = by_id.entry((s.message_id.as_str(), group(i))).or_insert(i);
         if let (Some(&(place, uid)), Some(&(was_place, was_uid))) =
             (arrived.get(i), arrived.get(*first))
             && place == was_place
@@ -100,13 +107,34 @@ pub fn arrange_arrived(summaries: &[&Summary], arrived: &[(usize, u32)]) -> Vec<
         let named =
             std::iter::once(s.in_reply_to.as_str()).chain(s.references.split_whitespace().rev());
         for id in named.filter(|id| !id.is_empty()) {
-            if let Some(&p) = by_id.get(id)
+            if let Some(&p) = by_id.get(&(id, group(i)))
                 && p != i
                 && !answers(&parent, p, i)
             {
                 parent[i] = Some(p);
                 break;
             }
+        }
+    }
+    // Gmail's native grouping also includes messages without References.
+    // Join its otherwise separate roots under the oldest one.
+    let mut group_roots = HashMap::new();
+    for i in 0..n {
+        if parent[i].is_none()
+            && let Some(group) = group(i)
+        {
+            let root = group_roots.entry(group).or_insert(i);
+            if (summaries[i].date, i) < (summaries[*root].date, *root) {
+                *root = i;
+            }
+        }
+    }
+    for i in 0..n {
+        if parent[i].is_none()
+            && let Some(root) = group(i).and_then(|g| group_roots.get(&g)).copied()
+            && root != i
+        {
+            parent[i] = Some(root);
         }
     }
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -260,7 +288,7 @@ mod tests {
             summary("a", "", "", 10, "Plan"),
         ];
         let refs: Vec<&Summary> = list.iter().collect();
-        let placed = arrange_arrived(&refs, &[(0, 5), (0, 2), (0, 1)]);
+        let placed = arrange_arrived(&refs, &[(0, 5), (0, 2), (0, 1)], &[]);
         let reply = placed.iter().position(|p| p.index == 1).unwrap();
         assert_eq!(placed[reply - 1].index, 2, "under the first: {placed:?}");
     }
@@ -357,6 +385,28 @@ mod tests {
             [true, true, true, true, false, false, false, false]
         );
         assert_eq!(connected(&refs, 0), [false; 8]);
+    }
+
+    #[test]
+    fn native_threads_join_missing_headers_without_crossing_accounts_or_groups() {
+        let list = [
+            summary("new", "", "", 30, "Plan"),
+            summary("old", "", "", 10, "Plan"),
+            summary("other", "old", "old", 40, "Re: Plan"),
+            summary("old", "", "", 5, "Other account"),
+            summary("reply", "old", "old", 20, "Re: Plan"),
+        ];
+        let refs: Vec<_> = list.iter().collect();
+        let groups = [
+            Some((0, 7)),
+            Some((0, 7)),
+            Some((0, 8)),
+            Some((1, 7)),
+            Some((0, 7)),
+        ];
+        let placed = arrange_arrived(&refs, &[], &groups);
+        let order: Vec<_> = placed.iter().map(|p| (p.index, p.tree.as_str())).collect();
+        assert_eq!(order, [(2, ""), (1, ""), (4, "├─"), (0, "└─"), (3, "")]);
     }
 
     #[test]

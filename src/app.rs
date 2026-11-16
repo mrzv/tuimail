@@ -62,6 +62,8 @@ const HELP_PAGE: isize = 5;
 const FOLDERS_EVERY: u32 = 4;
 /// Address books change less often than inboxes; R still asks at once.
 const CONTACTS_EVERY: Duration = Duration::from_secs(30 * 60);
+/// Refresh only conversations on screen, at most once a minute.
+const CONVERSATION_REFRESH: Duration = Duration::from_secs(60);
 
 pub enum AppEvent {
     /// An AI agent's request (`agent.rs`), answered on `reply`.
@@ -302,6 +304,7 @@ pub struct AccountState {
     pub state: State,
     contacts_last_check: Option<Instant>,
     contacts_sync: Option<ContactSync>,
+    conversations: ConversationState,
     pub folders: Vec<Folder>,
     pub expanded: bool,
     /// Folders a check is running for.
@@ -321,6 +324,29 @@ pub struct AccountState {
     password_put_off: bool,
     /// Changes (moves, flags, deletes) not yet made on the server.
     waiting: std::cell::Cell<usize>,
+}
+
+#[derive(Default)]
+struct ConversationState {
+    supported: Option<bool>,
+    pending: Option<(String, u32, u64)>,
+    checked: HashMap<u64, Instant>,
+    attempted: HashMap<String, HashMap<(u32, u32), Instant>>,
+    /// Source/copy UIDs moved to Trash or Junk, not merely to another label.
+    discarded: HashMap<(String, u32), Instant>,
+    retry: Option<Instant>,
+    revision: u64,
+}
+
+impl ConversationState {
+    fn invalidate(&mut self) {
+        self.checked.clear();
+        self.attempted.clear();
+        self.discarded
+            .retain(|_, at| at.elapsed() < LOCAL_FLAGS_WIN);
+        self.retry = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
 }
 
 /// A result belongs to one account instance and one cache revision.
@@ -589,12 +615,13 @@ impl HelpMenu {
     pub const MARK_READ: usize = 2;
     pub const THREADS: usize = 3;
     pub const THREADS_INCLUDE_SENT: usize = 4;
-    pub const CONFIRM_DELETE: usize = 5;
-    pub const CONFIRM_SEND: usize = 6;
-    pub const NOTIFICATIONS: usize = 7;
-    pub const AGENTS: usize = 8;
-    pub const CONFIRM_AGENTS: usize = 9;
-    pub const THEMES: usize = 10;
+    pub const THREADS_COMPLETE_GMAIL: usize = 5;
+    pub const CONFIRM_DELETE: usize = 6;
+    pub const CONFIRM_SEND: usize = 7;
+    pub const NOTIFICATIONS: usize = 8;
+    pub const AGENTS: usize = 9;
+    pub const CONFIRM_AGENTS: usize = 10;
+    pub const THEMES: usize = 11;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -955,6 +982,7 @@ impl App {
             state,
             contacts_last_check: None,
             contacts_sync: None,
+            conversations: ConversationState::default(),
             folders,
             expanded: true,
             syncing: HashSet::new(),
@@ -1041,6 +1069,106 @@ impl App {
             && reader.width != width
         {
             self.render();
+        }
+        self.complete_visible_threads();
+    }
+
+    /// Discover only conversations currently on screen, not all of All Mail.
+    fn complete_visible_threads(&mut self) {
+        if self.demo
+            || !self.settings.threads
+            || !self.settings.threads_complete_gmail
+            || self.search.is_some()
+        {
+            return;
+        }
+        let now = Instant::now();
+        for i in 0..self.accounts.len() {
+            let account = &self.accounts[i];
+            let state = &account.conversations;
+            if account.is_pop()
+                || state.supported == Some(false)
+                || state.pending.is_some()
+                || state.retry.is_some_and(|at| now < at)
+            {
+                continue;
+            }
+            let Some(all) = account.folder_for(Role::All) else {
+                continue;
+            };
+            let folder = match &self.place {
+                Place::Folder { account, folder } if *account == i => folder.as_str(),
+                Place::Folder { .. } => continue,
+                Place::AllInboxes => account
+                    .folder_for(Role::Inbox)
+                    .map_or("INBOX", |f| f.name.as_str()),
+            };
+            let validity = self.uidvalidity(i, folder);
+            if validity == 0 {
+                continue;
+            }
+            let mut uids = Vec::new();
+            let mut thread_ids = Vec::new();
+            let attempted = state.attempted.get(folder);
+            for item in self
+                .items
+                .iter()
+                .skip(self.list_scroll.get())
+                .take(usize::from(self.list_rows.get().max(1)))
+            {
+                if item.account != i {
+                    continue;
+                }
+                if let Some(gmail) = item.message.gmail {
+                    if !state
+                        .checked
+                        .get(&gmail.thread_id)
+                        .is_some_and(|at| at.elapsed() < CONVERSATION_REFRESH)
+                        && !thread_ids.contains(&gmail.thread_id)
+                    {
+                        thread_ids.push(gmail.thread_id);
+                    }
+                } else if item.message.folder == folder
+                    && !attempted
+                        .and_then(|seen| seen.get(&(validity, item.message.uid)))
+                        .is_some_and(|at| at.elapsed() < CONVERSATION_REFRESH)
+                {
+                    uids.push(item.message.uid);
+                }
+                if uids.len() + thread_ids.len() == worker::CONVERSATION_BATCH {
+                    break;
+                }
+            }
+            if uids.is_empty() && thread_ids.is_empty() {
+                continue;
+            }
+            let all = all.name.clone();
+            let folder = folder.to_owned();
+            let state = &mut self.accounts[i].conversations;
+            state
+                .checked
+                .retain(|_, at| at.elapsed() < CONVERSATION_REFRESH);
+            state.attempted.retain(|_, seen| {
+                seen.retain(|_, at| at.elapsed() < CONVERSATION_REFRESH);
+                !seen.is_empty()
+            });
+            if !uids.is_empty() {
+                let seen = state.attempted.entry(folder.clone()).or_default();
+                for &uid in &uids {
+                    seen.insert((validity, uid), now);
+                }
+            }
+            state.pending = Some((folder.clone(), validity, state.revision));
+            self.send(
+                i,
+                Request::Conversations {
+                    folder,
+                    uidvalidity: validity,
+                    uids,
+                    thread_ids,
+                    all,
+                },
+            );
         }
     }
 
@@ -1130,6 +1258,9 @@ impl App {
             return;
         }
         self.maybe_sync_contacts(i, all);
+        if all {
+            self.accounts[i].conversations.invalidate();
+        }
         self.accounts[i].last_check = Some(Instant::now());
         if self.accounts[i].is_pop() {
             self.pop_check(i);
@@ -1285,6 +1416,9 @@ impl App {
     fn sync_sent(&mut self, i: usize) {
         if self.settings.threads
             && self.settings.threads_include_sent
+            && !(self.settings.threads_complete_gmail
+                && self.accounts[i].folder_for(Role::All).is_some()
+                && self.accounts[i].conversations.supported != Some(false))
             && let Some(folder) = self.accounts[i]
                 .folder_for(Role::Sent)
                 .map(|f| f.name.clone())
@@ -1504,6 +1638,11 @@ impl App {
                 if !matches!(state, State::Online | State::Connecting) {
                     self.accounts[i].syncing.clear();
                 }
+                if matches!(state, State::Online)
+                    && !matches!(self.accounts[i].state, State::Online)
+                {
+                    self.accounts[i].conversations.supported = None;
+                }
                 self.accounts[i].state = state;
             }
             E::Folders(folders) => {
@@ -1705,6 +1844,7 @@ impl App {
                     }
                     _ => {}
                 }
+                self.accounts[i].conversations.invalidate();
                 self.folder_changed(i, &folder);
             }
             E::Headers { folder, headers } => {
@@ -1713,6 +1853,15 @@ impl App {
                 if self.shows(i, &folder) {
                     self.reload();
                 }
+            }
+            E::Conversations {
+                folder,
+                uidvalidity,
+                all,
+                result,
+                ..
+            } => {
+                self.on_conversations(i, &folder, uidvalidity, &all, result);
             }
             E::Failed { what, error } => {
                 self.accounts[i].syncing.clear();
@@ -1725,9 +1874,162 @@ impl App {
                 let name = self.account_name(i);
                 self.error(format!("{name}: {what} failed: {error}"));
             }
-            E::Changed { folder } => self.sync_folder(i, &folder),
+            E::Changed { folder } => {
+                self.accounts[i].conversations.invalidate();
+                self.sync_folder(i, &folder);
+            }
             E::Popped(popped) => self.on_popped(i, popped),
         }
+    }
+
+    fn on_conversations(
+        &mut self,
+        i: usize,
+        folder: &str,
+        uidvalidity: u32,
+        all: &str,
+        result: Result<Option<worker::Conversations>, String>,
+    ) {
+        if !self.accounts[i]
+            .conversations
+            .pending
+            .as_ref()
+            .is_some_and(|(f, v, _)| f == folder && *v == uidvalidity)
+        {
+            return;
+        }
+        let Some((_, _, revision)) = self.accounts[i].conversations.pending.take() else {
+            return;
+        };
+        if self.uidvalidity(i, folder) != uidvalidity
+            || self.accounts[i]
+                .folder_for(Role::All)
+                .is_none_or(|f| f.name != all)
+        {
+            return;
+        }
+        let mut data = match result {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                self.accounts[i].conversations.supported = Some(false);
+                self.reload();
+                self.sync_sent(i);
+                return;
+            }
+            Err(error) => {
+                self.accounts[i].conversations.retry = Some(Instant::now() + CONVERSATION_REFRESH);
+                self.error(format!(
+                    "{}: completing conversations failed: {error}",
+                    self.account_name(i)
+                ));
+                return;
+            }
+        };
+        if data.source_uidvalidity != uidvalidity || data.all_uidvalidity == 0 {
+            return;
+        }
+        let current = revision == self.accounts[i].conversations.revision;
+        let id = self.accounts[i].id.clone();
+        let applied = (|| -> anyhow::Result<()> {
+            let known = self.store.known(&id, all)?;
+            if known.uidvalidity != data.all_uidvalidity {
+                self.store.reset_folder(&id, all)?;
+                self.forget_folder_uids(i, all);
+                self.store.set_known(
+                    &id,
+                    all,
+                    Known {
+                        uidvalidity: data.all_uidvalidity,
+                        ..Known::default()
+                    },
+                )?;
+            }
+            self.store.set_gmail(&id, folder, &data.source)?;
+            self.local_flags
+                .retain(|_, at| at.elapsed() < LOCAL_FLAGS_WIN);
+            self.local_removed
+                .retain(|_, at| at.elapsed() < LOCAL_FLAGS_WIN);
+            self.accounts[i]
+                .conversations
+                .discarded
+                .retain(|_, at| at.elapsed() < LOCAL_FLAGS_WIN);
+            let local: HashSet<u32> = self
+                .local_flags
+                .keys()
+                .filter(|(account, f, _)| *account == i && f == all)
+                .map(|(_, _, uid)| *uid)
+                .collect();
+            let removed: HashSet<u32> = self
+                .local_removed
+                .keys()
+                .filter(|(account, f, _)| *account == i && f == all)
+                .map(|(_, _, uid)| *uid)
+                .collect();
+            let removed_source: HashSet<u32> = self.accounts[i]
+                .conversations
+                .discarded
+                .keys()
+                .filter(|(f, _)| f == folder)
+                .map(|(_, uid)| *uid)
+                .collect();
+            let removed_messages: HashSet<u64> = data
+                .source
+                .iter()
+                .filter(|(uid, _)| removed_source.contains(uid))
+                .map(|(_, gmail)| gmail.message_id)
+                .collect();
+            data.headers.retain(|h| {
+                !removed.contains(&h.uid)
+                    && h.gmail
+                        .is_none_or(|gmail| !removed_messages.contains(&gmail.message_id))
+            });
+            for header in &mut data.headers {
+                if local.contains(&header.uid)
+                    && let Some(message) = self.store.message(&id, all, header.uid)?
+                {
+                    header.flags = message.flags;
+                }
+            }
+            self.store
+                .replace_gmail_threads(&id, all, &data.thread_ids, &data.headers)
+        })();
+        if let Err(error) = applied {
+            self.accounts[i].conversations.retry = Some(Instant::now() + CONVERSATION_REFRESH);
+            self.error(format!("Couldn't cache conversations: {error:#}"));
+            return;
+        }
+        let state = &mut self.accounts[i].conversations;
+        state.supported = Some(true);
+        state.retry = None;
+        if current {
+            let now = Instant::now();
+            for id in data.thread_ids {
+                state.checked.insert(id, now);
+            }
+        }
+        self.reload();
+    }
+
+    /// A new UIDVALIDITY invalidates every UI reference to this folder's UIDs.
+    fn forget_folder_uids(&mut self, i: usize, folder: &str) {
+        let stale = |key: &(usize, String, u32)| key.0 == i && key.1 == folder;
+        if self.reader.as_ref().is_some_and(|r| stale(&r.key())) {
+            self.reader = None;
+            if self.focus == Focus::Reader {
+                self.focus = Focus::List;
+            }
+        }
+        self.marked.retain(|k| !stale(k));
+        self.local_flags.retain(|k, _| !stale(k));
+        self.local_removed.retain(|k, _| !stale(k));
+        self.accounts[i]
+            .conversations
+            .discarded
+            .retain(|(f, _), _| f != folder);
+        if self.pending.as_ref().is_some_and(|(k, _)| stale(k)) {
+            self.pending = None;
+        }
+        self.accounts[i].conversations.invalidate();
     }
 
     /// A reply, forward or draft waiting for this message's text, which
@@ -1777,18 +2079,7 @@ impl App {
         let before = self.store.known(&id, &s.folder).unwrap_or_default();
         if s.reset {
             let _ = self.store.reset_folder(&id, &s.folder);
-            // Its UIDs mean other messages now: nothing may act on the old.
-            let stale = |key: &(usize, String, u32)| key.0 == i && key.1 == s.folder;
-            if self.reader.as_ref().is_some_and(|r| stale(&r.key())) {
-                self.reader = None;
-                if self.focus == Focus::Reader {
-                    self.focus = Focus::List;
-                }
-            }
-            self.marked.retain(|k| !stale(k));
-            if self.pending.as_ref().is_some_and(|(k, _)| stale(k)) {
-                self.pending = None;
-            }
+            self.forget_folder_uids(i, &s.folder);
         }
         let _ = self.store.add_headers(&id, &s.folder, &s.new);
         // People who write to you are offered when you write.
@@ -1962,9 +2253,10 @@ impl App {
             Place::AllInboxes => self.accounts[i].inbox() == folder,
         };
         here || self.settings.threads
-            && self.settings.threads_include_sent
             && self.search.is_none()
-            && self.role_of(i, folder) == Some(Role::Sent)
+            && (self.settings.threads_include_sent && self.role_of(i, folder) == Some(Role::Sent)
+                || self.settings.threads_complete_gmail
+                    && self.role_of(i, folder) == Some(Role::All))
             && match self.place {
                 Place::Folder { account, .. } => account == i,
                 Place::AllInboxes => true,
@@ -2139,7 +2431,37 @@ impl App {
                 (None, None) => Ok(Vec::new()),
             };
             let mut found = found.unwrap_or_default();
+            let complete = self.settings.threads
+                && self.settings.threads_complete_gmail
+                && self.search.is_none()
+                && self.accounts[i].conversations.supported != Some(false);
+            if complete
+                && let Some(all) = self.accounts[i].folder_for(Role::All)
+                && folder.as_deref() != Some(all.name.as_str())
+            {
+                let threads: HashSet<u64> = found
+                    .iter()
+                    .filter_map(|m| m.gmail.map(|g| g.thread_id))
+                    .collect();
+                if !threads.is_empty() {
+                    let threads: Vec<u64> = threads.into_iter().collect();
+                    let members = self
+                        .store
+                        .gmail_messages(id, &all.name, &threads)
+                        .unwrap_or_default();
+                    let mut seen: HashSet<u64> = found
+                        .iter()
+                        .filter_map(|m| m.gmail.map(|g| g.message_id))
+                        .collect();
+                    found.extend(
+                        members
+                            .into_iter()
+                            .filter(|m| m.gmail.is_some_and(|g| seen.insert(g.message_id))),
+                    );
+                }
+            }
             if self.settings.threads
+                && !(complete && self.accounts[i].folder_for(Role::All).is_some())
                 && self.settings.threads_include_sent
                 && self.search.is_none()
                 && !found.is_empty()
@@ -2191,7 +2513,15 @@ impl App {
                     (n, it.message.uid)
                 })
                 .collect();
-            let order = crate::threads::arrange_arrived(&summaries, &arrived);
+            let groups: Vec<_> = if self.settings.threads_complete_gmail {
+                items
+                    .iter()
+                    .map(|it| it.message.gmail.map(|g| (it.account, g.thread_id)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let order = crate::threads::arrange_arrived(&summaries, &arrived, &groups);
             let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
             items = order
                 .into_iter()
@@ -3982,7 +4312,10 @@ impl App {
                 self.focus = Focus::List;
             }
         }
-        if self.settings.threads && self.settings.threads_include_sent && self.search.is_none() {
+        if self.settings.threads
+            && (self.settings.threads_include_sent || self.settings.threads_complete_gmail)
+            && self.search.is_none()
+        {
             self.reload();
         }
         self.selected = self.selected.min(self.items.len().saturating_sub(1));
@@ -3992,7 +4325,7 @@ impl App {
     /// Moves messages to `to` (a folder of the same account).
     fn move_messages(&mut self, account: usize, folder: &str, uids: &[u32], to: &str) {
         let id = self.accounts[account].id.clone();
-        let keys: Vec<_> = uids
+        let mut keys: Vec<_> = uids
             .iter()
             .map(|u| (account, folder.to_string(), *u))
             .collect();
@@ -4014,9 +4347,35 @@ impl App {
             }
             self.refresh_counts(account, to);
         } else {
+            let now = Instant::now();
+            if self.accounts[account]
+                .folders
+                .iter()
+                .any(|f| f.name == to && matches!(f.role, Some(Role::Trash | Role::Junk)))
+            {
+                let original = keys.len();
+                keys.extend(
+                    self.store
+                        .gmail_copies(&id, folder, uids)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(f, _)| f != folder && f != to)
+                        .map(|(f, uid)| (account, f, uid)),
+                );
+                for (_, f, copies) in Self::grouped(&keys[original..]) {
+                    let unread = self.unread_among(account, &f, &copies);
+                    let _ = self.store.remove(&id, &f, &copies);
+                    self.note_removed(account, &f, copies.len(), unread);
+                }
+                let state = &mut self.accounts[account].conversations;
+                for (_, folder, uid) in &keys {
+                    state.discarded.insert((folder.clone(), *uid), now);
+                }
+                state.invalidate();
+            }
             let _ = self.store.remove(&id, folder, uids);
             for key in &keys {
-                self.local_removed.insert(key.clone(), Instant::now());
+                self.local_removed.insert(key.clone(), now);
             }
             self.send(
                 account,
@@ -4534,6 +4893,7 @@ impl App {
             return;
         }
         self.composer = None;
+        self.accounts[i].conversations.invalidate();
         let n = sent.to.len();
         self.info(format!("Sent to {}", plural(n, "recipient")));
         let _ = self.store.remember(&sent.to, true, now());
@@ -5774,14 +6134,22 @@ impl App {
                 self.render();
             }
             HelpMenu::MARK_READ => self.save_setting("mark_read", flip(self.settings.mark_read)),
-            HelpMenu::THREADS | HelpMenu::THREADS_INCLUDE_SENT => {
-                if row == HelpMenu::THREADS {
-                    self.save_setting("threads", flip(self.settings.threads));
-                } else {
-                    self.save_setting(
-                        "threads_include_sent",
-                        flip(self.settings.threads_include_sent),
-                    );
+            HelpMenu::THREADS
+            | HelpMenu::THREADS_INCLUDE_SENT
+            | HelpMenu::THREADS_COMPLETE_GMAIL => {
+                let (key, value) = match row {
+                    HelpMenu::THREADS => ("threads", self.settings.threads),
+                    HelpMenu::THREADS_INCLUDE_SENT => {
+                        ("threads_include_sent", self.settings.threads_include_sent)
+                    }
+                    _ => (
+                        "threads_complete_gmail",
+                        self.settings.threads_complete_gmail,
+                    ),
+                };
+                self.save_setting(key, flip(value));
+                for account in &mut self.accounts {
+                    account.conversations.invalidate();
                 }
                 self.reload();
                 for i in 0..self.accounts.len() {
@@ -8362,6 +8730,7 @@ pub mod tests {
             summary: mail::summarize(raw),
             flags: Flags::default(),
             size: 4000,
+            gmail: None,
         };
         app.store.add_headers(&id, "INBOX", &[header]).unwrap();
         let handle = app.agent_id(0, "INBOX", 77001);
@@ -8773,5 +9142,421 @@ pub mod tests {
         assert_eq!(app.status.as_ref().unwrap().text, "work: signed in");
         app.on_signed_in(&id, Err("the sign-in was refused: no".into()));
         assert!(app.status.as_ref().unwrap().error);
+    }
+
+    fn gmail_app() -> App {
+        let mut app = app();
+        let id = app.accounts[0].id.clone();
+        let mut folders = local_folders();
+        let mut all = folders
+            .iter()
+            .find(|f| f.role == Some(Role::Inbox))
+            .unwrap()
+            .clone();
+        all.name = "All Mail".into();
+        all.shown = "All Mail".into();
+        all.role = Some(Role::All);
+        folders.push(all);
+        app.store.set_folders(&id, &folders).unwrap();
+        app.accounts[0].folders = app.store.folders(&id).unwrap();
+        for (folder, uidvalidity) in [("INBOX", 10), ("All Mail", 20), ("Archive", 30)] {
+            app.store
+                .set_known(
+                    &id,
+                    folder,
+                    Known {
+                        uidvalidity,
+                        ..Known::default()
+                    },
+                )
+                .unwrap();
+        }
+        let first = crate::store::tests::header(1, "Current plan", 20);
+        let second = crate::store::tests::header(2, "Another Inbox member", 40);
+        app.store
+            .add_headers(&id, "INBOX", &[first, second])
+            .unwrap();
+        app.reload();
+        app
+    }
+
+    fn gmail_result() -> worker::Conversations {
+        let mut headers = Vec::new();
+        for (uid, message_id, subject, date, sent) in [
+            (101, 9001, "Archived plan", 10, false),
+            (102, 9002, "Current plan", 20, false),
+            (103, 9003, "Sent plan", 30, true),
+            (104, 9004, "Another Inbox member", 40, false),
+        ] {
+            let mut header = crate::store::tests::header(uid, subject, date);
+            header.gmail = Some(crate::store::Gmail {
+                message_id,
+                thread_id: 700,
+                sent,
+            });
+            if sent {
+                header.summary.to = header.summary.from.display();
+            }
+            headers.push(header);
+        }
+        worker::Conversations {
+            source_uidvalidity: 10,
+            all_uidvalidity: 20,
+            source: vec![
+                (1, headers[1].gmail.unwrap()),
+                (2, headers[3].gmail.unwrap()),
+            ],
+            headers,
+            thread_ids: vec![700],
+        }
+    }
+
+    #[test]
+    fn gmail_threads_expand_visible_conversations_without_duplicate_label_copies() {
+        let mut app = gmail_app();
+        assert!(!app.settings.threads_complete_gmail);
+        app.on_key(key(KeyCode::Char('O')));
+        app.help.as_mut().unwrap().selected = HelpMenu::THREADS_COMPLETE_GMAIL;
+        app.on_key(key(KeyCode::Enter));
+        let screen = crate::ui::tests::screen(&mut app, 160, 40);
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("Complete Gmail threads") && line.contains("[✓]"))
+        );
+        app.on_key(key(KeyCode::Esc));
+        app.demo = false; // No workers: requests are recorded, never connected.
+        app.list_rows.set(1);
+        app.list_scroll.set(0);
+        app.after_draw();
+        assert!(
+            matches!(app.test_sent.borrow().last(), Some((0, Request::Conversations { uids, thread_ids, .. })) if uids == &[2] && thread_ids.is_empty())
+        );
+        app.on_worker(
+            0,
+            worker::Event::Conversations {
+                folder: "INBOX".into(),
+                uidvalidity: 10,
+                uids: vec![2],
+                thread_ids: vec![],
+                all: "All Mail".into(),
+                result: Ok(Some(gmail_result())),
+            },
+        );
+        let keys: Vec<_> = app
+            .items
+            .iter()
+            .map(|item| (item.message.folder.as_str(), item.message.uid))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("All Mail", 101),
+                ("INBOX", 1),
+                ("All Mail", 103),
+                ("INBOX", 2)
+            ]
+        );
+        assert!(app.items[0].thread.tree.is_empty());
+        assert!(
+            app.items[1..]
+                .iter()
+                .all(|item| !item.thread.tree.is_empty())
+        );
+        let screen = crate::ui::tests::screen(&mut app, 160, 30);
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("Archived plan") && line.contains("[All Mail]"))
+        );
+        assert!(screen.lines().any(|line| line.contains("Sent plan")
+            && line.contains("To Alice")
+            && line.contains(app.icons.sent)));
+        let requests = app.test_sent.borrow().len();
+        app.after_draw();
+        assert_eq!(
+            app.test_sent.borrow().len(),
+            requests,
+            "fresh native threads need no repeat lookup"
+        );
+
+        app.selected = 2;
+        app.on_key(key(KeyCode::Char('s')));
+        let id = app.accounts[0].id.clone();
+        assert!(
+            app.store
+                .message(&id, "All Mail", 103)
+                .unwrap()
+                .unwrap()
+                .flags
+                .flagged
+        );
+        assert!(
+            !app.store
+                .message(&id, "INBOX", 1)
+                .unwrap()
+                .unwrap()
+                .flags
+                .flagged
+        );
+        app.accounts[0].conversations.invalidate();
+        app.after_draw();
+        app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+        assert!(
+            app.store
+                .message(&id, "All Mail", 103)
+                .unwrap()
+                .unwrap()
+                .flags
+                .flagged,
+            "a stale server flag cannot undo a local change"
+        );
+
+        let mut archived = gmail_result().headers.remove(0);
+        archived.uid = 77;
+        app.store.add_headers(&id, "Archive", &[archived]).unwrap();
+        app.place = Place::Folder {
+            account: 0,
+            folder: "Archive".into(),
+        };
+        app.reload();
+        assert_eq!(app.items.len(), 4);
+        assert_eq!(app.items[0].message.folder, "Archive");
+        assert_eq!(app.items[0].message.uid, 77);
+        app.place = Place::AllInboxes;
+        app.reload();
+        assert_eq!(app.items.len(), 4);
+        app.place = Place::Folder {
+            account: 0,
+            folder: "INBOX".into(),
+        };
+        app.run_search("Current plan".into());
+        let subjects: Vec<_> = app
+            .items
+            .iter()
+            .map(|item| item.message.summary.subject.as_str())
+            .collect();
+        assert_eq!(
+            subjects,
+            ["Current plan", "Current plan"],
+            "search remains matching messages only, without thread expansion"
+        );
+        app.search = None;
+        app.settings.threads_complete_gmail = false;
+        app.reload();
+        assert_eq!(
+            app.items.len(),
+            2,
+            "turning the setting off restores the folder view"
+        );
+    }
+
+    #[test]
+    fn gmail_completion_rejects_reused_source_uids_and_resets_all_mail_safely() {
+        let mut app = gmail_app();
+        app.settings.threads_complete_gmail = true;
+        app.demo = false;
+        app.after_draw();
+        let id = app.accounts[0].id.clone();
+        app.store.reset_folder(&id, "INBOX").unwrap();
+        app.store
+            .set_known(
+                &id,
+                "INBOX",
+                Known {
+                    uidvalidity: 11,
+                    ..Known::default()
+                },
+            )
+            .unwrap();
+        app.store
+            .add_headers(
+                &id,
+                "INBOX",
+                &[crate::store::tests::header(2, "Replacement", 50)],
+            )
+            .unwrap();
+        app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+        assert!(
+            app.store
+                .message(&id, "INBOX", 2)
+                .unwrap()
+                .unwrap()
+                .gmail
+                .is_none()
+        );
+        assert!(app.store.messages(&id, "All Mail", 100).unwrap().is_empty());
+        app.reload();
+        app.after_draw();
+        let old = gmail_result().headers.remove(0);
+        app.store.add_headers(&id, "All Mail", &[old]).unwrap();
+        app.store
+            .save_body(&id, "All Mail", 101, b"Subject: Old\r\n\r\nOld")
+            .unwrap();
+        app.marked.insert((0, "All Mail".into(), 101));
+        app.local_removed
+            .insert((0, "All Mail".into(), 101), Instant::now());
+        app.local_flags
+            .insert((0, "All Mail".into(), 101), Instant::now());
+        app.local_removed
+            .insert((0, "Archive".into(), 77), Instant::now());
+        let discarded = &mut app.accounts[0].conversations.discarded;
+        discarded.insert(("All Mail".into(), 101), Instant::now());
+        discarded.insert(("Archive".into(), 77), Instant::now());
+        let mut result = gmail_result();
+        result.source_uidvalidity = 11;
+        result.all_uidvalidity = 21;
+        result.source.retain(|(uid, _)| *uid == 2);
+        app.on_conversations(0, "INBOX", 11, "All Mail", Ok(Some(result)));
+        assert!(app.marked.is_empty());
+        assert!(!app.local_removed.contains_key(&(0, "All Mail".into(), 101)));
+        assert!(!app.local_flags.contains_key(&(0, "All Mail".into(), 101)));
+        assert!(app.local_removed.contains_key(&(0, "Archive".into(), 77)));
+        let discarded = &app.accounts[0].conversations.discarded;
+        assert!(!discarded.contains_key(&("All Mail".into(), 101)));
+        assert!(discarded.contains_key(&("Archive".into(), 77)));
+        assert!(app.store.body(&id, "All Mail", 101).unwrap().is_none());
+        let known = app.store.known(&id, "All Mail").unwrap();
+        assert_eq!(
+            (known.uidvalidity, known.low, known.high),
+            (21, 0, 0),
+            "sparse completion is never a contiguous sync range"
+        );
+        assert_eq!(app.items.len(), 4);
+    }
+
+    #[test]
+    fn gmail_completion_refreshes_after_a_send_even_with_an_older_lookup_in_flight() {
+        let mut app = gmail_app();
+        app.settings.threads_complete_gmail = true;
+        Arc::make_mut(&mut app.accounts[0].account).save_sent = Some(false);
+        app.demo = false;
+        app.after_draw();
+        let id = app.accounts[0].id.clone();
+        app.on_sent(
+            &id,
+            Ok(()),
+            false,
+            SentCopy {
+                raw: vec![],
+                to: vec![],
+                replying: None,
+                draft_of: None,
+            },
+        );
+        app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+        app.test_sent.borrow_mut().clear();
+        app.after_draw();
+        assert!(
+            matches!(app.test_sent.borrow().last(), Some((0, Request::Conversations { uids, thread_ids, .. })) if uids.is_empty() && thread_ids == &[700])
+        );
+        let mut fresh = gmail_result();
+        let mut sent = fresh.headers[2].clone();
+        sent.uid = 105;
+        sent.summary.subject = "Newly sent reply".into();
+        sent.summary.date = 60;
+        sent.gmail.as_mut().unwrap().message_id = 9005;
+        fresh.headers.push(sent);
+        app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(fresh)));
+        assert_eq!(app.items.len(), 5);
+        assert_eq!(
+            app.items.last().unwrap().message.summary.subject,
+            "Newly sent reply"
+        );
+    }
+
+    #[test]
+    fn gmail_archiving_a_member_keeps_its_all_mail_header_and_body() {
+        for already_completed in [false, true] {
+            let mut app = gmail_app();
+            app.settings.threads_complete_gmail = true;
+            app.demo = false;
+            app.after_draw();
+            let id = app.accounts[0].id.clone();
+            let raw = b"Subject: Current plan\r\n\r\nKeep this archived mail";
+            if already_completed {
+                app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+                app.store.save_body(&id, "All Mail", 102, raw).unwrap();
+                app.accounts[0].conversations.invalidate();
+                app.after_draw();
+            }
+
+            // The reply is still part of this conversation after its Inbox
+            // label is removed, including in a response already in flight.
+            app.move_messages(0, "INBOX", &[1], "Archive");
+            app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+            assert!(app.store.message(&id, "INBOX", 1).unwrap().is_none());
+            assert!(app.store.message(&id, "All Mail", 102).unwrap().is_some());
+            assert_eq!(app.items.len(), 4);
+            assert!(app.items.iter().any(|item| {
+                item.message.folder == "All Mail"
+                    && item.message.uid == 102
+                    && item.message.summary.subject == "Current plan"
+            }));
+            if already_completed {
+                assert_eq!(app.store.body(&id, "All Mail", 102).unwrap().unwrap(), raw);
+            }
+        }
+    }
+
+    #[test]
+    fn gmail_trashing_a_member_cannot_restore_its_cached_label_copies() {
+        for already_completed in [false, true] {
+            let mut app = gmail_app();
+            app.settings.threads_complete_gmail = true;
+            app.demo = false;
+            app.after_draw();
+            let id = app.accounts[0].id.clone();
+            if already_completed {
+                app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+                let mut copy = gmail_result().headers.remove(1);
+                copy.uid = 77;
+                app.store
+                    .add_headers(&id, "Archive", std::slice::from_ref(&copy))
+                    .unwrap();
+                copy.uid = 88;
+                app.store
+                    .add_headers(&id, "Sent", std::slice::from_ref(&copy))
+                    .unwrap();
+                app.store
+                    .add_headers("another-account", "All Mail", &[copy])
+                    .unwrap();
+                app.store
+                    .save_body(
+                        &id,
+                        "All Mail",
+                        102,
+                        b"Subject: Current plan\r\n\r\nPrivate",
+                    )
+                    .unwrap();
+                app.marked.insert((0, "All Mail".into(), 102));
+            }
+            app.move_messages(0, "INBOX", &[1], "Trash");
+            assert!(app.store.message(&id, "All Mail", 102).unwrap().is_none());
+            assert!(app.store.message(&id, "Archive", 77).unwrap().is_none());
+            assert!(app.store.message(&id, "Sent", 88).unwrap().is_none());
+            assert!(app.store.body(&id, "All Mail", 102).unwrap().is_none());
+            assert!(!app.marked.contains(&(0, "All Mail".into(), 102)));
+            if already_completed {
+                assert!(
+                    app.store
+                        .message("another-account", "All Mail", 88)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+
+            // An older server answer must not undo the local move, even if
+            // native metadata was not known until this answer arrived.
+            app.after_draw();
+            app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(gmail_result())));
+            assert_eq!(app.items.len(), 3);
+            assert!(
+                app.items
+                    .iter()
+                    .all(|item| item.message.summary.subject != "Current plan")
+            );
+            assert!(app.store.message(&id, "All Mail", 102).unwrap().is_none());
+        }
     }
 }

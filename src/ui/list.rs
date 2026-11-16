@@ -150,8 +150,9 @@ fn row(
         .get(item.account)
         .and_then(|a| a.folders.iter().find(|f| f.name == m.folder))
         .and_then(|f| f.role);
+    let sent = role == Some(Role::Sent) || m.gmail.is_some_and(|g| g.sent);
     // In Sent and Drafts, who it's to matters.
-    let who = if matches!(role, Some(Role::Sent | Role::Drafts)) {
+    let who = if sent || role == Some(Role::Drafts) {
         let to = m.summary.to.split(',').next().unwrap_or("").trim();
         let to = to.split('<').next().unwrap_or(to).trim().trim_matches('"');
         format!("To {}", if to.is_empty() { "?" } else { to })
@@ -196,7 +197,7 @@ fn row(
         Place::Folder { account, folder } => *account != item.account || *folder != m.folder,
         Place::AllInboxes => app.accounts[item.account].inbox() != m.folder,
     };
-    let folder = if role == Some(Role::Sent) && (app.search.is_some() || outside) {
+    let folder = if sent && (app.search.is_some() || outside || role != Some(Role::Sent)) {
         if matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1 {
             format!(
                 "{} [{}] ",

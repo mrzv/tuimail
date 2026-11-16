@@ -16,7 +16,7 @@ use crate::account::{Account, Protocol};
 use crate::imap::{self, Caps, FlagKind, Session};
 use crate::net::Endpoint;
 use crate::secrets::{Credentials, NeedPassword};
-use crate::store::{Flags, Folder, Header, Known};
+use crate::store::{Flags, Folder, Gmail, Header, Known};
 use crate::{pop3, smtp, tags, text};
 
 /// After a failed connection, requests fail at once for this long instead
@@ -33,6 +33,8 @@ const POP_MAX: usize = 60 << 20;
 /// The most bytes one check downloads before leaving the rest for the
 /// next.
 const POP_BYTES: usize = 256 << 20;
+/// Visible seed messages per native Gmail conversation request.
+pub const CONVERSATION_BATCH: usize = 32;
 
 /// What the app asks an account's worker to do.
 #[derive(Clone, Debug)]
@@ -97,6 +99,14 @@ pub enum Request {
         uids: Vec<u32>,
         uidvalidity: u32,
     },
+    /// Complete native Gmail conversations, without syncing All Mail.
+    Conversations {
+        folder: String,
+        uidvalidity: u32,
+        uids: Vec<u32>,
+        thread_ids: Vec<u64>,
+        all: String,
+    },
     /// Moves messages back from `folder` to `to` (an undo): each by its
     /// Message-ID and size from UID `floor` on (the folder's UIDNEXT just
     /// before the move put them there, under `uidvalidity`), since their
@@ -158,6 +168,7 @@ impl Request {
             Request::Delete { .. } => "deleting mail",
             Request::Append { .. } => "saving a copy",
             Request::Headers { .. } => "checking for mail",
+            Request::Conversations { .. } => "loading Gmail conversations",
             Request::Search { .. } => "searching",
             Request::Pop { .. } => "checking for mail",
         }
@@ -208,6 +219,15 @@ pub struct Popped {
     pub deleted: Vec<String>,
     /// More new mail is waiting: check again.
     pub more: bool,
+}
+/// A source mailbox's native metadata and complete All Mail thread headers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Conversations {
+    pub source_uidvalidity: u32,
+    pub all_uidvalidity: u32,
+    pub source: Vec<(u32, Gmail)>,
+    pub headers: Vec<Header>,
+    pub thread_ids: Vec<u64>,
 }
 
 /// What a worker tells the app.
@@ -271,6 +291,14 @@ pub enum Event {
     Headers {
         folder: String,
         headers: Vec<Header>,
+    },
+    Conversations {
+        folder: String,
+        uidvalidity: u32,
+        uids: Vec<u32>,
+        thread_ids: Vec<u64>,
+        all: String,
+        result: Result<Option<Conversations>, String>,
     },
     Failed {
         what: &'static str,
@@ -467,6 +495,20 @@ fn report_failure(request: &Request, error: String, sink: &Sink) {
             } else {
                 error
             }),
+        }),
+        Request::Conversations {
+            folder,
+            uidvalidity,
+            uids,
+            thread_ids,
+            all,
+        } => sink(Event::Conversations {
+            folder: folder.clone(),
+            uidvalidity: *uidvalidity,
+            uids: uids.clone(),
+            thread_ids: thread_ids.clone(),
+            all: all.clone(),
+            result: Err(error),
         }),
         _ => sink(Event::Failed {
             what: request.what(),
@@ -804,6 +846,27 @@ async fn handle_imap(
             let headers = imap::headers(s, &uids).await?;
             sink(Event::Headers { folder, headers });
         }
+        Request::Conversations {
+            folder,
+            uidvalidity,
+            uids,
+            thread_ids,
+            all,
+        } => {
+            let result = if caps.gmail {
+                Some(conversations(s, &folder, uidvalidity, &uids, &thread_ids, &all).await?)
+            } else {
+                None
+            };
+            sink(Event::Conversations {
+                folder,
+                uidvalidity,
+                uids,
+                thread_ids,
+                all,
+                result: Ok(result),
+            });
+        }
         Request::Search { folder, query } => {
             let Some(criteria) = imap::search_criteria(&query) else {
                 return Ok(());
@@ -822,6 +885,61 @@ async fn handle_imap(
         Request::Pop { .. } => {}
     }
     Ok(())
+}
+
+async fn conversations(
+    s: &mut Session,
+    folder: &str,
+    uidvalidity: u32,
+    uids: &[u32],
+    thread_ids: &[u64],
+    all: &str,
+) -> Result<Conversations> {
+    if uidvalidity == 0
+        || uids.len().saturating_add(thread_ids.len()) > CONVERSATION_BATCH
+        || uids.contains(&0)
+        || thread_ids.contains(&0)
+    {
+        return Err(imap::Said(
+            "Gmail conversations need a known mailbox and bounded native IDs".into(),
+        )
+        .into());
+    }
+    let selected = select_same(s, folder, uidvalidity).await?;
+    let seeds = imap::gmail_metadata(s, uids).await?;
+    let mut threads: Vec<u64> = thread_ids
+        .iter()
+        .copied()
+        .chain(seeds.iter().map(|(_, gmail)| gmail.thread_id))
+        .collect();
+    threads.sort_unstable();
+    threads.dedup();
+    let source_uids = imap::gmail_thread_uids(s, &threads).await?;
+    let (all_uidvalidity, source, headers) = if folder == all {
+        let headers = imap::gmail_headers(s, &source_uids, &threads).await?;
+        let source = headers
+            .iter()
+            .filter_map(|header| header.gmail.map(|gmail| (header.uid, gmail)))
+            .collect();
+        (selected.uidvalidity, source, headers)
+    } else {
+        let mut source = imap::gmail_metadata(s, &source_uids).await?;
+        source.retain(|(_, gmail)| threads.binary_search(&gmail.thread_id).is_ok());
+        let target = imap::select(s, all).await?;
+        if target.uidvalidity == 0 {
+            return Err(imap::Said("All Mail did not provide UIDVALIDITY".into()).into());
+        }
+        let all_uids = imap::gmail_thread_uids(s, &threads).await?;
+        let headers = imap::gmail_headers(s, &all_uids, &threads).await?;
+        (target.uidvalidity, source, headers)
+    };
+    Ok(Conversations {
+        source_uidvalidity: selected.uidvalidity,
+        all_uidvalidity,
+        source,
+        headers,
+        thread_ids: threads,
+    })
 }
 
 /// What's new in `folder` since `known`, and the flags of what's cached.
@@ -1184,5 +1302,334 @@ mod tests {
             matches!(&events[..], [Event::Body { uid: 9, result: Err(e), .. }] if e.contains("offline")),
             "{events:?}"
         );
+    }
+
+    fn gmail_header(
+        uid: u32,
+        message_id: u64,
+        thread_id: u64,
+        labels: &str,
+        flags: &str,
+    ) -> String {
+        let header = "From: \"Other\" <other@example.org>\r\nTo: me@example.org\r\nSubject: A native thread\r\n\r\n";
+        format!(
+            "* {uid} FETCH (UID {uid} FLAGS ({flags}) RFC822.SIZE 123 INTERNALDATE \"01-Jan-2026 00:00:00 +0000\" \
+             X-GM-MSGID {message_id} X-GM-THRID {thread_id} X-GM-LABELS ({labels}) \
+             BODY[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE)] {{{}}}\r\n{header})\r\n",
+            header.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn gmail_conversations_fetch_complete_source_mappings_and_all_mail_headers_only() {
+        const THREAD: u64 = u64::MAX - 2;
+        const FIRST: u64 = u64::MAX - 1;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (mut session, caps) = imap::tests::scripted_capabilities("IMAP4rev1 X-GM-EXT-1", move |tag, command| {
+            let step = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = match step {
+                0 => {
+                    assert_eq!(command, "SELECT \"INBOX\"");
+                    "* 6 EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n".into()
+                }
+                1 => {
+                    assert_eq!(command, "UID FETCH 1 (UID FLAGS X-GM-MSGID X-GM-THRID X-GM-LABELS)");
+                    format!("* 1 FETCH (UID 1 FLAGS () X-GM-MSGID {FIRST} X-GM-THRID {THREAD} X-GM-LABELS (\\Inbox))\r\n\
+                             * 8 FETCH (UID 88 X-GM-MSGID 10 X-GM-THRID 10 X-GM-LABELS ())\r\n")
+                }
+                2 => {
+                    assert_eq!(command, format!("UID SEARCH X-GM-THRID {THREAD}"));
+                    "* SEARCH 1 4 5 6\r\n".into()
+                }
+                3 => {
+                    assert_eq!(command, "UID FETCH 1,4:6 (UID FLAGS X-GM-MSGID X-GM-THRID X-GM-LABELS)");
+                    format!("* 1 FETCH (UID 1 FLAGS () X-GM-MSGID {FIRST} X-GM-THRID {THREAD} X-GM-LABELS (\\Inbox))\r\n\
+                             * 2 FETCH (UID 4 FLAGS () X-GM-MSGID 44 X-GM-THRID {THREAD} X-GM-LABELS (\"Sent\"))\r\n\
+                             * 3 FETCH (UID 5 FLAGS () X-GM-MSGID 55 X-GM-THRID 55 X-GM-LABELS ())\r\n\
+                             * 4 FETCH (UID 6 FLAGS (\\Deleted) X-GM-MSGID 66 X-GM-THRID {THREAD} X-GM-LABELS ())\r\n\
+                             * 1 FETCH (UID 1 FLAGS () X-GM-MSGID 1 X-GM-THRID 1 X-GM-LABELS ())\r\n\
+                             * 9 FETCH (UID 77 FLAGS () X-GM-MSGID 77 X-GM-THRID {THREAD} X-GM-LABELS ())\r\n")
+                }
+                4 => {
+                    assert_eq!(command, "SELECT \"[Gmail]/All Mail\"");
+                    "* 100000 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n".into()
+                }
+                5 => {
+                    assert_eq!(command, format!("UID SEARCH X-GM-THRID {THREAD}"));
+                    "* SEARCH 8 9 10 11\r\n".into()
+                }
+                6 => {
+                    assert!(command.starts_with("UID FETCH 8:11 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS ("), "{command}");
+                    assert!(command.ends_with("X-GM-MSGID X-GM-THRID X-GM-LABELS)"), "{command}");
+                    let mut out = "* 8 FETCH (UID 8 FLAGS (\\Seen))\r\n".to_string();
+                    out.push_str(&gmail_header(8, FIRST, THREAD, "\\Inbox", "\\Seen"));
+                    out.push_str(&gmail_header(9, u64::MAX, THREAD, "\\Sent", ""));
+                    out.push_str(&gmail_header(10, 10, 10, "", ""));
+                    out.push_str(&gmail_header(11, 11, THREAD, "", "\\Deleted"));
+                    out.push_str(&gmail_header(88, 88, THREAD, "", ""));
+                    out.push_str(&gmail_header(9, 1, THREAD, "", ""));
+                    out
+                }
+                _ => panic!("unexpected command: {command}"),
+            };
+            format!("{answer}{tag} OK done\r\n").into_bytes()
+        }).await;
+        assert!(
+            caps.gmail,
+            "CAPABILITY, not the account host, gates the extension"
+        );
+        let got = conversations(&mut session, "INBOX", 7, &[1], &[], "[Gmail]/All Mail")
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
+        assert_eq!((got.source_uidvalidity, got.all_uidvalidity), (7, 9));
+        assert_eq!(got.thread_ids, [THREAD]);
+        assert_eq!(
+            got.source.iter().map(|(uid, _)| *uid).collect::<Vec<_>>(),
+            [1, 4]
+        );
+        assert!(
+            !got.source[1].1.sent,
+            "a user label named Sent isn't the standard label"
+        );
+        assert_eq!(
+            got.headers.iter().map(|h| h.uid).collect::<Vec<_>>(),
+            [8, 9]
+        );
+        assert_eq!(got.headers[0].gmail.unwrap().message_id, FIRST);
+        assert_eq!(got.headers[1].gmail.unwrap().message_id, u64::MAX);
+        assert!(got.headers[1].gmail.unwrap().sent);
+        assert!(got.headers[0].flags.seen);
+        assert_eq!(got.headers[0].size, 123);
+        assert!(
+            got.headers[0].summary.date > 0,
+            "INTERNALDATE supplies missing Date"
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_known_threads_survive_an_empty_source_folder() {
+        let mut step = 0;
+        let (mut session, _) =
+            imap::tests::scripted_capabilities("IMAP4rev1 X-GM-EXT-1", move |tag, command| {
+                let answer = match step {
+                    0 => {
+                        assert_eq!(command, "SELECT \"INBOX\"");
+                        "* 0 EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n".into()
+                    }
+                    1 => {
+                        assert_eq!(
+                            command,
+                            "UID SEARCH OR OR X-GM-THRID 8 X-GM-THRID 9 X-GM-THRID 10"
+                        );
+                        "* SEARCH\r\n".into()
+                    }
+                    2 => {
+                        assert_eq!(command, "SELECT \"All\"");
+                        "* 100 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n".into()
+                    }
+                    3 => {
+                        assert_eq!(
+                            command,
+                            "UID SEARCH OR OR X-GM-THRID 8 X-GM-THRID 9 X-GM-THRID 10"
+                        );
+                        "* SEARCH 20\r\n".into()
+                    }
+                    4 => {
+                        assert!(command.starts_with("UID FETCH 20 "));
+                        gmail_header(20, 21, 9, "\\Sent", "")
+                    }
+                    _ => panic!("unexpected command: {command}"),
+                };
+                step += 1;
+                format!("{answer}{tag} OK done\r\n").into_bytes()
+            })
+            .await;
+        let got = conversations(&mut session, "INBOX", 7, &[], &[10, 9, 8, 9], "All")
+            .await
+            .unwrap();
+        assert_eq!(got.thread_ids, [8, 9, 10]);
+        assert!(got.source.is_empty());
+        assert_eq!(got.headers.len(), 1);
+        assert_eq!(got.headers[0].gmail.unwrap().thread_id, 9);
+    }
+
+    #[tokio::test]
+    async fn gmail_all_mail_source_reuses_the_select_search_and_header_metadata() {
+        let mut step = 0;
+        let (mut session, _) =
+            imap::tests::scripted_capabilities("IMAP4rev1 X-GM-EXT-1", move |tag, command| {
+                let answer = match step {
+                    0 => {
+                        assert_eq!(command, "SELECT \"All\"");
+                        "* 2 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n".into()
+                    }
+                    1 => {
+                        assert_eq!(command, "UID SEARCH X-GM-THRID 8");
+                        "* SEARCH 20\r\n".into()
+                    }
+                    2 => {
+                        assert!(command.starts_with("UID FETCH 20 "));
+                        gmail_header(20, 21, 8, "\\Sent", "")
+                    }
+                    _ => panic!("unexpected command: {command}"),
+                };
+                step += 1;
+                format!("{answer}{tag} OK done\r\n").into_bytes()
+            })
+            .await;
+        let got = conversations(&mut session, "All", 9, &[], &[8], "All")
+            .await
+            .unwrap();
+        assert_eq!((got.source_uidvalidity, got.all_uidvalidity), (9, 9));
+        assert_eq!(got.source, [(20, got.headers[0].gmail.unwrap())]);
+    }
+
+    #[tokio::test]
+    async fn gmail_requests_refuse_unknown_changed_or_missing_uidvalidity() {
+        for (expected, advertised, all) in [
+            (0, 7, "INBOX"),
+            (7, 8, "INBOX"),
+            (7, 0, "INBOX"),
+            (7, 7, "All"),
+        ] {
+            let (mut session, _) =
+                imap::tests::scripted_capabilities("IMAP4rev1 X-GM-EXT-1", move |tag, command| {
+                    let validity = if command == "SELECT \"INBOX\"" {
+                        advertised
+                    } else {
+                        assert_eq!(command, "SELECT \"All\"");
+                        0
+                    };
+                    let code = if validity == 0 {
+                        String::new()
+                    } else {
+                        format!("* OK [UIDVALIDITY {validity}] stable\r\n")
+                    };
+                    format!("* 0 EXISTS\r\n{code}{tag} OK done\r\n").into_bytes()
+                })
+                .await;
+            let error = conversations(&mut session, "INBOX", expected, &[], &[], all)
+                .await
+                .unwrap_err();
+            assert!(!broken(&error), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_unsupported_is_a_correlated_success_without_sending_commands() {
+        let (mut session, caps) = imap::tests::scripted_capabilities("IMAP4rev1", |_, command| {
+            panic!("unsupported Gmail command: {command}")
+        })
+        .await;
+        assert!(!caps.gmail);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = events.clone();
+        let sink: Sink = Arc::new(move |event| kept.lock().unwrap().push(event));
+        let creds = Credentials::new(Arc::new(Account::default()), false);
+        let request = Request::Conversations {
+            folder: "INBOX".into(),
+            uidvalidity: 7,
+            uids: vec![1],
+            thread_ids: vec![8],
+            all: "All".into(),
+        };
+        assert!(!request.changes());
+        handle_imap(request, &mut session, caps, &creds, &sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&events.lock().unwrap()[..], [Event::Conversations {
+            folder, uidvalidity: 7, uids, thread_ids, all, result: Ok(None)
+        }] if folder == "INBOX" && uids == &[1] && thread_ids == &[8] && all == "All")
+        );
+    }
+
+    #[test]
+    fn gmail_failures_always_echo_the_request_identity() {
+        for error in ["offline", "SEARCH: no", "the server stopped answering"] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let kept = events.clone();
+            let sink: Sink = Arc::new(move |event| kept.lock().unwrap().push(event));
+            let request = Request::Conversations {
+                folder: "INBOX".into(),
+                uidvalidity: 7,
+                uids: vec![1],
+                thread_ids: vec![8],
+                all: "All".into(),
+            };
+            report_failure(&request, error.into(), &sink);
+            assert!(
+                matches!(&events.lock().unwrap()[..], [Event::Conversations {
+                folder, uidvalidity: 7, uids, thread_ids, all, result: Err(message)
+            }] if folder == "INBOX" && uids == &[1] && thread_ids == &[8] && all == "All" && message == error)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_offline_worker_answers_every_queued_request_without_holding_reads() {
+        let account = Arc::new(Account {
+            password: crate::account::PasswordFrom::Ask,
+            ..Account::default()
+        });
+        let creds = Credentials::new(account.clone(), false);
+        let endpoints = Endpoints::of(&account, crate::net::tls_config(None).unwrap());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = events.clone();
+        let sink: Sink = Arc::new(move |event| kept.lock().unwrap().push(event));
+        let (tx, rx) = unbounded_channel();
+        for uid in [1, 2] {
+            tx.send(Request::Conversations {
+                folder: "INBOX".into(),
+                uidvalidity: 7,
+                uids: vec![uid],
+                thread_ids: vec![8],
+                all: "All".into(),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        // No password, keychain, socket or user configuration is accessed.
+        run_imap(creds, endpoints, rx, sink).await;
+        let events = events.lock().unwrap();
+        let failed: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Conversations {
+                    uids,
+                    result: Err(error),
+                    ..
+                } if error == "offline" => Some(uids[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, [1, 2], "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Waiting(n) if *n != 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_request_batch_limit_combines_source_uids_and_known_thread_ids() {
+        for (uids, threads) in [
+            (vec![0], vec![]),
+            (vec![], vec![0]),
+            ((1..=CONVERSATION_BATCH as u32).collect(), vec![8]),
+            (vec![], (1..=CONVERSATION_BATCH as u64 + 1).collect()),
+        ] {
+            let (mut session, _) =
+                imap::tests::scripted_capabilities("IMAP4rev1 X-GM-EXT-1", |_, command| {
+                    panic!("invalid request reached the server: {command}")
+                })
+                .await;
+            let error = conversations(&mut session, "INBOX", 7, &uids, &threads, "All")
+                .await
+                .unwrap_err();
+            assert!(!broken(&error), "{error:#}");
+        }
     }
 }

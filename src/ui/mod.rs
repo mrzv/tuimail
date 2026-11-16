@@ -835,6 +835,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.threads_include_sent),
         "Include Sent in threads",
     );
+    add(
+        &mut lines,
+        HelpMenu::THREADS_COMPLETE_GMAIL,
+        check(settings.threads_complete_gmail),
+        "Complete Gmail threads (All Mail and Sent)",
+    );
     lines.push(Line::default());
     lines.push(heading(" Asking first"));
     add(
