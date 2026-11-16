@@ -9237,8 +9237,6 @@ pub mod tests {
             worker::Event::Conversations {
                 folder: "INBOX".into(),
                 uidvalidity: 10,
-                uids: vec![2],
-                thread_ids: vec![],
                 all: "All Mail".into(),
                 result: Ok(Some(gmail_result())),
             },

@@ -295,8 +295,6 @@ pub enum Event {
     Conversations {
         folder: String,
         uidvalidity: u32,
-        uids: Vec<u32>,
-        thread_ids: Vec<u64>,
         all: String,
         result: Result<Option<Conversations>, String>,
     },
@@ -499,14 +497,11 @@ fn report_failure(request: &Request, error: String, sink: &Sink) {
         Request::Conversations {
             folder,
             uidvalidity,
-            uids,
-            thread_ids,
             all,
+            ..
         } => sink(Event::Conversations {
             folder: folder.clone(),
             uidvalidity: *uidvalidity,
-            uids: uids.clone(),
-            thread_ids: thread_ids.clone(),
             all: all.clone(),
             result: Err(error),
         }),
@@ -861,8 +856,6 @@ async fn handle_imap(
             sink(Event::Conversations {
                 folder,
                 uidvalidity,
-                uids,
-                thread_ids,
                 all,
                 result: Ok(result),
             });
@@ -1541,8 +1534,8 @@ mod tests {
             .unwrap();
         assert!(
             matches!(&events.lock().unwrap()[..], [Event::Conversations {
-            folder, uidvalidity: 7, uids, thread_ids, all, result: Ok(None)
-        }] if folder == "INBOX" && uids == &[1] && thread_ids == &[8] && all == "All")
+            folder, uidvalidity: 7, all, result: Ok(None)
+        }] if folder == "INBOX" && all == "All")
         );
     }
 
@@ -1562,8 +1555,8 @@ mod tests {
             report_failure(&request, error.into(), &sink);
             assert!(
                 matches!(&events.lock().unwrap()[..], [Event::Conversations {
-                folder, uidvalidity: 7, uids, thread_ids, all, result: Err(message)
-            }] if folder == "INBOX" && uids == &[1] && thread_ids == &[8] && all == "All" && message == error)
+                folder, uidvalidity: 7, all, result: Err(message)
+            }] if folder == "INBOX" && all == "All" && message == error)
             );
         }
     }
@@ -1580,11 +1573,11 @@ mod tests {
         let kept = events.clone();
         let sink: Sink = Arc::new(move |event| kept.lock().unwrap().push(event));
         let (tx, rx) = unbounded_channel();
-        for uid in [1, 2] {
+        for folder in ["INBOX", "Archive"] {
             tx.send(Request::Conversations {
-                folder: "INBOX".into(),
+                folder: folder.into(),
                 uidvalidity: 7,
-                uids: vec![uid],
+                uids: vec![1],
                 thread_ids: vec![8],
                 all: "All".into(),
             })
@@ -1594,18 +1587,18 @@ mod tests {
         // No password, keychain, socket or user configuration is accessed.
         run_imap(creds, endpoints, rx, sink).await;
         let events = events.lock().unwrap();
-        let failed: Vec<u32> = events
+        let failed: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
                 Event::Conversations {
-                    uids,
+                    folder,
                     result: Err(error),
                     ..
-                } if error == "offline" => Some(uids[0]),
+                } if error == "offline" => Some(folder.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(failed, [1, 2], "{events:?}");
+        assert_eq!(failed, ["INBOX", "Archive"], "{events:?}");
         assert!(
             !events
                 .iter()
