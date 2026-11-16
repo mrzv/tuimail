@@ -9261,15 +9261,19 @@ pub mod tests {
                 .iter()
                 .all(|item| !item.thread.tree.is_empty())
         );
-        let screen = crate::ui::tests::screen(&mut app, 160, 30);
-        assert!(
-            screen
+        for icons in [crate::icons::NERD, crate::icons::PLAIN] {
+            app.icons = icons;
+            let screen = crate::ui::tests::screen(&mut app, 160, 30);
+            let archived = screen
                 .lines()
-                .any(|line| line.contains("Archived plan") && line.contains("[All Mail]"))
-        );
-        assert!(screen.lines().any(|line| line.contains("Sent plan")
-            && line.contains("To Alice")
-            && line.contains(app.icons.sent)));
+                .find(|line| line.contains("Archived plan"))
+                .unwrap();
+            assert!(archived.contains(&format!("{} Archived plan", icons.all)));
+            assert!(!archived.contains("[All Mail]"));
+            assert!(screen.lines().any(|line| line.contains("Sent plan")
+                && line.contains("To Alice")
+                && line.contains(icons.sent)));
+        }
         let requests = app.test_sent.borrow().len();
         app.after_draw();
         assert_eq!(

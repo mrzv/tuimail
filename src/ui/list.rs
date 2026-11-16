@@ -197,15 +197,18 @@ fn row(
         Place::Folder { account, folder } => *account != item.account || *folder != m.folder,
         Place::AllInboxes => app.accounts[item.account].inbox() != m.folder,
     };
-    let folder = if sent && (app.search.is_some() || outside || role != Some(Role::Sent)) {
+    let folder_icon = if sent && (app.search.is_some() || outside || role != Some(Role::Sent)) {
+        Some(icons.sent)
+    } else if role == Some(Role::All) && (app.search.is_some() || outside) {
+        Some(icons.all)
+    } else {
+        None
+    };
+    let folder = if let Some(icon) = folder_icon {
         if matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1 {
-            format!(
-                "{} [{}] ",
-                icons.sent,
-                fit(&app.account_tag(item.account), 10)
-            )
+            format!("{} [{}] ", icon, fit(&app.account_tag(item.account), 10))
         } else {
-            format!("{} ", icons.sent)
+            format!("{icon} ")
         }
     } else if app.search.is_some()
         || outside
