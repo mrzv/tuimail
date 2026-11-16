@@ -1416,9 +1416,6 @@ impl App {
     fn sync_sent(&mut self, i: usize) {
         if self.settings.threads
             && self.settings.threads_include_sent
-            && !(self.settings.threads_complete_gmail
-                && self.accounts[i].folder_for(Role::All).is_some()
-                && self.accounts[i].conversations.supported != Some(false))
             && let Some(folder) = self.accounts[i]
                 .folder_for(Role::Sent)
                 .map(|f| f.name.clone())
@@ -2461,7 +2458,6 @@ impl App {
                 }
             }
             if self.settings.threads
-                && !(complete && self.accounts[i].folder_for(Role::All).is_some())
                 && self.settings.threads_include_sent
                 && self.search.is_none()
                 && !found.is_empty()
@@ -2473,18 +2469,47 @@ impl App {
                     .store
                     .messages(id, &sent.name, MAX_LISTED)
                     .unwrap_or_default();
-                // A sent copy already in this folder (All Mail, or mail to
-                // yourself) is shown once, with this folder's identity.
-                let ids: HashSet<&str> = found
+                // Prefer the displayed copy of a native message, or its
+                // Message-ID when either copy has no native metadata yet.
+                let native_ids: HashSet<u64> = found
                     .iter()
-                    .map(|m| m.summary.message_id.as_str())
-                    .filter(|id| !id.is_empty())
+                    .filter_map(|m| m.gmail.map(|g| g.message_id))
                     .collect();
-                outgoing.retain(|m| !ids.contains(m.summary.message_id.as_str()));
+                let native_threads: HashSet<u64> = if complete {
+                    found
+                        .iter()
+                        .filter_map(|m| m.gmail.map(|g| g.thread_id))
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+                let mut ids: HashMap<&str, bool> = HashMap::new();
+                for message in &found {
+                    if !message.summary.message_id.is_empty() {
+                        let unknown = ids.entry(&message.summary.message_id).or_default();
+                        *unknown |= message.gmail.is_none();
+                    }
+                }
+                outgoing.retain(|m| match m.gmail {
+                    Some(g) => {
+                        !native_ids.contains(&g.message_id)
+                            && !ids
+                                .get(m.summary.message_id.as_str())
+                                .copied()
+                                .unwrap_or(false)
+                    }
+                    None => !ids.contains_key(m.summary.message_id.as_str()),
+                });
                 if !outgoing.is_empty() {
                     found.extend(outgoing);
                     let summaries: Vec<&mail::Summary> = found.iter().map(|m| &m.summary).collect();
-                    let mut keep = crate::threads::connected(&summaries, listed).into_iter();
+                    let seeds = found.iter().enumerate().filter_map(|(j, m)| {
+                        (j < listed
+                            || m.gmail
+                                .is_some_and(|g| native_threads.contains(&g.thread_id)))
+                        .then_some(j)
+                    });
+                    let mut keep = crate::threads::connected(&summaries, seeds).into_iter();
                     found.retain(|_| keep.next().unwrap_or(false));
                 }
             }
@@ -2513,15 +2538,15 @@ impl App {
                     (n, it.message.uid)
                 })
                 .collect();
-            let groups: Vec<_> = if self.settings.threads_complete_gmail {
+            let mut groups: Vec<_> = if self.settings.threads_complete_gmail {
                 items
                     .iter()
-                    .map(|it| it.message.gmail.map(|g| (it.account, g.thread_id)))
+                    .map(|it| (it.account, it.message.gmail.map(|g| g.thread_id)))
                     .collect()
             } else {
                 Vec::new()
             };
-            let order = crate::threads::arrange_arrived(&summaries, &arrived, &groups);
+            let order = crate::threads::arrange_arrived(&summaries, &arrived, &mut groups);
             let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
             items = order
                 .into_iter()
@@ -9560,5 +9585,176 @@ pub mod tests {
             );
             assert!(app.store.message(&id, "All Mail", 102).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn native_sent_members_seed_their_header_only_ancestors_and_replies() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[2]).unwrap();
+        let mut incoming = gmail_result().headers.remove(1);
+        incoming.uid = 1;
+        app.store.add_headers(&id, "INBOX", &[incoming]).unwrap();
+        let mut native = gmail_result().headers.remove(2);
+        native.uid = 10;
+        native.summary.message_id = "native-sent".into();
+        native.summary.in_reply_to = "native-first".into();
+        let mut ancestor = store::tests::header(11, "Sent native ancestor", 25);
+        ancestor.summary.message_id = "native-first".into();
+        let mut reply = store::tests::header(12, "Sent native reply", 35);
+        reply.summary.message_id = "native-reply".into();
+        reply.summary.in_reply_to = "native-sent".into();
+        app.store
+            .add_headers(&id, "Sent", &[native, ancestor, reply])
+            .unwrap();
+        app.settings.threads_complete_gmail = true;
+        app.settings.threads_include_sent = true;
+        app.reload();
+        let keys: Vec<_> = app
+            .items
+            .iter()
+            .map(|item| (item.message.folder.as_str(), item.message.uid))
+            .collect();
+        assert_eq!(
+            keys,
+            [("INBOX", 1), ("Sent", 11), ("Sent", 10), ("Sent", 12)]
+        );
+        assert!(app.items[0].thread.tree.is_empty());
+        assert!(
+            app.items[1..]
+                .iter()
+                .all(|item| !item.thread.tree.is_empty())
+        );
+    }
+
+    #[test]
+    fn gmail_completion_and_sent_threads_can_be_enabled_together() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+        let mut incoming = store::tests::header(1, "Current plan", 20);
+        incoming.summary.message_id = "incoming".into();
+        incoming.summary.in_reply_to = "first".into();
+        incoming.gmail = gmail_result().headers[1].gmail;
+        app.store.add_headers(&id, "INBOX", &[incoming]).unwrap();
+        let archived = gmail_result().headers.remove(0);
+        app.store.add_headers(&id, "All Mail", &[archived]).unwrap();
+        let mut native = gmail_result().headers.remove(2);
+        native.uid = 10;
+        native.summary.message_id = "native-sent".into();
+        let header = |uid, subject: &str, message_id: &str, parent: &str, date| {
+            let mut header = store::tests::header(uid, subject, date);
+            header.summary.message_id = message_id.into();
+            header.summary.in_reply_to = parent.into();
+            header.summary.to = header.summary.from.display();
+            header
+        };
+        app.store
+            .add_headers(
+                &id,
+                "Sent",
+                &[
+                    native.clone(),
+                    header(11, "Sent header reply", "reply", "incoming", 25),
+                    header(12, "Sent first", "first", "", 10),
+                    header(13, "Sent follow-up", "follow-up", "reply", 35),
+                    header(99, "Unrelated sent mail", "unrelated", "", 50),
+                ],
+            )
+            .unwrap();
+        app.settings.threads_complete_gmail = true;
+        app.reload();
+        assert_eq!(app.items.len(), 2);
+        app.change_setting(HelpMenu::THREADS_INCLUDE_SENT);
+        assert!(app.settings.threads_complete_gmail && app.settings.threads_include_sent);
+        let keys: Vec<_> = app
+            .items
+            .iter()
+            .map(|item| (item.message.folder.as_str(), item.message.uid))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("All Mail", 101),
+                ("Sent", 12),
+                ("INBOX", 1),
+                ("Sent", 11),
+                ("Sent", 13),
+                ("Sent", 10)
+            ]
+        );
+        assert_eq!(app.items[0].message.folder, "All Mail");
+        assert!(
+            app.items[1..]
+                .iter()
+                .all(|item| !item.thread.tree.is_empty())
+        );
+        let screen = crate::ui::tests::screen(&mut app, 160, 30);
+        assert!(screen.lines().any(|line| line.contains("Sent header reply")
+            && line.contains("To Alice")
+            && line.contains(app.icons.sent)));
+        assert!(!screen.contains("Unrelated sent mail"));
+
+        app.demo = false; // No workers: requests are recorded, never connected.
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "INBOX".into(),
+        });
+        let latest = header(14, "Latest sent reply", "latest", "follow-up", 45);
+        for (account, request) in app.test_sent.take() {
+            if matches!(request, Request::Sync { ref folder, .. } if folder == "Sent") {
+                app.on_worker(
+                    account,
+                    worker::Event::Synced(worker::Synced {
+                        folder: "Sent".into(),
+                        uidvalidity: 1,
+                        new: vec![latest.clone()],
+                        low: 1,
+                        high: 99,
+                        total: 6,
+                        ..Default::default()
+                    }),
+                );
+            }
+        }
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.message.summary.subject == "Latest sent reply"),
+            "Sent must still sync while Gmail completion is enabled"
+        );
+
+        native.uid = 103;
+        native.summary.message_id = "another-cached-header".into();
+        app.store.add_headers(&id, "All Mail", &[native]).unwrap();
+        app.reload();
+        assert_eq!(app.items.len(), 7, "native label copies appear once");
+        assert!(
+            !app.items
+                .iter()
+                .any(|item| item.message.folder == "Sent" && item.message.uid == 10)
+        );
+        app.settings.threads_include_sent = false;
+        app.reload();
+        assert_eq!(app.items.len(), 3);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.message.folder == "All Mail" && item.message.uid == 103)
+        );
+        app.settings.threads_complete_gmail = false;
+        app.settings.threads_include_sent = true;
+        app.reload();
+        assert_eq!(app.items.len(), 5);
+        assert!(
+            app.items
+                .iter()
+                .all(|item| item.message.folder != "All Mail")
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.message.summary.subject == "Latest sent reply")
+        );
     }
 }

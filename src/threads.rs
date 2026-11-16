@@ -32,24 +32,30 @@ pub struct Placed {
     pub same_subject: bool,
 }
 
-/// Messages connected to the first `listed` by their conversation headers.
+fn ids(summary: &Summary) -> impl Iterator<Item = &str> {
+    std::iter::once(summary.message_id.as_str())
+        .chain(std::iter::once(summary.in_reply_to.as_str()))
+        .chain(summary.references.split_whitespace())
+        .filter(|id| !id.is_empty())
+}
+
+/// Messages connected to the seed indices by their conversation headers.
 /// Shared references count even when the message they name isn't cached.
-pub fn connected(summaries: &[&Summary], listed: usize) -> Vec<bool> {
-    fn ids(s: &Summary) -> impl Iterator<Item = &str> {
-        std::iter::once(s.message_id.as_str())
-            .chain(std::iter::once(s.in_reply_to.as_str()))
-            .chain(s.references.split_whitespace())
-            .filter(|id| !id.is_empty())
+pub fn connected(summaries: &[&Summary], seeds: impl IntoIterator<Item = usize>) -> Vec<bool> {
+    let mut keep = vec![false; summaries.len()];
+    let mut pending: Vec<usize> = seeds.into_iter().collect();
+    for &i in &pending {
+        keep[i] = true;
     }
     let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, summary) in summaries.iter().enumerate().skip(listed) {
+    for (i, summary) in summaries.iter().enumerate() {
+        if keep[i] {
+            continue;
+        }
         for id in ids(summary) {
             by_id.entry(id).or_default().push(i);
         }
     }
-    let mut keep = vec![false; summaries.len()];
-    let mut pending: Vec<usize> = (0..listed).collect();
-    keep[..listed].fill(true);
     while let Some(i) = pending.pop() {
         for id in ids(summaries[i]) {
             // Each header id is visited once, even in long conversations.
@@ -66,10 +72,64 @@ pub fn connected(summaries: &[&Summary], listed: usize) -> Vec<bool> {
     keep
 }
 
+/// Header-only members inherit a native thread only when their connected
+/// component names exactly one, within the same account.
+fn infer_groups(summaries: &[&Summary], groups: &mut [(usize, Option<u64>)]) {
+    if !groups.iter().any(|(_, thread)| thread.is_some())
+        || groups.iter().all(|(_, thread)| thread.is_some())
+    {
+        return;
+    }
+    let mut by_id: HashMap<(usize, &str), Vec<usize>> = HashMap::new();
+    for (i, summary) in summaries.iter().enumerate() {
+        if let Some(&(account, _)) = groups.get(i) {
+            for id in ids(summary) {
+                by_id.entry((account, id)).or_default().push(i);
+            }
+        }
+    }
+    let mut visited = vec![false; summaries.len()];
+    let mut pending = Vec::new();
+    let mut members = Vec::new();
+    for i in 0..summaries.len() {
+        let Some(&(account, None)) = groups.get(i) else {
+            continue;
+        };
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        pending.push(i);
+        let mut native = None;
+        let mut ambiguous = false;
+        while let Some(j) = pending.pop() {
+            members.push(j);
+            for id in ids(summaries[j]) {
+                if let Some(related) = by_id.remove(&(account, id)) {
+                    for k in related {
+                        if let Some(thread) = groups[k].1 {
+                            ambiguous |= native.is_some_and(|was| was != thread);
+                            native = Some(thread);
+                        } else if !visited[k] {
+                            visited[k] = true;
+                            pending.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        for j in members.drain(..) {
+            if !ambiguous {
+                groups[j].1 = native;
+            }
+        }
+    }
+}
+
 /// `summaries` as threads: each conversation in turn, newest first.
 #[cfg(test)]
 pub fn arrange(summaries: &[&Summary]) -> Vec<Placed> {
-    arrange_arrived(summaries, &[], &[])
+    arrange_arrived(summaries, &[], &mut [])
 }
 
 /// As [`arrange`], knowing where each message is and its UID there
@@ -78,14 +138,21 @@ pub fn arrange(summaries: &[&Summary]) -> Vec<Placed> {
 /// the one replies go under, not one a sender dated later.
 /// Native conversation groups are scoped to an account. Their members stay
 /// together even without reply headers; sender headers can't cross groups.
+/// `groups` holds each account and native thread ID as scratch space;
+/// missing IDs are inferred from unambiguous header connections.
 pub fn arrange_arrived(
     summaries: &[&Summary],
     arrived: &[(usize, u32)],
-    groups: &[Option<(usize, u64)>],
+    groups: &mut [(usize, Option<u64>)],
 ) -> Vec<Placed> {
     let n = summaries.len();
     // A Message-ID's first message: a copy (in two inboxes) stands alone.
-    let group = |i: usize| groups.get(i).copied().flatten();
+    infer_groups(summaries, groups);
+    let group = |i: usize| {
+        groups
+            .get(i)
+            .and_then(|&(account, thread)| thread.map(|thread| (account, thread)))
+    };
     let mut by_id = HashMap::new();
     for (i, s) in summaries.iter().enumerate() {
         if s.message_id.is_empty() {
@@ -288,7 +355,7 @@ mod tests {
             summary("a", "", "", 10, "Plan"),
         ];
         let refs: Vec<&Summary> = list.iter().collect();
-        let placed = arrange_arrived(&refs, &[(0, 5), (0, 2), (0, 1)], &[]);
+        let placed = arrange_arrived(&refs, &[(0, 5), (0, 2), (0, 1)], &mut []);
         let reply = placed.iter().position(|p| p.index == 1).unwrap();
         assert_eq!(placed[reply - 1].index, 2, "under the first: {placed:?}");
     }
@@ -381,10 +448,10 @@ mod tests {
         ];
         let refs: Vec<&Summary> = list.iter().collect();
         assert_eq!(
-            connected(&refs, 1),
+            connected(&refs, [0]),
             [true, true, true, true, false, false, false, false]
         );
-        assert_eq!(connected(&refs, 0), [false; 8]);
+        assert_eq!(connected(&refs, []), [false; 8]);
     }
 
     #[test]
@@ -397,16 +464,44 @@ mod tests {
             summary("reply", "old", "old", 20, "Re: Plan"),
         ];
         let refs: Vec<_> = list.iter().collect();
-        let groups = [
-            Some((0, 7)),
-            Some((0, 7)),
-            Some((0, 8)),
-            Some((1, 7)),
-            Some((0, 7)),
+        let mut groups = [
+            (0, Some(7)),
+            (0, Some(7)),
+            (0, Some(8)),
+            (1, Some(7)),
+            (0, Some(7)),
         ];
-        let placed = arrange_arrived(&refs, &[], &groups);
+        let placed = arrange_arrived(&refs, &[], &mut groups);
         let order: Vec<_> = placed.iter().map(|p| (p.index, p.tree.as_str())).collect();
         assert_eq!(order, [(2, ""), (1, ""), (4, "├─"), (0, "└─"), (3, "")]);
+    }
+
+    #[test]
+    fn header_only_members_join_native_threads_without_crossing_accounts_or_ambiguities() {
+        let list = [
+            summary("incoming", "first", "", 20, "Plan"),
+            summary("archived", "", "", 5, "Plan"),
+            summary("first", "", "", 10, "Plan"),
+            summary("last", "first", "", 30, "Re: Plan"),
+            summary("other", "", "", 40, "Other"),
+            summary("ambiguous", "incoming", "incoming other", 50, "Re: Plan"),
+            summary("foreign", "incoming", "", 60, "Re: Plan"),
+        ];
+        let refs: Vec<_> = list.iter().collect();
+        let mut groups = [
+            (0, Some(7)),
+            (0, Some(7)),
+            (0, None),
+            (0, None),
+            (0, Some(8)),
+            (0, None),
+            (1, None),
+        ];
+        let placed = arrange_arrived(&refs, &[], &mut groups);
+        let order: Vec<_> = placed.iter().map(|p| p.index).collect();
+        assert_eq!(order, [6, 5, 4, 1, 2, 0, 3]);
+        assert!(placed[..4].iter().all(|p| p.tree.is_empty()));
+        assert!(placed[4..].iter().all(|p| !p.tree.is_empty()));
     }
 
     #[test]
