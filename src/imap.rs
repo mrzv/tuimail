@@ -734,7 +734,11 @@ fn gmail_of(attrs: &[AttributeValue<'_>]) -> Option<Gmail> {
                 sent = Some(
                     labels
                         .iter()
-                        .any(|label| label.eq_ignore_ascii_case("\\Sent")),
+                        // imap-proto leaves quoted-string escapes intact.
+                        .any(|label| {
+                            label.eq_ignore_ascii_case(r"\Sent")
+                                || label.eq_ignore_ascii_case(r"\\Sent")
+                        }),
                 );
             }
             _ => {}

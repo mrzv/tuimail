@@ -9757,4 +9757,70 @@ pub mod tests {
                 .any(|item| item.message.summary.subject == "Latest sent reply")
         );
     }
+
+    #[tokio::test]
+    async fn all_mail_sent_icons_follow_quoted_and_unquoted_system_labels() {
+        for (labels, sent) in [
+            (r"\Sent", true),
+            (r#""\\Sent""#, true),
+            (r#""Sent""#, false),
+        ] {
+            let raw = "From: Myself <me@example.org>\r\nTo: Alice <alice@example.com>\r\n\
+                Subject: Sent plan\r\n\r\n";
+            let (mut session, _) =
+                crate::imap::tests::scripted_capabilities("IMAP4rev1 X-GM-EXT-1", move |tag, _| {
+                    format!(
+                        "* 1 FETCH (UID 103 FLAGS () X-GM-MSGID 9003 X-GM-THRID 700 \
+                         X-GM-LABELS ({labels}) BODY[HEADER] {{{}}}\r\n{raw})\r\n{tag} OK done\r\n",
+                        raw.len()
+                    )
+                    .into_bytes()
+                })
+                .await;
+            let mut data = gmail_result();
+            data.headers[2] = crate::imap::gmail_headers(&mut session, &[103], &[700])
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut app = gmail_app();
+            app.settings.threads_complete_gmail = true;
+            app.demo = false; // No workers: requests are recorded, never connected.
+            app.after_draw();
+            app.on_worker(
+                0,
+                worker::Event::Conversations {
+                    folder: "INBOX".into(),
+                    uidvalidity: 10,
+                    all: "All Mail".into(),
+                    result: Ok(Some(data)),
+                },
+            );
+            for icons in [crate::icons::NERD, crate::icons::PLAIN] {
+                app.icons = icons;
+                let screen = crate::ui::tests::screen(&mut app, 160, 30);
+                let line = screen
+                    .lines()
+                    .find(|line| line.contains("Sent plan"))
+                    .expect(&screen);
+                let (icon, other) = if sent {
+                    (icons.sent, icons.all)
+                } else {
+                    (icons.all, icons.sent)
+                };
+                assert!(
+                    line.contains(&format!("{icon} Sent plan")),
+                    "{labels}: {line}"
+                );
+                assert!(
+                    !line.contains(&format!("{other} Sent plan")),
+                    "{labels}: {line}"
+                );
+                assert!(
+                    line.contains(if sent { "To Alice" } else { "Myself" }),
+                    "{labels}: {line}"
+                );
+            }
+        }
+    }
 }
