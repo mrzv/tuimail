@@ -271,7 +271,9 @@ certificate = "/Users/you/Documents/bridge/cert.pem"
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: the message beside the list, plain text or HTML, marking read, threading and its default view, including Sent or completing Gmail threads, asking before deleting and before sending, notifications, AI agents, and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments).
+`O` (or `?` then `Tab`) opens the settings: the message beside the list, plain text or HTML, marking read, threading and its default view, including Sent or completing Gmail threads, asking before deleting and before sending, notifications, AI agents, sidebar folders, and the theme. `j` / `k` move, `Enter` or `Space` turns a setting on or off or opens its choices. Changes are saved at once, keeping other settings in `settings.toml` (but not its comments).
+
+Under **Sidebar**, choose **Choose which folders to show**. Use `j` / `k` to move and `Enter` or `Space` to show or hide a folder. Changes are saved immediately, separately for each account. Use the same list to bring hidden folders back. Hiding a folder only removes its sidebar row: its subfolders are controlled separately, and mail still syncs and can be moved there.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
 

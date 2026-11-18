@@ -21,6 +21,8 @@ impl Config {
     }
 }
 
+pub const SMALL_FILE_LIMIT: u64 = 1 << 20;
+
 /// Makes the data folder, or checks the one that's there, so only you can
 /// reach it, and gives its path with links resolved. In this order, so
 /// nothing is created or changed somewhere unsafe: the folders above it may
@@ -31,7 +33,7 @@ impl Config {
 /// Reads a file tuimail keeps, refusing anything that isn't a plain file of
 /// a sane size, so a link to `/dev/zero` or a pipe can't hang the start.
 pub fn read_small(path: &Path) -> std::io::Result<String> {
-    String::from_utf8(read_capped(path, 1 << 20)?).map_err(std::io::Error::other)
+    String::from_utf8(read_capped(path, SMALL_FILE_LIMIT)?).map_err(std::io::Error::other)
 }
 
 /// The bytes of `path` if it's a plain file of at most `cap` bytes: checked

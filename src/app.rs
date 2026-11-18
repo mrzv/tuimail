@@ -3,7 +3,7 @@
 //! mutates it. The cache (`Store`) is written only from here.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -583,6 +583,12 @@ pub enum PickerKind {
     Attachments,
     /// Changes to undo, by id, in the items' order.
     Changes(Vec<i64>),
+    FolderVisibility {
+        /// Account id and display label.
+        accounts: Vec<(String, String)>,
+        /// Index into `accounts` and exact server folder name, in item order.
+        targets: Vec<(usize, String)>,
+    },
     /// A tag to put on these messages or take off, or (the last item) a
     /// new one to type.
     Tag {
@@ -750,7 +756,8 @@ impl HelpMenu {
     pub const NOTIFICATIONS: usize = 9;
     pub const AGENTS: usize = 10;
     pub const CONFIRM_AGENTS: usize = 11;
-    pub const THEMES: usize = 12;
+    pub const FOLDER_VISIBILITY: usize = 12;
+    pub const THEMES: usize = 13;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -6108,8 +6115,11 @@ impl App {
         for (i, account) in self.accounts.iter().enumerate() {
             rows.push(Row::Account(i));
             if account.expanded {
+                let hidden = self.settings.hidden_folders.get(&account.id);
                 for (f, depth) in folder_rows(&account.folders) {
-                    rows.push(Row::Folder(i, f, depth));
+                    if !hidden.is_some_and(|folders| folders.contains(&account.folders[f].name)) {
+                        rows.push(Row::Folder(i, f, depth));
+                    }
                 }
             }
         }
@@ -6246,11 +6256,25 @@ impl App {
                 let n = picker.selected;
                 self.view_attachments(n, true);
             }
-            KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('y') => {
+            KeyCode::Enter | KeyCode::Char(' ' | 's' | 'y')
+                if match picker.kind {
+                    PickerKind::FolderVisibility { .. } => {
+                        matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+                    }
+                    _ => key.code != KeyCode::Char(' '),
+                } =>
+            {
                 let Some(picker) = self.picker.take() else {
                     return;
                 };
                 let n = picker.selected;
+                if let PickerKind::FolderVisibility { accounts, targets } = &picker.kind {
+                    if let Some((account, folder)) = targets.get(n) {
+                        self.toggle_folder_visibility(&accounts[*account].0, folder);
+                    }
+                    self.picker = Some(picker);
+                    return;
+                }
                 match (picker.kind, key.code) {
                     (
                         PickerKind::MoveTo {
@@ -6586,6 +6610,7 @@ impl App {
                     .notifications
                     .resolve(|name| std::env::var(name).ok());
             }
+            HelpMenu::FOLDER_VISIBILITY => self.pick_folder_visibility(),
             row => {
                 if let Some((id, _)) = theme::names().get(row - HelpMenu::THEMES) {
                     self.save_setting("theme", toml::Value::String(id.to_string()));
@@ -6595,26 +6620,101 @@ impl App {
         }
     }
 
-    fn save_setting(&mut self, key: &str, value: toml::Value) {
-        let settings = if let Some(path) = &self.settings_path {
-            match Settings::save_one(path, key, value) {
-                Ok(settings) => settings,
-                Err(e) => return self.error(format!("{e:#}")),
+    fn pick_folder_visibility(&mut self) {
+        let mut accounts = Vec::with_capacity(self.accounts.len());
+        let mut targets = Vec::new();
+        let mut items = Vec::new();
+        for (i, account) in self.accounts.iter().enumerate() {
+            accounts.push((account.id.clone(), self.account_name(i)));
+            // Use the unfiltered rows, including collapsed accounts and hidden folders.
+            for (f, _) in folder_rows(&account.folders) {
+                let folder = &account.folders[f];
+                items.push(folder.shown.clone());
+                targets.push((i, folder.name.clone()));
             }
+        }
+        let title = if items.is_empty() {
+            " No sidebar folders yet "
+        } else {
+            " Sidebar folders "
+        };
+        self.picker = Some(Picker {
+            kind: PickerKind::FolderVisibility { accounts, targets },
+            title: title.into(),
+            items,
+            labels: Vec::new(),
+            selected: 0,
+        });
+    }
+
+    fn toggle_folder_visibility(&mut self, account: &str, folder: &str) {
+        let hide = !self.settings.is_folder_hidden(account, folder);
+        self.update_setting("hidden_folders", |value| {
+            let mut hidden: BTreeMap<String, BTreeSet<String>> = value
+                .map(toml::Value::try_into)
+                .transpose()?
+                .unwrap_or_default();
+            if hide {
+                hidden
+                    .entry(account.into())
+                    .or_default()
+                    .insert(folder.into());
+            } else if let Some(folders) = hidden.get_mut(account) {
+                folders.remove(folder);
+                if folders.is_empty() {
+                    hidden.remove(account);
+                }
+            }
+            Ok(toml::Value::try_from(hidden)?)
+        });
+    }
+
+    fn save_setting(&mut self, key: &str, value: toml::Value) {
+        self.update_setting(key, |_| Ok(value));
+    }
+
+    fn update_setting(
+        &mut self,
+        key: &str,
+        change: impl FnOnce(Option<toml::Value>) -> Result<toml::Value>,
+    ) {
+        let settings = if let Some(path) = &self.settings_path {
+            Settings::save_one(path, key, change)
         } else {
             // The demo: changed for this run only.
-            let mut table = toml::Table::try_from(&self.settings).unwrap_or_default();
-            table.insert(key.to_string(), value);
-            let Ok(settings) = table.try_into() else {
-                return;
-            };
-            settings
+            (|| {
+                let mut table = toml::Table::try_from(&self.settings)?;
+                let value = change(table.remove(key))?;
+                table.insert(key.to_string(), value);
+                Ok(table.try_into()?)
+            })()
+        };
+        let settings = match settings {
+            Ok(settings) => settings,
+            Err(e) => return self.error(format!("{e:#}")),
+        };
+        let sidebar_changed = self.settings.hidden_folders != settings.hidden_folders;
+        let sidebar_row = if sidebar_changed {
+            self.sidebar_rows().get(self.sidebar_selected).copied()
+        } else {
+            None
         };
         let threads_default_changed = self.settings.threads_collapsed != settings.threads_collapsed;
         let grouping_changed = self.settings.threads != settings.threads
             || self.settings.threads_include_sent != settings.threads_include_sent
             || self.settings.threads_complete_gmail != settings.threads_complete_gmail;
         self.settings = settings;
+        if sidebar_changed {
+            let rows = self.sidebar_rows();
+            self.sidebar_selected = sidebar_row
+                .and_then(|row| {
+                    rows.iter().position(|r| *r == row).or_else(|| match row {
+                        Row::Folder(i, ..) => rows.iter().position(|r| *r == Row::Account(i)),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| self.sidebar_selected.min(rows.len().saturating_sub(1)));
+        }
         if threads_default_changed {
             self.thread_overrides.clear();
         }
@@ -7884,20 +7984,115 @@ pub mod tests {
         assert!(!Settings::load(&path).unwrap().threads_collapsed);
 
         // Saving an unrelated setting also picks up changes made by another instance.
-        Settings::save_one(&path, "threads_collapsed", toml::Value::Boolean(true)).unwrap();
+        Settings::save_one(&path, "threads_collapsed", |_| Ok(true.into())).unwrap();
         app.on_key(key(KeyCode::Char('O')));
         app.on_key(key(KeyCode::Enter)); // Preview
         app.on_key(key(KeyCode::Esc));
         assert_eq!(design(&app).1, 3);
         assert_eq!(app.reader.as_ref().unwrap().key(), open);
 
-        Settings::save_one(&path, "threads", toml::Value::Boolean(false)).unwrap();
+        Settings::save_one(&path, "threads", |_| Ok(false.into())).unwrap();
         settings_row(&mut app);
         app.on_key(key(KeyCode::Enter));
         app.on_key(key(KeyCode::Esc));
         assert_eq!(design(&app).1, 1);
         assert!(app.items.iter().all(|it| it.thread.tree.is_empty()));
         assert_eq!(app.reader.as_ref().unwrap().key(), open);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sidebar_folder_visibility_is_saved_without_hiding_children_or_move_targets() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        let id = app.accounts[0].id.clone();
+        let dir = crate::tools::private_temp_dir().unwrap();
+        let path = crate::settings::path(&dir);
+        app.settings_path = Some(path.clone());
+        let press = |app: &mut App, code| app.on_key(key(code));
+        let open_picker = |app: &mut App| {
+            press(app, KeyCode::Char('O'));
+            for _ in 0..HelpMenu::FOLDER_VISIBILITY {
+                press(app, KeyCode::Down);
+            }
+            assert!(screen(app, 100, 25).contains("Choose which folders to show"));
+            press(app, KeyCode::Enter);
+        };
+        let sidebar = |app: &mut App| {
+            screen(app, 100, 25)
+                .lines()
+                .map(|line| line.chars().take(28).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let projects = |lines: &[String]| lines.iter().any(|line| line.contains(" Projects"));
+
+        let rows = app.sidebar_rows();
+        app.sidebar_selected = rows
+            .iter()
+            .position(|row| {
+                matches!(row, Row::Folder(0, f, _) if app.accounts[0].folders[*f].name == "Projects")
+            })
+            .unwrap();
+        assert!(projects(&sidebar(&mut app)));
+
+        open_picker(&mut app);
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Up); // Projects, immediately before its child
+        assert!(screen(&mut app, 100, 25).contains("[✓] work · Projects"));
+        // Another instance hid Archive after this picker was opened.
+        Settings::save_one(&path, "hidden_folders", |_| {
+            Ok(toml::Value::try_from(BTreeMap::from([(&id, ["Archive"])]))?)
+        })
+        .unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 100, 25).contains("[ ] work · Projects"));
+        press(&mut app, KeyCode::Esc);
+        assert!(screen(&mut app, 100, 25).contains("Choose which folders to show"));
+        press(&mut app, KeyCode::Esc);
+
+        let saved = Settings::load(&path).unwrap();
+        assert!(saved.is_folder_hidden(&id, "Projects") && saved.is_folder_hidden(&id, "Archive"));
+        assert_eq!(app.sidebar_rows()[app.sidebar_selected], Row::Account(0));
+        let lines = sidebar(&mut app);
+        assert!(!projects(&lines));
+        assert!(lines.iter().any(|line| line.contains(" Website")));
+        press(&mut app, KeyCode::Char('m'));
+        assert!(screen(&mut app, 100, 25).contains(" Projects "));
+        press(&mut app, KeyCode::Esc);
+
+        app.accounts[0].expanded = false;
+        open_picker(&mut app);
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        app.accounts[0].expanded = true;
+        assert!(projects(&sidebar(&mut app)));
+        assert!(
+            !Settings::load(&path)
+                .unwrap()
+                .is_folder_hidden(&id, "Projects")
+        );
+
+        Arc::make_mut(&mut app.accounts[0].account).name = "an account name ".repeat(4);
+        let child = app.accounts[0]
+            .folders
+            .iter_mut()
+            .find(|folder| folder.name == "Projects/Website")
+            .unwrap();
+        child.shown = format!("Projects/{}Website", "nested-folder/".repeat(6));
+        open_picker(&mut app);
+        let narrow = screen(&mut app, 60, 25);
+        assert!(narrow.lines().any(|line| line.contains(" · Projects ")));
+        assert!(
+            narrow
+                .lines()
+                .any(|line| line.contains("[✓]") && line.contains("Website"))
+        );
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 

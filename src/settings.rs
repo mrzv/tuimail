@@ -1,7 +1,7 @@
 //! User settings, kept in `settings.toml` in the data directory. Accounts
 //! are in `accounts.toml` beside it (`account.rs`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +53,8 @@ pub struct Settings {
     pub fetch_count: u32,
     /// The sidebar's width, in columns.
     pub sidebar_width: u16,
+    /// Folder rows to hide, by account id and exact server folder name.
+    pub hidden_folders: BTreeMap<String, BTreeSet<String>>,
     /// Where attachments are saved. Default: your Downloads folder.
     pub downloads: Option<PathBuf>,
     /// Let AI agents read and sort mail through `tuimail mcp` (while
@@ -96,6 +98,7 @@ impl Default for Settings {
             check_minutes: 5,
             fetch_count: 300,
             sidebar_width: 28,
+            hidden_folders: BTreeMap::new(),
             downloads: None,
             agents: false,
             confirm_agents: true,
@@ -151,6 +154,12 @@ impl Settings {
         self.sidebar_width.clamp(16, 50)
     }
 
+    pub fn is_folder_hidden(&self, account: &str, folder: &str) -> bool {
+        self.hidden_folders
+            .get(account)
+            .is_some_and(|folders| folders.contains(folder))
+    }
+
     /// The icon mode in use: `TM_ICONS` if it names one, else the file's.
     pub fn icon_mode(&self) -> IconMode {
         config::var("TM_ICONS")
@@ -180,7 +189,11 @@ impl Settings {
     /// written there since tuimail started (by hand, or by another tuimail)
     /// stays. A file that no longer reads is left alone. Returns the
     /// settings the file now holds.
-    pub fn save_one(path: &Path, key: &str, value: toml::Value) -> Result<Self> {
+    pub fn save_one(
+        path: &Path,
+        key: &str,
+        change: impl FnOnce(Option<toml::Value>) -> Result<toml::Value>,
+    ) -> Result<Self> {
         let shown = config::shown(path);
         let mut table: toml::Table = match config::read_small(path) {
             Ok(text) => toml::from_str(&text)
@@ -188,8 +201,12 @@ impl Settings {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
             Err(e) => return Err(e).with_context(|| format!("cannot read {shown}")),
         };
+        let value = change(table.remove(key))?;
         table.insert(key.to_string(), value);
         let text = toml::to_string(&table)?;
+        if text.len() as u64 > config::SMALL_FILE_LIMIT {
+            anyhow::bail!("{shown} would exceed 1 MiB, so it wasn't changed");
+        }
         let settings: Self = toml::from_str(&text)?;
         write_private(path, &text).with_context(|| format!("cannot write {shown}"))?;
         Ok(settings)
@@ -224,7 +241,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 20] = [
+const KNOWN: [&str; 21] = [
     "theme",
     "icons",
     "notifications",
@@ -240,6 +257,7 @@ const KNOWN: [&str; 20] = [
     "check_minutes",
     "fetch_count",
     "sidebar_width",
+    "hidden_folders",
     "downloads",
     "agents",
     "confirm_agents",
@@ -266,7 +284,7 @@ mod tests {
              [attachment_openers.pdf]\ncommand = [\"pdfterm\"]\nterminal = true\n",
         )
         .unwrap();
-        let saved = Settings::save_one(&file, "prefer_plain", true.into()).unwrap();
+        let saved = Settings::save_one(&file, "prefer_plain", |_| Ok(true.into())).unwrap();
         assert!(!saved.mark_read && saved.prefer_plain);
         let opener = saved.attachment_opener(Path::new("report.PDF")).unwrap();
         assert_eq!(opener.command, ["pdfterm"]);
@@ -284,9 +302,18 @@ mod tests {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "only yours");
         }
+        assert!(
+            Settings::save_one(&file, "hidden_folders", |_| {
+                let folder = "x".repeat(config::SMALL_FILE_LIMIT as usize);
+                Ok(toml::Value::try_from(BTreeMap::from([("work", [folder])]))?)
+            })
+            .is_err()
+        );
+        assert_eq!(Settings::load(&file).unwrap(), saved);
+
         // A file that doesn't read is left as it is.
         std::fs::write(&file, "mark_read = \"no\"").unwrap();
-        assert!(Settings::save_one(&file, "theme", "latte".into()).is_err());
+        assert!(Settings::save_one(&file, "theme", |_| Ok("latte".into())).is_err());
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "mark_read = \"no\""

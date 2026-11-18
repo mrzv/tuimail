@@ -49,7 +49,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.prompt.is_some() {
         prompt(frame, app, body);
     }
-    if app.help.is_some() {
+    if app.help.is_some() && app.picker.is_none() {
         help(frame, app, area);
     }
     if app.confirm.is_some() {
@@ -371,7 +371,7 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(&prompt.input, input_area);
 }
 
-/// A list to pick from: folders to move to, links, attachments.
+/// A list to pick from: folders, links, attachments and other choices.
 fn picker(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     let Some(picker) = &app.picker else {
@@ -386,6 +386,8 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Attachments => " `Enter` open · `s` save to Downloads · `Esc` close ",
         PickerKind::Tag { .. } => " `Enter` put on or take off · `Esc` cancel ",
         PickerKind::Changes(_) => " `Enter` undo · `Esc` close ",
+        PickerKind::FolderVisibility { .. } if picker.items.is_empty() => " `Esc` back ",
+        PickerKind::FolderVisibility { .. } => " `j k` move · `Enter` show/hide · `Esc` back ",
     };
     // Links in columns: the site (from the whole URL, never from what the
     // link says), what it says, then the URL.
@@ -405,14 +407,24 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         (0, 0)
     };
     let gap = |w: usize| if w > 0 { w + 2 } else { 0 };
-    let widest = picker.items.iter().map(|i| cols(i)).max().unwrap_or(0) + gap(hosts) + gap(saids);
+    let widest = if let PickerKind::FolderVisibility { accounts, targets } = &picker.kind {
+        picker
+            .items
+            .iter()
+            .zip(targets)
+            .map(|(item, (account, _))| 7 + cols(&accounts[*account].1) + cols(item))
+            .max()
+            .unwrap_or(0)
+    } else {
+        picker.items.iter().map(|i| cols(i)).max().unwrap_or(0) + gap(hosts) + gap(saids)
+    };
     let width = (widest + 6)
         .max(cols(&picker.title) + 4)
         .max(cols(&hint.replace('`', "")) + 4)
         .min(usize::from(area.width).saturating_sub(4)) as u16;
-    let height = (picker.items.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
+    let height = (picker.items.len() + 2)
+        .min(usize::from(area.height.saturating_sub(2)))
+        .max(3) as u16;
     let rect = centered(area, width, height);
     frame.render_widget(Clear, rect);
     let block = bordered()
@@ -442,7 +454,7 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::new().fg(c.text)
             };
-            let item = match picker.kind {
+            let item = match &picker.kind {
                 PickerKind::Links if columns => {
                     let (host, said) = &picker.labels[i];
                     let mut row = format!("{}  ", pad(&fit_end(host, host_width), host_width));
@@ -456,6 +468,28 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
                 PickerKind::Links if cols(item) > room => {
                     let host = crate::app::link_host(item);
                     fit(&format!("{host}  {item}"), room)
+                }
+                PickerKind::FolderVisibility { accounts, targets } => {
+                    let (account, folder) = &targets[i];
+                    let (id, label) = &accounts[*account];
+                    let mark = if app.settings.is_folder_hidden(id, folder) {
+                        "[ ]"
+                    } else {
+                        "[✓]"
+                    };
+                    if room < 10 {
+                        fit(&format!("{mark} {item}"), room)
+                    } else {
+                        let available = room - 7; // Checkbox and separator.
+                        let account =
+                            cols(label).min(available - cols(item).min(available * 2 / 3));
+                        let folder = available - account;
+                        format!(
+                            "{mark} {} · {}",
+                            fit_middle(label, account),
+                            fit_middle(item, folder)
+                        )
+                    }
                 }
                 _ => fit(item, room),
             };
@@ -729,6 +763,9 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
     ]);
     let hint = match menu.tab {
         HelpTab::Keys => " `j k` scroll · `Tab` settings · `Esc` close ",
+        HelpTab::Settings if menu.selected == HelpMenu::FOLDER_VISIBILITY => {
+            " `Enter` choose · `Tab` keys · `Esc` close "
+        }
         HelpTab::Settings if menu.selected >= HelpMenu::THEMES => {
             " `Enter` use · `Tab` keys · `Esc` close "
         }
@@ -885,6 +922,14 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         HelpMenu::CONFIRM_AGENTS,
         check(settings.confirm_agents),
         "Ask before each change an agent makes",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Sidebar"));
+    add(
+        &mut lines,
+        HelpMenu::FOLDER_VISIBILITY,
+        "  ›  ",
+        "Choose which folders to show",
     );
     lines.push(Line::default());
     lines.push(heading(" Theme"));
