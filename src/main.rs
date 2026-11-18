@@ -35,7 +35,9 @@ use std::collections::HashMap;
 use std::io::{Write, stdout};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 
 use crate::account::{Auth, PasswordFrom};
@@ -121,10 +123,7 @@ async fn run() -> Result<()> {
 
     need_terminal()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut terminal = ratatui::init();
-    panic_hook();
-    // A pasted path arrives as one event instead of keystrokes.
-    execute!(stdout(), EnableBracketedPaste)?;
+    let mut terminal = init_terminal()?;
     let mut app = app::App::with_passwords(
         store,
         settings,
@@ -147,21 +146,65 @@ async fn run() -> Result<()> {
     }
     let result = app.run(&mut terminal, rx).await;
     drop(app);
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    let _ = restore_terminal();
+    result
+}
+
+fn init_terminal() -> Result<ratatui::DefaultTerminal> {
+    let terminal = ratatui::try_init();
+    panic_hook();
+    // A pasted path arrives as one event instead of keystrokes.
+    match terminal.and_then(|terminal| {
+        execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;
+        Ok(terminal)
+    }) {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            let _ = restore_terminal();
+            Err(error.into())
+        }
+    }
+}
+
+fn restore_terminal() -> std::io::Result<()> {
+    let result = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+    // Reports already in the tty must not become keys in the shell or editor.
+    #[cfg(unix)]
+    let result = result.and(discard_terminal_input());
     ratatui::restore();
     result
+}
+
+#[cfg(unix)]
+fn discard_terminal_input() -> std::io::Result<()> {
+    use std::io::IsTerminal;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let stdin = std::io::stdin();
+    let tty;
+    let fd = if stdin.is_terminal() {
+        stdin.as_fd()
+    } else {
+        tty = std::fs::File::open("/dev/tty")?;
+        tty.as_fd()
+    };
+    // SAFETY: fd is a live terminal descriptor, borrowed for this call.
+    if unsafe { libc::tcflush(fd.as_raw_fd(), libc::TCIFLUSH) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// A panic anywhere but in parsing or laying out a message (caught there)
 /// ends the app: the terminal is put back, then the message is printed
 /// without control characters, since it can quote a message.
-pub fn panic_hook() {
+fn panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         if mail::panic_is_contained() {
             return;
         }
-        let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
-        ratatui::restore();
+        let _ = execute!(stdout(), crossterm::cursor::Show);
+        let _ = restore_terminal();
         eprintln!("tuimail crashed: {}", text::clean(&info.to_string()));
         std::process::exit(101);
     }));

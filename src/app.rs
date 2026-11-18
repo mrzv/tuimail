@@ -6,13 +6,17 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 use ratatui::backend::Backend;
+use ratatui::layout::{Position, Rect};
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -146,10 +150,30 @@ enum TerminalRequest {
     Attachment(std::process::Command),
 }
 
+fn list_click(mouse: &MouseEvent) -> bool {
+    mouse.kind == MouseEventKind::Down(MouseButton::Left) && mouse.modifiers.is_empty()
+}
+
+struct TerminalBatch {
+    events: Vec<Event>,
+    mouse_frame: u64,
+}
+
+impl TerminalBatch {
+    fn for_frame(mut self, current: u64) -> Vec<Event> {
+        if self.mouse_frame == 0 || self.mouse_frame != current {
+            self.events
+                .retain(|event| !matches!(event, Event::Mouse(_)));
+        }
+        self.events
+    }
+}
+
 /// The only terminal reader. Joining it before a foreground program starts
 /// leaves neither a reader nor an EventStream shutdown wake-up behind.
 struct TerminalEvents {
-    events: tokio::sync::mpsc::Receiver<std::io::Result<Vec<Event>>>,
+    events: tokio::sync::mpsc::Receiver<std::io::Result<TerminalBatch>>,
+    mouse_frame: Arc<AtomicU64>,
     reader: Option<std::thread::JoinHandle<()>>,
     finished: std::sync::mpsc::Receiver<()>,
 }
@@ -158,15 +182,41 @@ impl TerminalEvents {
     fn new() -> std::io::Result<Self> {
         let (tx, events) = tokio::sync::mpsc::channel(1);
         let (finished_tx, finished) = std::sync::mpsc::sync_channel(1);
+        let mouse_frame = Arc::new(AtomicU64::new(0));
+        let displayed = Arc::clone(&mouse_frame);
+        #[cfg(windows)]
+        let console = Self::open_console()?;
         let reader = std::thread::Builder::new().spawn(move || {
+            let mut drained_frame = 0;
             while !tx.is_closed() {
                 // A bounded wait lets stop join without injecting a wake-up
                 // into Crossterm's shared reader.
-                let result = match crossterm::event::poll(Duration::from_millis(100)) {
-                    Ok(false) => continue,
-                    Ok(true) => Self::read_waiting(),
+                let current = displayed.load(Ordering::Relaxed);
+                // After a redraw, consume buffered input without accepting
+                // clicks until the queue has emptied under the new mapping.
+                let wait = if drained_frame == current {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::ZERO
+                };
+                #[cfg(windows)]
+                let ready = Self::poll_console(wait, &console);
+                #[cfg(not(windows))]
+                let ready = crossterm::event::poll(wait);
+                let result = match ready {
+                    Ok(false) => {
+                        drained_frame = current;
+                        continue;
+                    }
+                    Ok(true) => Self::read_waiting().map(|events| TerminalBatch {
+                        events,
+                        mouse_frame: drained_frame,
+                    }),
                     Err(e) => Err(e),
                 };
+                if result.as_ref().is_ok_and(|batch| batch.events.is_empty()) {
+                    continue;
+                }
                 let failed = result.is_err();
                 if tx.blocking_send(result).is_err() || failed {
                     break;
@@ -176,6 +226,7 @@ impl TerminalEvents {
         })?;
         Ok(Self {
             events,
+            mouse_frame,
             reader: Some(reader),
             finished,
         })
@@ -203,6 +254,57 @@ impl TerminalEvents {
         Ok(())
     }
 
+    #[cfg(windows)]
+    fn open_console() -> std::io::Result<std::fs::File> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        // Pass the device name directly, without making it a filesystem path.
+        let device = b"CONIN$\0".map(u16::from);
+        // SAFETY: CONIN$ is NUL-terminated, and the optional pointers are null.
+        let handle = unsafe {
+            CreateFileW(
+                device.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a newly owned handle.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    #[cfg(windows)]
+    fn poll_console(wait: Duration, console: &std::fs::File) -> std::io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
+
+        while !crossterm::event::poll(wait)? {
+            if !wait.is_zero() {
+                return Ok(false);
+            }
+            // A zero-time poll can return false after consuming one ignored console record.
+            let mut queued = 0;
+            // SAFETY: console owns a live CONIN$ handle, and queued is a valid out pointer.
+            if unsafe { GetNumberOfConsoleInputEvents(console.as_raw_handle(), &mut queued) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if queued == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn read_waiting() -> std::io::Result<Vec<Event>> {
         // Batch before sending: a paste must not wake the app with its
         // first key while the rest are still waiting in the terminal.
@@ -213,6 +315,8 @@ impl TerminalEvents {
                 Err(_) => break,
             }
         }
+        // Crossterm also captures motion; don't redraw for mouse events we don't use.
+        events.retain(|event| !matches!(event, Event::Mouse(mouse) if !list_click(mouse)));
         Ok(events)
     }
 }
@@ -704,6 +808,8 @@ pub struct App {
     thread_overrides: HashSet<(usize, String, u32)>,
     pub selected: usize,
     pub list_scroll: Cell<usize>,
+    /// The occupied message rows in the last frame; empty when not clickable.
+    pub(crate) list_hit_area: Cell<Rect>,
     /// Messages picked with Space for an action on them all.
     pub marked: HashSet<(usize, String, u32)>,
     /// The search in effect.
@@ -895,6 +1001,7 @@ impl App {
             thread_overrides: HashSet::new(),
             selected: 0,
             list_scroll: Cell::new(0),
+            list_hit_area: Cell::new(Rect::ZERO),
             marked: HashSet::new(),
             search: None,
             sidebar_selected: 0,
@@ -1034,6 +1141,7 @@ impl App {
         mut rx: UnboundedReceiver<AppEvent>,
     ) -> Result<()> {
         let mut keys = TerminalEvents::new()?;
+        let mut mouse_frame = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         #[cfg(unix)]
         quit_on_hangup(self.tx.clone())?;
@@ -1044,7 +1152,20 @@ impl App {
             self.check(i, true);
         }
         loop {
-            terminal.draw(|frame| crate::ui::draw(frame, self))?;
+            let previous = (self.list_hit_area.get(), self.list_scroll.get());
+            terminal.draw(|frame| {
+                crate::ui::draw(frame, self);
+                let area = self.list_hit_area.get();
+                if area.is_empty() || (area, self.list_scroll.get()) != previous {
+                    // Don't associate clicks with a mapping while it is changing.
+                    keys.mouse_frame.store(0, Ordering::Relaxed);
+                }
+            })?;
+            if !self.list_hit_area.get().is_empty() && keys.mouse_frame.load(Ordering::Relaxed) == 0
+            {
+                mouse_frame += 1;
+                keys.mouse_frame.store(mouse_frame, Ordering::Relaxed);
+            }
             self.after_draw();
             if self.quit {
                 break;
@@ -1052,9 +1173,7 @@ impl App {
             if let Some(request) = self.terminal_requests.pop_front() {
                 // Only one program reads keys or draws on the terminal at a time.
                 keys.stop()?;
-                let _ =
-                    crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-                ratatui::restore();
+                crate::restore_terminal()?;
                 match request {
                     TerminalRequest::Editor => self.run_editor(),
                     TerminalRequest::Attachment(command) => {
@@ -1063,9 +1182,7 @@ impl App {
                         }
                     }
                 }
-                *terminal = ratatui::init();
-                let _ =
-                    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+                *terminal = crate::init_terminal()?;
                 // Its buffers are new; clear the fullscreen backend without
                 // querying a cursor position that we don't need.
                 terminal.backend_mut().clear()?;
@@ -1074,7 +1191,9 @@ impl App {
             }
             tokio::select! {
                 event = keys.events.recv() => match event {
-                    Some(Ok(events)) => self.on_terminal_events(events),
+                    Some(Ok(batch)) => self.on_terminal_events(
+                        batch.for_frame(keys.mouse_frame.load(Ordering::Relaxed)),
+                    ),
                     Some(Err(_)) | None => self.quit = true,
                 },
                 Some(event) = rx.recv() => {
@@ -2603,6 +2722,8 @@ impl App {
 
     /// Rebuilds the row-to-message mapping after the list or a thread changes.
     fn rebuild_rows(&mut self, current: Option<&(usize, String, u32)>) {
+        // Until the next frame, screen rows still refer to the old mapping.
+        self.list_hit_area.set(Rect::ZERO);
         self.rows.clear();
         let overrides: HashSet<_> = self
             .thread_overrides
@@ -5515,7 +5636,7 @@ impl App {
         }
     }
 
-    // Keys.
+    // Terminal input.
 
     /// Terminal events that were waiting together. A paste is meant to come
     /// as one `Event::Paste` (bracketed paste), but on Windows, and from a
@@ -5535,17 +5656,21 @@ impl App {
         if presses.len() < 2 || repeated {
             return events.into_iter().for_each(|event| self.on_terminal(event));
         }
-        for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
-            self.on_terminal(event);
-        }
         // Under a question, keys answer it: nothing is written.
         let writing = self.confirm.is_none()
             && (self.prompt.is_some() || self.composer.is_some() || self.setup.is_some());
+        // Preserve the order of clicks and keys when the keys aren't a paste.
+        if !writing && presses.len() < PASTED_KEYS {
+            return events.into_iter().for_each(|event| self.on_terminal(event));
+        }
+        for event in events
+            .into_iter()
+            .filter(|e| !matches!(e, Event::Key(_) | Event::Mouse(_)))
+        {
+            self.on_terminal(event);
+        }
         if !writing {
-            if presses.len() >= PASTED_KEYS {
-                return self.info("Pasted text goes where you write: press c, / or Tab first");
-            }
-            return presses.into_iter().for_each(|key| self.on_key(key));
+            return self.info("Pasted text goes where you write: press c, / or Tab first");
         }
         let typed = |key: &KeyEvent| {
             matches!(key.code, KeyCode::Char(_))
@@ -5578,6 +5703,8 @@ impl App {
     fn on_terminal(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.on_key(key),
+            Event::Mouse(mouse) if list_click(&mouse) => self.on_list_click(mouse),
+            Event::Resize(..) => self.list_hit_area.set(Rect::ZERO),
             // A paste never answers a question, nor changes what it's about.
             Event::Paste(_) if self.confirm.is_some() => {
                 self.info("Answer the question first: y, or any other key")
@@ -5614,6 +5741,29 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn list_click_blocked(&self) -> bool {
+        self.confirm.is_some()
+            || self.prompt.is_some()
+            || self.picker.is_some()
+            || self.help.is_some()
+            || self.setup.is_some()
+            || self.composer.is_some()
+    }
+
+    fn on_list_click(&mut self, mouse: MouseEvent) {
+        let area = self.list_hit_area.get();
+        if self.list_click_blocked() || !area.contains(Position::new(mouse.column, mouse.row)) {
+            return;
+        }
+        self.pending_g = false;
+        self.focus = Focus::List;
+        let row = self.list_scroll.get() + usize::from(mouse.row - area.y);
+        if row == self.selected {
+            self.moved_at = Some(Instant::now());
+        }
+        self.select(row);
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -7543,6 +7693,58 @@ pub mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn mouse_selects_a_scrolled_conversation_but_not_through_help() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.threads_collapsed = true;
+        app.reload();
+        let (conversation, newest) = app
+            .visible_items()
+            .enumerate()
+            .find_map(|(row, (item, members))| (members > 1).then(|| (row, item.key())))
+            .unwrap();
+        assert!(conversation > 0);
+        app.select(conversation + 1);
+        let before = app.selected_item().unwrap().key();
+        app.focus = Focus::Sidebar;
+        let drawn = screen(&mut app, 160, 5);
+        let row = drawn
+            .lines()
+            .position(|line| line.contains("▸ 3 "))
+            .expect(&drawn) as u16;
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 35,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        app.on_terminal_events(vec![Event::Key(key(KeyCode::Char('?'))), click.clone()]);
+        assert_eq!(app.selected_item().unwrap().key(), before);
+        app.on_key(key(KeyCode::Esc));
+        screen(&mut app, 160, 5);
+        let paste = ['r', 'x', 'y'].map(|c| Event::Key(key(KeyCode::Char(c))));
+        app.on_terminal_events(paste.into_iter().chain([click.clone()]).collect());
+        assert_eq!(app.selected_item().unwrap().key(), before);
+
+        // A queued click from the previous list must not pick the message now
+        // occupying the same screen row, even if all the geometry is unchanged.
+        let stale = TerminalBatch {
+            mouse_frame: 1,
+            events: vec![click.clone()],
+        };
+        app.on_terminal_events(stale.for_frame(2));
+        assert_eq!(app.selected_item().unwrap().key(), before);
+
+        app.on_terminal_events(vec![click]);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.selected_item().unwrap().key(), newest);
+        assert!(app.reader.is_none(), "the click selects without opening");
     }
 
     #[tokio::test]

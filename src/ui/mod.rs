@@ -31,6 +31,7 @@ const WIDE: u16 = 100;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.list_hit_area.set(Rect::ZERO);
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
     let [body, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);

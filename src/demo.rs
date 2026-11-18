@@ -2,11 +2,7 @@
 //! memory. Nothing connects anywhere and nothing is sent; settings changed
 //! last for the run.
 
-use std::io::stdout;
-
 use anyhow::Result;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::execute;
 
 use crate::account::{Account, Protocol};
 use crate::app::{self, App};
@@ -543,9 +539,7 @@ pub async fn run() -> Result<()> {
     let mut store = Store::in_memory();
     fill(&mut store, &accounts);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut terminal = ratatui::init();
-    crate::panic_hook();
-    execute!(stdout(), EnableBracketedPaste)?;
+    let mut terminal = crate::init_terminal()?;
     let mut app = App::new(store, Settings::default(), accounts, false, None, tx, true);
     // Agents try it here, on made-up mail, once the setting is on
     // (`tuimail mcp --demo`): the data folder is only looked for then.
@@ -554,8 +548,7 @@ pub async fn run() -> Result<()> {
         .map(|c| crate::agent::socket(&c.data_dir, true));
     app.info("The demo: made-up mail, nothing is sent or fetched. ? lists the keys, q quits.");
     let result = app.run(&mut terminal, rx).await;
-    let _ = execute!(stdout(), DisableBracketedPaste);
-    ratatui::restore();
+    let _ = crate::restore_terminal();
     result
 }
 

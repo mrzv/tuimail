@@ -109,6 +109,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | Key | Action |
 | --- | --- |
 | `←↓↑→` / `h j k l` | Move; `Enter`, `→` or `l` opens |
+| Left click on a message or conversation | Focus the message list and select that row |
 | `Tab` | Folders → messages → the message |
 | `gg` / `G`, `Ctrl-u` / `Ctrl-d` | First / last, half a page |
 | `c` | Write a message |

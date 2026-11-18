@@ -61,6 +61,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .take(height)
         .map(|(i, (item, members))| row(app, item, members, i == app.selected, focused, width, now))
         .collect();
+    if !app.list_click_blocked() {
+        app.list_hit_area.set(Rect {
+            height: lines.len() as u16,
+            ..inner
+        });
+    }
     frame.render_widget(Paragraph::new(lines), inner);
     scrollbar(frame, area, count.saturating_sub(height), scroll, c);
 }
