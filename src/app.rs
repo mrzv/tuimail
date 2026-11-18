@@ -638,14 +638,15 @@ impl HelpMenu {
     pub const PREFER_PLAIN: usize = 1;
     pub const MARK_READ: usize = 2;
     pub const THREADS: usize = 3;
-    pub const THREADS_INCLUDE_SENT: usize = 4;
-    pub const THREADS_COMPLETE_GMAIL: usize = 5;
-    pub const CONFIRM_DELETE: usize = 6;
-    pub const CONFIRM_SEND: usize = 7;
-    pub const NOTIFICATIONS: usize = 8;
-    pub const AGENTS: usize = 9;
-    pub const CONFIRM_AGENTS: usize = 10;
-    pub const THEMES: usize = 11;
+    pub const THREADS_COLLAPSED: usize = 4;
+    pub const THREADS_INCLUDE_SENT: usize = 5;
+    pub const THREADS_COMPLETE_GMAIL: usize = 6;
+    pub const CONFIRM_DELETE: usize = 7;
+    pub const CONFIRM_SEND: usize = 8;
+    pub const NOTIFICATIONS: usize = 9;
+    pub const AGENTS: usize = 10;
+    pub const CONFIRM_AGENTS: usize = 11;
+    pub const THEMES: usize = 12;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -699,8 +700,8 @@ pub struct App {
     /// All listed messages, including those hidden under a conversation row.
     pub items: Vec<Item>,
     rows: Vec<ListEntry>,
-    /// Members anchoring collapsed threads in the current folder view.
-    collapsed: HashSet<(usize, String, u32)>,
+    /// Members anchoring exceptions to the thread default in this folder view.
+    thread_overrides: HashSet<(usize, String, u32)>,
     pub selected: usize,
     pub list_scroll: Cell<usize>,
     /// Messages picked with Space for an action on them all.
@@ -891,7 +892,7 @@ impl App {
             place: Place::AllInboxes,
             items: Vec::new(),
             rows: Vec::new(),
-            collapsed: HashSet::new(),
+            thread_overrides: HashSet::new(),
             selected: 0,
             list_scroll: Cell::new(0),
             marked: HashSet::new(),
@@ -2048,7 +2049,7 @@ impl App {
             }
         }
         self.marked.retain(|k| !stale(k));
-        self.collapsed.retain(|k| !stale(k));
+        self.thread_overrides.retain(|k| !stale(k));
         self.local_flags.retain(|k, _| !stale(k));
         self.local_removed.retain(|k, _| !stale(k));
         self.accounts[i]
@@ -2436,6 +2437,10 @@ impl App {
         } else {
             self.selected_item().map(Item::key)
         };
+        self.reload_keeping(current.as_ref());
+    }
+
+    fn reload_keeping(&mut self, current: Option<&(usize, String, u32)>) {
         let mut items = Vec::new();
         let targets: Vec<(usize, Option<String>)> = match &self.place {
             Place::Folder { account, folder } => {
@@ -2597,19 +2602,23 @@ impl App {
     }
 
     /// Rebuilds the row-to-message mapping after the list or a thread changes.
-    fn rebuild_rows(&mut self, current: Option<(usize, String, u32)>) {
+    fn rebuild_rows(&mut self, current: Option<&(usize, String, u32)>) {
         self.rows.clear();
-        let collapsed: HashSet<_> = self
-            .collapsed
+        let overrides: HashSet<_> = self
+            .thread_overrides
             .iter()
             .map(|(account, folder, uid)| (*account, folder.as_str(), *uid))
             .collect();
         let mut start = 0;
         for thread in self.items.chunk_by(|_, next| !next.thread.tree.is_empty()) {
             let end = start + thread.len();
-            // Email updates can change the root or replace a label copy;
-            // any surviving member carries the collapse into the new list.
-            if thread.len() > 1 && thread.iter().any(|it| collapsed.contains(&it.key_ref())) {
+            // Any surviving member carries the exception if email updates
+            // change the root or replace a label copy.
+            if thread.len() > 1
+                && self.settings.threads_collapsed
+                    != (!overrides.is_empty()
+                        && thread.iter().any(|it| overrides.contains(&it.key_ref())))
+            {
                 let newest = (start..end)
                     .max_by_key(|&i| (self.items[i].message.summary.date, std::cmp::Reverse(i)))
                     .unwrap();
@@ -2629,11 +2638,7 @@ impl App {
             .and_then(|(account, folder, uid)| {
                 self.items
                     .iter()
-                    .position(|it| {
-                        it.account == account
-                            && it.message.folder == folder
-                            && it.message.uid == uid
-                    })
+                    .position(|it| it.key_ref() == (*account, folder.as_str(), *uid))
                     .map(|i| self.row_for(i))
             })
             .unwrap_or(self.selected)
@@ -2670,14 +2675,9 @@ impl App {
             return;
         }
         let current = self.items[row.newest].key();
-        if row.members.len() > 1 {
-            let members: HashSet<_> = self.items[row.members.clone()]
-                .iter()
-                .map(Item::key_ref)
-                .collect();
-            self.collapsed.retain(|(account, folder, uid)| {
-                !members.contains(&(*account, folder.as_str(), *uid))
-            });
+        let collapsed = row.members.len() > 1;
+        let members = if collapsed {
+            row.members.clone()
         } else {
             let mut root = row.members.start;
             while root > 0 && !self.items[root].thread.tree.is_empty() {
@@ -2692,10 +2692,18 @@ impl App {
             if end == root + 1 {
                 return;
             }
-            self.collapsed
-                .extend(self.items[root..end].iter().map(Item::key));
+            root..end
+        };
+        if collapsed == self.settings.threads_collapsed {
+            self.thread_overrides
+                .extend(self.items[members].iter().map(Item::key));
+        } else {
+            let members: HashSet<_> = self.items[members].iter().map(Item::key_ref).collect();
+            self.thread_overrides.retain(|(account, folder, uid)| {
+                !members.contains(&(*account, folder.as_str(), *uid))
+            });
         }
-        self.rebuild_rows(Some(current));
+        self.rebuild_rows(Some(&current));
         self.moved_at = Some(Instant::now());
     }
 
@@ -2708,7 +2716,7 @@ impl App {
             self.selected = 0;
             self.list_scroll.set(0);
             self.marked.clear();
-            self.collapsed.clear();
+            self.thread_overrides.clear();
         }
         self.reload();
         match place {
@@ -2825,7 +2833,10 @@ impl App {
         let Some(reader) = &self.reader else {
             return;
         };
-        if self.collapsed.is_empty() && reader.thread.is_none() {
+        if !self.settings.threads_collapsed
+            && self.thread_overrides.is_empty()
+            && reader.thread.is_none()
+        {
             return;
         }
         let index = self.items.iter().position(|it| reader.is_message(it));
@@ -2839,11 +2850,7 @@ impl App {
             }
             return;
         }
-        let thread = if self.collapsed.is_empty() {
-            None
-        } else {
-            index.and_then(|i| self.thread_for(i))
-        };
+        let thread = index.and_then(|i| self.thread_for(i));
         let previous = reader.thread.as_ref().map(|t| t.active);
         let active = thread.as_ref().map(|t| t.active);
         let reader = self.reader.as_mut().unwrap();
@@ -4552,7 +4559,7 @@ impl App {
     /// in place.
     fn take_off_list(&mut self, keys: &[(usize, String, u32)]) {
         let keys: HashSet<_> = keys.iter().cloned().collect();
-        self.collapsed.retain(|key| !keys.contains(key));
+        self.thread_overrides.retain(|key| !keys.contains(key));
         self.marked.retain(|k| !keys.contains(k));
         if self
             .reader
@@ -6301,7 +6308,7 @@ impl App {
         }
         self.agent_downloads.clear();
         self.marked.clear();
-        self.collapsed.clear();
+        self.thread_overrides.clear();
         self.pending = None;
         self.local_flags.clear();
         self.local_removed.clear();
@@ -6389,6 +6396,9 @@ impl App {
                 self.render();
             }
             HelpMenu::MARK_READ => self.save_setting("mark_read", flip(self.settings.mark_read)),
+            HelpMenu::THREADS_COLLAPSED => {
+                self.save_setting("threads_collapsed", flip(self.settings.threads_collapsed))
+            }
             HelpMenu::THREADS
             | HelpMenu::THREADS_INCLUDE_SENT
             | HelpMenu::THREADS_COMPLETE_GMAIL => {
@@ -6403,13 +6413,6 @@ impl App {
                     ),
                 };
                 self.save_setting(key, flip(value));
-                for account in &mut self.accounts {
-                    account.conversations.invalidate();
-                }
-                self.reload();
-                for i in 0..self.accounts.len() {
-                    self.sync_sent(i);
-                }
             }
             HelpMenu::CONFIRM_DELETE => {
                 self.save_setting("confirm_delete", flip(self.settings.confirm_delete))
@@ -6443,26 +6446,59 @@ impl App {
     }
 
     fn save_setting(&mut self, key: &str, value: toml::Value) {
-        let Some(path) = self.settings_path.clone() else {
+        let settings = if let Some(path) = &self.settings_path {
+            match Settings::save_one(path, key, value) {
+                Ok(settings) => settings,
+                Err(e) => return self.error(format!("{e:#}")),
+            }
+        } else {
             // The demo: changed for this run only.
             let mut table = toml::Table::try_from(&self.settings).unwrap_or_default();
             table.insert(key.to_string(), value);
-            if let Ok(settings) = table.try_into() {
-                self.settings = settings;
-            }
-            return;
+            let Ok(settings) = table.try_into() else {
+                return;
+            };
+            settings
         };
-        match Settings::save_one(&path, key, value) {
-            Ok(settings) => {
-                self.settings = settings;
-                // The file may say agents are off now (another tuimail
-                // turned them off): then they're off here too, not only
-                // on the settings tab.
-                if !self.settings.agents {
-                    self.listen_for_agents();
+        let threads_default_changed = self.settings.threads_collapsed != settings.threads_collapsed;
+        let grouping_changed = self.settings.threads != settings.threads
+            || self.settings.threads_include_sent != settings.threads_include_sent
+            || self.settings.threads_complete_gmail != settings.threads_complete_gmail;
+        self.settings = settings;
+        if threads_default_changed {
+            self.thread_overrides.clear();
+        }
+        if threads_default_changed || grouping_changed {
+            let reading = self.focus == Focus::Reader;
+            let current = if reading {
+                self.reader.as_ref().map(Reader::key)
+            } else {
+                self.selected_item().map(Item::key)
+            };
+            if grouping_changed {
+                for account in &mut self.accounts {
+                    account.conversations.invalidate();
                 }
+                self.reload_keeping(current.as_ref());
+                for i in 0..self.accounts.len() {
+                    self.sync_sent(i);
+                }
+            } else {
+                self.rebuild_rows(current.as_ref());
             }
-            Err(e) => self.error(format!("{e:#}")),
+            if !reading
+                && self.selected_item().is_some_and(|item| {
+                    current.as_ref().is_none_or(|(account, folder, uid)| {
+                        item.key_ref() != (*account, folder.as_str(), *uid)
+                    })
+                })
+            {
+                self.moved_at = Some(Instant::now());
+            }
+        }
+        // Another instance may have turned agents off in the settings file.
+        if self.settings_path.is_some() && !self.settings.agents {
+            self.listen_for_agents();
         }
     }
 
@@ -7584,6 +7620,130 @@ pub mod tests {
             "{list}"
         );
         assert_eq!(app.selected_item().unwrap().key(), newer);
+    }
+
+    #[test]
+    fn conversation_default_is_saved_and_v_overrides_it() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let dir = crate::tools::private_temp_dir().unwrap();
+        let path = crate::settings::path(&dir);
+        app.settings_path = Some(path.clone());
+        let settings_row = |app: &mut App| {
+            app.on_key(key(KeyCode::Char('O')));
+            for _ in 0..4 {
+                app.on_key(key(KeyCode::Down));
+            }
+        };
+        let design = |app: &App| {
+            app.visible_items()
+                .enumerate()
+                .find(|(_, (it, _))| it.message.summary.subject.ends_with("Design review notes"))
+                .map(|(i, (_, count))| (i, count))
+                .unwrap()
+        };
+
+        let (row, count) = design(&app);
+        assert_eq!(count, 1);
+        app.select(row);
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(design(&app).1, 3);
+        settings_row(&mut app);
+        let label = "Collapse threads into conversations by default";
+        assert!(screen(&mut app, 99, 32).contains(&format!("[ ] {label}")));
+        app.on_key(key(KeyCode::Enter));
+        assert!(screen(&mut app, 99, 32).contains(&format!("[✓] {label}")));
+        app.on_key(key(KeyCode::Esc));
+        let (saved, unknown) = Settings::load_checked(&path).unwrap();
+        assert!(saved.threads_collapsed && unknown.is_empty());
+        let (row, count) = design(&app);
+        assert_eq!(count, 3);
+
+        app.select(row);
+        app.on_key(key(KeyCode::Char('v')));
+        app.reload();
+        assert_eq!(design(&app).1, 1, "the override survives reload");
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(design(&app).1, 3);
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.reader_thread().unwrap().0.len(), 3);
+        app.on_key(key(KeyCode::Char(']')));
+        let open = app.reader.as_ref().unwrap().key();
+        settings_row(&mut app);
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.reader_thread().is_none());
+        assert_eq!(app.selected_item().unwrap().key(), open);
+        assert_eq!(design(&app).1, 1);
+        assert!(!Settings::load(&path).unwrap().threads_collapsed);
+
+        // Saving an unrelated setting also picks up changes made by another instance.
+        Settings::save_one(&path, "threads_collapsed", toml::Value::Boolean(true)).unwrap();
+        app.on_key(key(KeyCode::Char('O')));
+        app.on_key(key(KeyCode::Enter)); // Preview
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(design(&app).1, 3);
+        assert_eq!(app.reader.as_ref().unwrap().key(), open);
+
+        Settings::save_one(&path, "threads", toml::Value::Boolean(false)).unwrap();
+        settings_row(&mut app);
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(design(&app).1, 1);
+        assert!(app.items.iter().all(|it| it.thread.tree.is_empty()));
+        assert_eq!(app.reader.as_ref().unwrap().key(), open);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn collapsing_by_default_updates_the_list_preview() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.preview = true;
+        crate::ui::tests::screen(&mut app, 160, 32);
+        app.focus = Focus::List;
+        let root = app
+            .items
+            .iter()
+            .position(|it| it.message.summary.subject == "Design review notes")
+            .unwrap();
+        app.select(root + 1);
+        app.open_selected(false);
+        let older = app.reader.as_ref().unwrap().key();
+        // The old preview has settled, with no pending cursor movement.
+        app.moved_at = None;
+
+        app.change_setting(HelpMenu::THREADS_COLLAPSED);
+        *app.moved_at.as_mut().unwrap() -= PREVIEW_AFTER;
+        app.on_tick();
+        let selected = app.selected_item().unwrap().key();
+        assert_ne!(selected, older);
+        assert_eq!(app.reader.as_ref().unwrap().key(), selected);
+        assert_eq!(app.reader_thread().unwrap().0.len(), 3);
+    }
+
+    #[test]
+    fn thread_default_does_not_open_an_unchanged_selection() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.preview = true;
+        app.settings.threads = false;
+        app.reload();
+        crate::ui::tests::screen(&mut app, 160, 32);
+        app.focus = Focus::List;
+        app.reader = None;
+        app.moved_at = None;
+
+        app.change_setting(HelpMenu::THREADS_COLLAPSED);
+        if let Some(at) = &mut app.moved_at {
+            *at -= PREVIEW_AFTER;
+        }
+        app.on_tick();
+        assert!(app.reader.is_none());
     }
 
     #[test]

@@ -134,6 +134,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 
 Open a collapsed conversation to see its messages newest first, with only the newest body expanded. List actions target the newest message, not the whole conversation; actions in the reader target the message you've opened.
 
+To start with conversations collapsed, turn on **Collapse threads into conversations by default** in `O`. Changing the default resets individual `v` choices. The setting has no effect when threading is off or when viewing search results.
+
 Writing:
 
 | Key | Action |
@@ -268,7 +270,7 @@ certificate = "/Users/you/Documents/bridge/cert.pem"
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: the message beside the list, plain text or HTML, marking read, conversations, including Sent or completing Gmail threads, asking before deleting and before sending, notifications, AI agents, and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments).
+`O` (or `?` then `Tab`) opens the settings: the message beside the list, plain text or HTML, marking read, threading and its default view, including Sent or completing Gmail threads, asking before deleting and before sending, notifications, AI agents, and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments).
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
 
@@ -280,6 +282,7 @@ preview = true           # the open message beside the list, when the window is 
 prefer_plain = false     # a message's plain-text part rather than its HTML, when it has both
 mark_read = true         # mark a message read once it's shown
 threads = true           # group the list in conversations
+threads_collapsed = false # collapse threads into single conversation rows by default
 threads_include_sent = false # include related cached Sent messages (requires threads)
 threads_complete_gmail = false # complete on-screen threads from Gmail All Mail (requires threads)
 confirm_delete = false   # ask before moving mail to Trash

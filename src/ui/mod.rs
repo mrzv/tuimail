@@ -833,6 +833,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
     );
     add(
         &mut lines,
+        HelpMenu::THREADS_COLLAPSED,
+        check(settings.threads_collapsed),
+        "Collapse threads into conversations by default",
+    );
+    add(
+        &mut lines,
         HelpMenu::THREADS_INCLUDE_SENT,
         check(settings.threads_include_sent),
         "Include Sent in threads",

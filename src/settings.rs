@@ -34,6 +34,8 @@ pub struct Settings {
     pub mark_read: bool,
     /// Group the list's messages in conversations.
     pub threads: bool,
+    /// Show each thread as a single conversation row by default.
+    pub threads_collapsed: bool,
     /// Include related messages from Sent in conversations.
     pub threads_include_sent: bool,
     /// Complete on-screen Gmail conversations from All Mail, including Sent.
@@ -86,6 +88,7 @@ impl Default for Settings {
             prefer_plain: false,
             mark_read: true,
             threads: true,
+            threads_collapsed: false,
             threads_include_sent: false,
             threads_complete_gmail: false,
             confirm_delete: false,
@@ -221,7 +224,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 19] = [
+const KNOWN: [&str; 20] = [
     "theme",
     "icons",
     "notifications",
@@ -229,6 +232,7 @@ const KNOWN: [&str; 19] = [
     "prefer_plain",
     "mark_read",
     "threads",
+    "threads_collapsed",
     "threads_include_sent",
     "threads_complete_gmail",
     "confirm_delete",
