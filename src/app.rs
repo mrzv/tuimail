@@ -4,6 +4,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -295,6 +296,16 @@ impl Item {
     pub fn key(&self) -> (usize, String, u32) {
         (self.account, self.message.folder.clone(), self.message.uid)
     }
+
+    fn key_ref(&self) -> (usize, &str, u32) {
+        (self.account, &self.message.folder, self.message.uid)
+    }
+}
+
+/// A list row covers one message or one whole, contiguous thread.
+struct ListEntry {
+    members: Range<usize>,
+    newest: usize,
 }
 
 pub struct AccountState {
@@ -395,6 +406,7 @@ pub struct Reader {
     /// A layout is being made (its number).
     pending: Option<u64>,
     pub scroll: usize,
+    thread: Option<ReaderThread>,
     pub error: Option<String>,
     /// The plain part (true) or the HTML (false), chosen with `H`.
     pub plain: Option<bool>,
@@ -404,9 +416,21 @@ pub struct Reader {
     marked_read: bool,
 }
 
+struct ReaderThread {
+    /// Indices into App::items, newest first.
+    members: Vec<usize>,
+    active: usize,
+}
+
 impl Reader {
     pub fn key(&self) -> (usize, String, u32) {
         (self.account, self.folder.clone(), self.uid)
+    }
+
+    fn is_message(&self, item: &Item) -> bool {
+        self.account == item.account
+            && self.folder == item.message.folder
+            && self.uid == item.message.uid
     }
 }
 
@@ -672,7 +696,11 @@ pub struct App {
     keychain: bool,
 
     pub place: Place,
+    /// All listed messages, including those hidden under a conversation row.
     pub items: Vec<Item>,
+    rows: Vec<ListEntry>,
+    /// Members anchoring collapsed threads in the current folder view.
+    collapsed: HashSet<(usize, String, u32)>,
     pub selected: usize,
     pub list_scroll: Cell<usize>,
     /// Messages picked with Space for an action on them all.
@@ -862,6 +890,8 @@ impl App {
             keychain,
             place: Place::AllInboxes,
             items: Vec::new(),
+            rows: Vec::new(),
+            collapsed: HashSet::new(),
             selected: 0,
             list_scroll: Cell::new(0),
             marked: HashSet::new(),
@@ -1111,10 +1141,11 @@ impl App {
             let mut thread_ids = Vec::new();
             let attempted = state.attempted.get(folder);
             for item in self
-                .items
+                .rows
                 .iter()
                 .skip(self.list_scroll.get())
                 .take(usize::from(self.list_rows.get().max(1)))
+                .flat_map(|row| &self.items[row.members.clone()])
             {
                 if item.account != i {
                     continue;
@@ -1208,7 +1239,7 @@ impl App {
             && at.elapsed() >= PREVIEW_AFTER
         {
             self.moved_at = None;
-            if self.preview_shown() {
+            if self.focus != Focus::Reader && self.preview_shown() {
                 self.open_selected(false);
             }
         }
@@ -2017,6 +2048,7 @@ impl App {
             }
         }
         self.marked.retain(|k| !stale(k));
+        self.collapsed.retain(|k| !stale(k));
         self.local_flags.retain(|k, _| !stale(k));
         self.local_removed.retain(|k, _| !stale(k));
         self.accounts[i]
@@ -2402,7 +2434,7 @@ impl App {
         let current = if self.selected == 0 && self.reader.is_none() {
             None
         } else {
-            self.items.get(self.selected).map(Item::key)
+            self.selected_item().map(Item::key)
         };
         let mut items = Vec::new();
         let targets: Vec<(usize, Option<String>)> = match &self.place {
@@ -2561,15 +2593,110 @@ impl App {
                 .collect();
         }
         self.items = items;
-        self.selected = current
-            .and_then(|key| self.items.iter().position(|it| it.key() == key))
-            .unwrap_or(self.selected)
-            .min(self.items.len().saturating_sub(1));
-        if !self.marked.is_empty() {
-            // Looked up in one set: thousands marked in a list of thousands.
-            let listed: HashSet<_> = self.items.iter().map(Item::key).collect();
-            self.marked.retain(|key| listed.contains(key));
+        self.rebuild_rows(current);
+    }
+
+    /// Rebuilds the row-to-message mapping after the list or a thread changes.
+    fn rebuild_rows(&mut self, current: Option<(usize, String, u32)>) {
+        self.rows.clear();
+        let collapsed: HashSet<_> = self
+            .collapsed
+            .iter()
+            .map(|(account, folder, uid)| (*account, folder.as_str(), *uid))
+            .collect();
+        let mut start = 0;
+        for thread in self.items.chunk_by(|_, next| !next.thread.tree.is_empty()) {
+            let end = start + thread.len();
+            // Email updates can change the root or replace a label copy;
+            // any surviving member carries the collapse into the new list.
+            if thread.len() > 1 && thread.iter().any(|it| collapsed.contains(&it.key_ref())) {
+                let newest = (start..end)
+                    .max_by_key(|&i| (self.items[i].message.summary.date, std::cmp::Reverse(i)))
+                    .unwrap();
+                self.rows.push(ListEntry {
+                    members: start..end,
+                    newest,
+                });
+            } else {
+                self.rows.extend((start..end).map(|i| ListEntry {
+                    members: i..i + 1,
+                    newest: i,
+                }));
+            }
+            start = end;
         }
+        self.selected = current
+            .and_then(|(account, folder, uid)| {
+                self.items
+                    .iter()
+                    .position(|it| {
+                        it.account == account
+                            && it.message.folder == folder
+                            && it.message.uid == uid
+                    })
+                    .map(|i| self.row_for(i))
+            })
+            .unwrap_or(self.selected)
+            .min(self.rows.len().saturating_sub(1));
+        if !self.marked.is_empty() {
+            // Batch actions can only reach visible rows, including after a search.
+            let visible: HashSet<_> = self
+                .rows
+                .iter()
+                .map(|row| self.items[row.newest].key_ref())
+                .collect();
+            self.marked.retain(|(account, folder, uid)| {
+                visible.contains(&(*account, folder.as_str(), *uid))
+            });
+        }
+        self.refresh_reader_thread();
+    }
+
+    fn row_for(&self, item: usize) -> usize {
+        self.rows.partition_point(|row| row.members.end <= item)
+    }
+
+    pub(crate) fn visible_items(&self) -> impl ExactSizeIterator<Item = (&Item, usize)> {
+        self.rows
+            .iter()
+            .map(|row| (&self.items[row.newest], row.members.len()))
+    }
+
+    fn toggle_conversation(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        if !self.settings.threads || self.search.is_some() {
+            return;
+        }
+        let current = self.items[row.newest].key();
+        if row.members.len() > 1 {
+            let members: HashSet<_> = self.items[row.members.clone()]
+                .iter()
+                .map(Item::key_ref)
+                .collect();
+            self.collapsed.retain(|(account, folder, uid)| {
+                !members.contains(&(*account, folder.as_str(), *uid))
+            });
+        } else {
+            let mut root = row.members.start;
+            while root > 0 && !self.items[root].thread.tree.is_empty() {
+                root -= 1;
+            }
+            let end = root
+                + 1
+                + self.items[root + 1..]
+                    .iter()
+                    .take_while(|item| !item.thread.tree.is_empty())
+                    .count();
+            if end == root + 1 {
+                return;
+            }
+            self.collapsed
+                .extend(self.items[root..end].iter().map(Item::key));
+        }
+        self.rebuild_rows(Some(current));
+        self.moved_at = Some(Instant::now());
     }
 
     /// Opens a folder (or every inbox) in the list.
@@ -2581,6 +2708,7 @@ impl App {
             self.selected = 0;
             self.list_scroll.set(0);
             self.marked.clear();
+            self.collapsed.clear();
         }
         self.reload();
         match place {
@@ -2602,11 +2730,13 @@ impl App {
     }
 
     pub fn selected_item(&self) -> Option<&Item> {
-        self.items.get(self.selected)
+        self.rows
+            .get(self.selected)
+            .map(|row| &self.items[row.newest])
     }
 
     fn select(&mut self, i: usize) {
-        let i = i.min(self.items.len().saturating_sub(1));
+        let i = i.min(self.rows.len().saturating_sub(1));
         if i != self.selected {
             self.selected = i;
             self.moved_at = Some(Instant::now());
@@ -2616,7 +2746,7 @@ impl App {
 
     /// Fetches older mail when the cursor nears the end of what's cached.
     fn load_older_if_near_end(&mut self) {
-        if self.search.is_some() || self.selected + NEAR_END < self.items.len() {
+        if self.search.is_some() || self.selected + NEAR_END < self.rows.len() {
             return;
         }
         let Place::Folder { account, folder } = self.place.clone() else {
@@ -2651,17 +2781,23 @@ impl App {
     /// Opens the message under the cursor in the reader; `enter` when asked
     /// for (marked read at once), not just previewed.
     fn open_selected(&mut self, enter: bool) {
-        let Some(item) = self.selected_item().cloned() else {
+        let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        let key = item.key();
-        // A draft opens in the composer.
-        if enter && self.role_of(item.account, &item.message.folder) == Some(Role::Drafts) {
-            return self.start_from(key, Pending::EditDraft);
+        let index = row.newest;
+        let item = &self.items[index];
+        if enter {
+            self.moved_at = None;
+            // A draft opens in the composer unless reading a conversation.
+            if row.members.len() == 1
+                && self.role_of(item.account, &item.message.folder) == Some(Role::Drafts)
+            {
+                return self.start_from(item.key(), Pending::EditDraft);
+            }
         }
         // Open already; Enter downloads again one that failed.
-        if let Some(reader) = &mut self.reader
-            && reader.key() == key
+        if let Some(reader) = &self.reader
+            && reader.is_message(item)
             && !(enter && reader.raw.is_none() && reader.error.is_some())
         {
             if enter {
@@ -2670,27 +2806,118 @@ impl App {
             }
             return;
         }
-        let id = self.accounts[item.account].id.clone();
+        self.open_message(index, enter, self.thread_for(index), None);
+    }
+
+    fn thread_for(&self, index: usize) -> Option<ReaderThread> {
+        let row = self.rows.get(self.row_for(index))?;
+        if row.members.len() < 2 {
+            return None;
+        }
+        let mut members: Vec<_> = row.members.clone().collect();
+        members
+            .sort_unstable_by_key(|&i| (std::cmp::Reverse(self.items[i].message.summary.date), i));
+        let active = members.iter().position(|&i| i == index)?;
+        Some(ReaderThread { members, active })
+    }
+
+    fn refresh_reader_thread(&mut self) {
+        let Some(reader) = &self.reader else {
+            return;
+        };
+        if self.collapsed.is_empty() && reader.thread.is_none() {
+            return;
+        }
+        let index = self.items.iter().position(|it| reader.is_message(it));
+        if index.is_none() && reader.thread.is_some() {
+            // A refresh can replace a folder copy. Never redirect actions
+            // from an open message to a different folder and UID.
+            self.reader = None;
+            if self.focus == Focus::Reader {
+                self.focus = Focus::List;
+                self.info("Message left this conversation; Enter opens the conversation");
+            }
+            return;
+        }
+        let thread = if self.collapsed.is_empty() {
+            None
+        } else {
+            index.and_then(|i| self.thread_for(i))
+        };
+        let previous = reader.thread.as_ref().map(|t| t.active);
+        let active = thread.as_ref().map(|t| t.active);
+        let reader = self.reader.as_mut().unwrap();
+        if previous != active {
+            reader.scroll = active.unwrap_or(0);
+        }
+        reader.thread = thread;
+    }
+
+    pub(crate) fn reader_thread(
+        &self,
+    ) -> Option<(impl ExactSizeIterator<Item = &Item> + Clone, usize)> {
+        let thread = self.reader.as_ref()?.thread.as_ref()?;
+        Some((
+            thread.members.iter().map(|&i| &self.items[i]),
+            thread.active,
+        ))
+    }
+
+    fn step_thread(&mut self, by: isize) {
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+        let Some(thread) = reader.thread.as_mut() else {
+            return;
+        };
+        let Some(next) = thread
+            .active
+            .checked_add_signed(by)
+            .filter(|&i| i < thread.members.len())
+        else {
+            return;
+        };
+        thread.active = next;
+        let index = thread.members[next];
+        let plain = reader.plain;
+        let thread = reader.thread.take();
+        self.moved_at = None;
+        self.selected = self.row_for(index);
+        self.open_message(index, true, thread, plain);
+    }
+
+    fn open_message(
+        &mut self,
+        index: usize,
+        enter: bool,
+        thread: Option<ReaderThread>,
+        plain: Option<bool>,
+    ) {
+        let item = &self.items[index];
+        let account = item.account;
+        let uid = item.message.uid;
+        let id = &self.accounts[account].id;
         let raw = self
             .store
-            .body(&id, &item.message.folder, item.message.uid)
+            .body(id, &item.message.folder, uid)
             .ok()
             .flatten()
             .map(Arc::new);
         let have = raw.is_some();
         self.reader = Some(Reader {
-            account: item.account,
+            account,
             folder: item.message.folder.clone(),
-            uid: item.message.uid,
+            uid,
             message: item.message.clone(),
             raw,
             parsed: None,
             body: None,
             width: 0,
             pending: None,
-            scroll: 0,
+            scroll: thread.as_ref().map_or(0, |t| t.active),
+            thread,
             error: None,
-            plain: None,
+            plain,
             opened_at: if enter {
                 Instant::now() - PREVIEW_READ_AFTER
             } else {
@@ -2704,17 +2931,17 @@ impl App {
         }
         if have {
             self.render();
-        } else if self.demo || self.accounts[item.account].is_pop() {
+        } else if self.demo || self.accounts[account].is_pop() {
             if let Some(reader) = self.reader.as_mut() {
                 reader.error = Some("This message's text isn't on this computer".into());
             }
-        } else {
+        } else if let Some(reader) = &self.reader {
             self.send(
-                item.account,
+                account,
                 Request::Body {
-                    folder: item.message.folder.clone(),
-                    uid: item.message.uid,
-                    uidvalidity: self.uidvalidity(item.account, &item.message.folder),
+                    folder: reader.folder.clone(),
+                    uid,
+                    uidvalidity: self.uidvalidity(account, &reader.folder),
                 },
             );
         }
@@ -4325,7 +4552,7 @@ impl App {
     /// in place.
     fn take_off_list(&mut self, keys: &[(usize, String, u32)]) {
         let keys: HashSet<_> = keys.iter().cloned().collect();
-        self.items.retain(|it| !keys.contains(&it.key()));
+        self.collapsed.retain(|key| !keys.contains(key));
         self.marked.retain(|k| !keys.contains(k));
         if self
             .reader
@@ -4337,13 +4564,12 @@ impl App {
                 self.focus = Focus::List;
             }
         }
-        if self.settings.threads
-            && (self.settings.threads_include_sent || self.settings.threads_complete_gmail)
-            && self.search.is_none()
-        {
+        if self.settings.threads && self.search.is_none() {
             self.reload();
+        } else {
+            self.items.retain(|it| !keys.contains(&it.key()));
+            self.rebuild_rows(None);
         }
-        self.selected = self.selected.min(self.items.len().saturating_sub(1));
         self.moved_at = Some(Instant::now());
     }
 
@@ -5524,6 +5750,7 @@ impl App {
             KeyCode::Home => self.go_to(0),
             KeyCode::Char('G') | KeyCode::End => self.go_to(usize::MAX),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open_selected(true),
+            KeyCode::Char('v') if !ctrl => self.toggle_conversation(),
             KeyCode::Char(' ') => {
                 if let Some(key) = self.selected_item().map(Item::key)
                     && !self.marked.remove(&key)
@@ -5533,10 +5760,10 @@ impl App {
                 self.select(self.selected + 1);
             }
             KeyCode::Char('*') => {
-                if self.marked.len() == self.items.len() {
+                if self.marked.len() == self.rows.len() {
                     self.marked.clear();
                 } else {
-                    self.marked = self.items.iter().map(Item::key).collect();
+                    self.marked = self.visible_items().map(|(it, _)| it.key()).collect();
                 }
             }
             KeyCode::Esc if !self.marked.is_empty() => self.marked.clear(),
@@ -5589,13 +5816,15 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => reader.scroll = usize::MAX / 2,
             KeyCode::Char('J') | KeyCode::Char('n') => self.step_message(1),
             KeyCode::Char('K') | KeyCode::Char('p') => self.step_message(-1),
+            KeyCode::Char('[') if !ctrl => self.step_thread(-1),
+            KeyCode::Char(']') if !ctrl => self.step_thread(1),
             KeyCode::Char('o') => self.pick_link(),
             KeyCode::Char('U') => self.unsubscribe(),
             KeyCode::Char('A') | KeyCode::Char('w') => self.pick_attachment(),
             KeyCode::Char('H') => {
                 let now_plain = reader.plain.unwrap_or(self.settings.prefer_plain);
                 reader.plain = Some(!now_plain);
-                reader.scroll = 0;
+                reader.scroll = reader.thread.as_ref().map_or(0, |t| t.active);
                 self.render();
             }
             KeyCode::Esc
@@ -5615,7 +5844,7 @@ impl App {
     /// `J` / `K` in the reader: the next or previous message in the list.
     fn step_message(&mut self, by: isize) {
         let next = self.selected as isize + by;
-        if next < 0 || next as usize >= self.items.len() {
+        if next < 0 || next as usize >= self.rows.len() {
             return;
         }
         self.select(next as usize);
@@ -6072,6 +6301,7 @@ impl App {
         }
         self.agent_downloads.clear();
         self.marked.clear();
+        self.collapsed.clear();
         self.pending = None;
         self.local_flags.clear();
         self.local_removed.clear();
@@ -7277,6 +7507,96 @@ pub mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn collapsed_conversation_opens_newest_and_switches_reply_targets() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.on_key(key(KeyCode::Char('d'))); // An unrelated move to undo from the reader.
+        let root = app
+            .items
+            .iter()
+            .position(|it| it.message.summary.subject == "Design review notes")
+            .unwrap();
+        let older = app.items[root + 1].key();
+        let newer = app.items[root + 2].key();
+        app.select(root + 1);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.marked.contains(&older));
+        app.on_key(key(KeyCode::Char('v')));
+        let list = screen(&mut app, 99, 32);
+        assert!(
+            list.contains("▸ 3 ") && list.contains("Re: Design review notes"),
+            "{list}"
+        );
+        assert!(!list.contains("Agreed on all three"), "{list}");
+        assert!(app.marked.is_empty());
+        assert_eq!(app.targets(), [newer.clone()]);
+
+        app.on_key(key(KeyCode::Enter));
+        wait_for_layout(&mut app).await;
+        let reader = screen(&mut app, 99, 32);
+        let (newest, middle, oldest) = (
+            reader.find("▾ maya@example.com").unwrap(),
+            reader.find("▸ leo@example.com").unwrap(),
+            reader.find("▸ maya@example.com").unwrap(),
+        );
+        assert!(newest < middle && middle < oldest, "{reader}");
+        assert!(reader.contains("Yes: one popup"), "{reader}");
+        assert!(!reader.contains("Agreed on all three"), "{reader}");
+
+        app.on_key(key(KeyCode::Char(']')));
+        wait_for_layout(&mut app).await;
+        let reader = screen(&mut app, 99, 32);
+        assert!(
+            reader.contains("▾ leo@example.com") && reader.contains("Agreed on all three"),
+            "{reader}"
+        );
+        assert!(!reader.contains("Yes: one popup"), "{reader}");
+        app.settings.preview = true;
+        screen(&mut app, 160, 32);
+        app.on_key(key(KeyCode::Char('z')));
+        if let Some(at) = &mut app.moved_at {
+            *at -= PREVIEW_AFTER;
+        }
+        app.on_tick();
+        app.on_key(key(KeyCode::Char('s')));
+        let flagged = |(account, folder, uid): &(usize, String, u32)| {
+            app.store
+                .message(&app.accounts[*account].id, folder, *uid)
+                .unwrap()
+                .unwrap()
+                .flags
+                .flagged
+        };
+        assert!(flagged(&older));
+        assert!(!flagged(&newer));
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('v')));
+        let list = screen(&mut app, 99, 32);
+        assert!(
+            list.contains("Agreed on all three") && !list.contains("▸ 3 "),
+            "{list}"
+        );
+        assert_eq!(app.selected_item().unwrap().key(), newer);
+    }
+
+    #[test]
+    fn marks_do_not_follow_messages_out_of_search_results() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let hidden = app.selected_item().unwrap().key();
+        app.on_key(key(KeyCode::Char(' ')));
+        app.run_search("Design review notes");
+        let selected = app.selected_item().unwrap().key();
+        assert_ne!(hidden, selected);
+        assert_eq!(app.targets(), [selected]);
     }
 
     fn subjects(app: &App) -> Vec<String> {
@@ -9234,6 +9554,62 @@ pub mod tests {
             headers,
             thread_ids: vec![700],
         }
+    }
+
+    #[test]
+    fn collapsed_thread_survives_gmail_completion_replacing_its_root() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+        let mut result = gmail_result();
+        let sent_copy = &mut result.headers[2];
+        sent_copy.summary.message_id = "sent@example.com".into();
+        sent_copy.summary.date = 15;
+        let mut sent = sent_copy.clone();
+        sent.uid = 1;
+        sent.gmail = None;
+        app.store.add_headers(&id, "Sent", &[sent]).unwrap();
+        let mut first = crate::store::tests::header(1, "Current plan", 20);
+        first.summary.message_id = "first@example.com".into();
+        first.summary.in_reply_to = "sent@example.com".into();
+        let mut second = crate::store::tests::header(2, "Another Inbox member", 40);
+        second.summary.in_reply_to = first.summary.message_id.clone();
+        app.store
+            .add_headers(&id, "INBOX", &[first, second])
+            .unwrap();
+        app.settings.threads_complete_gmail = true;
+        app.settings.threads_include_sent = true;
+        app.reload();
+        assert_eq!(app.items[0].message.folder, "Sent");
+        app.focus = Focus::List;
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(app.visible_items().next().unwrap().1, 3);
+        app.on_key(key(KeyCode::Enter));
+        for _ in 0..2 {
+            app.on_key(key(KeyCode::Char(']')));
+        }
+        assert_eq!(app.reader.as_ref().unwrap().folder, "Sent");
+        app.demo = false; // Record the completion request without connecting.
+        app.list_rows.set(1);
+        app.after_draw();
+        app.on_worker(
+            0,
+            worker::Event::Conversations {
+                folder: "INBOX".into(),
+                uidvalidity: 10,
+                all: "All Mail".into(),
+                result: Ok(Some(result)),
+            },
+        );
+        assert_eq!(app.items[0].message.summary.subject, "Archived plan");
+        assert!(app.items.iter().all(|item| item.message.folder != "Sent"));
+        assert_eq!(app.visible_items().next().unwrap().1, 4);
+        assert_eq!(app.focus, Focus::List);
+        assert!(app.reader.is_none());
+        app.on_key(key(KeyCode::Enter));
+        let (members, active) = app.reader_thread().unwrap();
+        assert_eq!(members.len(), 4);
+        assert_eq!(active, 0);
     }
 
     #[test]

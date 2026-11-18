@@ -287,7 +287,7 @@ fn hints(app: &App) -> &'static str {
             "`Enter` open · `Esc` end search · `/` search again · `r` reply · `d` delete · `?` help"
         }
         Focus::List => {
-            "`Enter` open · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `t` tag · `/` search · `?` help"
+            "`Enter` open · `v` conversation · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `t` tag · `/` search · `?` help"
         }
         Focus::Reader => {
             "`j k` scroll · `J K` next/previous · `r` reply · `a` all · `f` forward · `o` links · `A` files · `H` html/text · `Esc` back"
@@ -648,7 +648,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 31] = [
+const HELP: [(&str, &str); 33] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
@@ -669,7 +669,9 @@ const HELP: [(&str, &str); 31] = [
     ),
     ("/", "search: here, and the server's folder"),
     ("Esc", "end the search, unmark, back"),
-    ("J  K", "next, previous message (reading)"),
+    ("v", "collapse or expand the conversation (list)"),
+    ("J  K", "next, previous list row (reading)"),
+    ("[  ]", "open the newer, older message in a conversation"),
     ("Space  b", "a page down, up (reading)"),
     ("o", "the message's links: open, or y copy"),
     ("A", "attachments: open, v all with viewer, s save"),

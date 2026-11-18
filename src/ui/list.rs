@@ -37,7 +37,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
     let height = usize::from(inner.height);
     app.list_rows.set(inner.height);
-    if app.items.is_empty() {
+    let rows = app.visible_items();
+    let count = rows.len();
+    if count == 0 {
         let text = empty_text(app);
         let lines = vec![
             Line::default(),
@@ -53,22 +55,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     app.list_scroll.set(scroll);
     let now = crate::app::now();
     let width = usize::from(inner.width);
-    let lines: Vec<Line> = app
-        .items
-        .iter()
+    let lines: Vec<Line> = rows
         .enumerate()
         .skip(scroll)
         .take(height)
-        .map(|(i, item)| row(app, item, i == app.selected, focused, width, now))
+        .map(|(i, (item, members))| row(app, item, members, i == app.selected, focused, width, now))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
-    scrollbar(
-        frame,
-        area,
-        app.items.len().saturating_sub(height),
-        scroll,
-        c,
-    );
+    scrollbar(frame, area, count.saturating_sub(height), scroll, c);
 }
 
 /// The list's title (where it is) and what's on the right (how many).
@@ -135,6 +129,7 @@ fn empty_text(app: &App) -> String {
 fn row(
     app: &App,
     item: &Item,
+    members: usize,
     selected: bool,
     focused: bool,
     width: usize,
@@ -230,19 +225,26 @@ fn row(
         String::new()
     };
     // In a conversation, a reply's subject shows only if it's new.
-    let subject = if item.thread.same_subject && !m.preview.is_empty() {
+    let subject = if members == 1 && item.thread.same_subject && !m.preview.is_empty() {
         String::new()
     } else if m.summary.subject.is_empty() {
         "(no subject)".to_string()
     } else {
         m.summary.subject.clone()
     };
-    let tree = if item.thread.tree.is_empty() {
+    let tree = if members > 1 {
+        format!("▸ {members} ")
+    } else if item.thread.tree.is_empty() {
         String::new()
     } else {
         format!("{} ", item.thread.tree)
     };
-    let tree = fit(&tree, cols(&tree).min(text_width / 2));
+    let tree_width = if members > 1 {
+        text_width
+    } else {
+        text_width / 2
+    };
+    let tree = fit(&tree, cols(&tree).min(tree_width));
     let text_width = text_width.saturating_sub(cols(&tree));
     let folder_width = cols(&folder).min(text_width);
     let folder = fit(&folder, folder_width);

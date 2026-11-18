@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::{border, bordered, fit, fit_middle, hint_spans, scrollbar};
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, Item};
 use crate::mail::{self, Addr, Role};
 use crate::text::{cols, wrap};
 use crate::theme::Colors;
@@ -47,18 +47,56 @@ fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a>
     Line::from(spans)
 }
 
+/// One line per member; the active message's body follows its header.
+fn thread_header(item: &Item, active: bool, width: usize, now: i64, c: &Colors) -> Line<'static> {
+    let m = &item.message;
+    let date = mail::short_date(m.summary.date, now);
+    let room = width.saturating_sub(2 + if date.is_empty() { 0 } else { cols(&date) + 2 });
+    let subject = if m.summary.subject.is_empty() {
+        "(no subject)"
+    } else {
+        &m.summary.subject
+    };
+    let addr = fit_middle(&m.summary.from.addr, room.div_ceil(2));
+    let subject = if addr.is_empty() {
+        fit(subject, room)
+    } else {
+        let subject = fit(subject, room.saturating_sub(cols(&addr) + 2));
+        format!("  {subject}")
+    };
+    let style = if active {
+        Style::new().fg(c.accent).add_modifier(Modifier::BOLD)
+    } else if !m.flags.seen {
+        Style::new().fg(c.text).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(c.subtext)
+    };
+    Line::from(vec![
+        Span::styled(if active { "▾ " } else { "▸ " }, style),
+        Span::styled(addr, style),
+        Span::styled(subject, style),
+        Span::styled(
+            if date.is_empty() {
+                date
+            } else {
+                format!("  {date}")
+            },
+            Style::new().fg(c.dim),
+        ),
+    ])
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
     let focused = app.focus == Focus::Reader;
     let mut block = bordered().border_style(border(focused, &c));
     if focused {
-        block = block.title_bottom(
-            Line::from(hint_spans(
-                " `o` links · `A` files · `J K` next/previous ",
-                &c,
-            ))
-            .right_aligned(),
-        );
+        let hint = if app.reader_thread().is_some() {
+            " `[ ]` newer/older reply "
+        } else {
+            " `o` links · `A` files · `J K` next/previous "
+        };
+        block = block.title_bottom(Line::from(hint_spans(hint, &c)).right_aligned());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -248,15 +286,35 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     let rows = usize::from(inner.height);
-    let max = lines.len().saturating_sub(rows);
+    let (max, scroll) = {
+        let thread = app.reader_thread();
+        let max = (lines.len() + thread.as_ref().map_or(0, |(members, _)| members.len()))
+            .saturating_sub(rows);
+        let scroll = reader.scroll.min(max);
+        // Lines wider than the pane are cut, not wrapped.
+        let shown: Vec<_> = if let Some((members, active)) = thread {
+            let now = crate::app::now();
+            let headers = members
+                .enumerate()
+                .map(|(i, item)| thread_header(item, i == active, width, now, &c));
+            headers
+                .clone()
+                .take(active + 1)
+                .chain(lines)
+                .chain(headers.skip(active + 1))
+                .skip(scroll)
+                .take(rows)
+                .collect()
+        } else {
+            lines.into_iter().skip(scroll).take(rows).collect()
+        };
+        frame.render_widget(Paragraph::new(shown), text_area);
+        (max, scroll)
+    };
     if let Some(reader) = app.reader.as_mut() {
-        reader.scroll = reader.scroll.min(max);
-        let scroll = reader.scroll;
-        // Lines wider than the pane (a long word, a table) are cut, not
-        // wrapped: the layout was made for this width.
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), text_area);
-        scrollbar(frame, area, max, scroll, &c);
+        reader.scroll = scroll;
     }
+    scrollbar(frame, area, max, scroll, &c);
 }
 
 #[cfg(test)]

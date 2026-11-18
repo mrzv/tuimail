@@ -119,8 +119,10 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `t` | Tag: put a tag on or take it off, or type a new one |
 | `z` / `Z` | Undo the last change (a star, read, tag or move) / list the changes, to undo any |
 | `Space` / `*` | Mark a message / all of them; the keys above act on the marked |
+| `v` | Collapse / expand the selected conversation in the message list |
 | `/` | Search; `Esc` ends it |
-| `J` / `K` | Reading: the next / previous message |
+| `J` / `K` | Reading: next / previous list row |
+| `[` / `]` | Reading a conversation: open the newer / older message |
 | `Space` / `b` | Reading: a page down / up |
 | `o` / `A` | Reading: links (`Enter` open, `y` copy) / attachments (`Enter` open, `v` all with viewer, `s` save) |
 | `H` | Reading: HTML or plain text |
@@ -129,6 +131,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `+` / `x` / `P` | Add an account / remove it (on its row) / type its password, or sign in |
 | `?` / `O` | Every key / the settings and themes |
 | `q` | Quit |
+
+Open a collapsed conversation to see its messages newest first, with only the newest body expanded. List actions target the newest message, not the whole conversation; actions in the reader target the message you've opened.
 
 Writing:
 
