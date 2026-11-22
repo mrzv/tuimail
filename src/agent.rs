@@ -344,6 +344,7 @@ mod other {
 
 #[cfg(unix)]
 mod unix {
+    use std::borrow::Cow;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -405,6 +406,61 @@ mod unix {
             .then(|| (meta.dev(), meta.ino()))
     }
 
+    /// A kernel address for a socket that stays in the private data folder.
+    /// On macOS a long path uses a short, private alias to the parent just
+    /// for bind/connect. The socket file itself is never a symlink.
+    struct SocketAddress<'a> {
+        path: Cow<'a, Path>,
+        #[cfg(target_os = "macos")]
+        alias: Option<PathBuf>,
+    }
+
+    impl<'a> SocketAddress<'a> {
+        fn new(path: &'a Path) -> Result<Self> {
+            // Socket paths are short: 104 bytes on macOS, 108 on Linux.
+            if path.as_os_str().len() < 100 {
+                return Ok(Self {
+                    path: Cow::Borrowed(path),
+                    #[cfg(target_os = "macos")]
+                    alias: None,
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            bail!("the data folder's path is too long for agents to reach tuimail through it");
+            #[cfg(target_os = "macos")]
+            {
+                let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                    bail!("invalid agent socket path");
+                };
+                // The config gives us an absolute, private parent. Use
+                // macOS's short, root-owned sticky temp directory, not
+                // TMPDIR, which need not be short.
+                let dir = crate::tools::private_temp_dir_in(Path::new("/private/tmp"))?;
+                let alias = dir.join("d");
+                if let Err(error) = std::os::unix::fs::symlink(parent, &alias) {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(error).context("cannot shorten the agent socket path");
+                }
+                Ok(Self {
+                    path: Cow::Owned(alias.join(name)),
+                    alias: Some(alias),
+                })
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for SocketAddress<'_> {
+        fn drop(&mut self) {
+            if let Some(alias) = &self.alias {
+                let _ = std::fs::remove_file(alias);
+                if let Some(dir) = alias.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
+        }
+    }
+
     /// Whether a tuimail answers at `path`, asked for at most a moment: a
     /// listener that never accepts must not hold up the screen.
     fn answers(path: &Path) -> bool {
@@ -421,20 +477,18 @@ mod unix {
     /// Listens at `path`; each request reaches the app as
     /// [`AppEvent::Agent`].
     pub fn listen(path: &Path, tx: UnboundedSender<AppEvent>) -> Result<Listener> {
+        let address = SocketAddress::new(path)?;
         // A socket left by a tuimail that's gone is removed; one another
         // tuimail answers on is left to it. Anything else there (a link, a
         // socket not this user's) is never asked: it goes.
         if std::fs::symlink_metadata(path).is_ok() {
-            if identity(path).is_some() && answers(path) {
+            if identity(path).is_some() && answers(&address.path) {
                 bail!("another tuimail is answering agents");
             }
             std::fs::remove_file(path).context("cannot remove the old agent socket")?;
         }
-        // Socket paths are short: 104 bytes on macOS, 108 on Linux.
-        if path.as_os_str().len() >= 100 {
-            bail!("the data folder's path is too long for agents to reach tuimail through it");
-        }
-        let listener = UnixListener::bind(path).context("cannot listen for agents")?;
+        let listener =
+            UnixListener::bind(address.path.as_ref()).context("cannot listen for agents")?;
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -520,16 +574,18 @@ mod unix {
     }
 
     /// Asks the tuimail listening at `path` (`tuimail mcp`'s side): only a
-    /// socket of this user's, not through a link, and only a listener of
-    /// this user's, since what it answers goes to the agent as the user's
-    /// mail.
+    /// socket of this user's, not a link, and only a listener of this user's,
+    /// since what it answers goes to the agent as the user's mail.
     pub async fn ask(path: &Path, request: &Request) -> Answer {
         if identity(path).is_none() {
             return Err(NOT_LISTENING.to_string());
         }
-        let mut stream = UnixStream::connect(path)
-            .await
-            .map_err(|_| NOT_LISTENING.to_string())?;
+        let mut stream = {
+            let address = SocketAddress::new(path).map_err(|_| NOT_LISTENING.to_string())?;
+            UnixStream::connect(address.path.as_ref())
+                .await
+                .map_err(|_| NOT_LISTENING.to_string())?
+        };
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
         if !stream.peer_cred().is_ok_and(|c| c.uid() == me) {

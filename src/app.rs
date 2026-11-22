@@ -10359,11 +10359,21 @@ pub mod tests {
         let mut app = app();
         with_mail(&mut app);
         let dir = crate::tools::private_temp_dir().unwrap();
-        let socket = agent::socket(&dir, false);
+        #[cfg(target_os = "macos")]
+        let data = {
+            let data = dir.join("x".repeat(100));
+            std::fs::create_dir(&data).unwrap();
+            data
+        };
+        #[cfg(not(target_os = "macos"))]
+        let data = &dir;
+        let socket = agent::socket(data.as_path(), false);
         app.agent_socket = Some(socket.clone());
         app.settings.agents = true;
         app.listen_for_agents();
         assert!(app.agents.is_some());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(agent::listen(&socket, tx).is_err(), "keep the live socket");
         let request = agent::Request {
             client: "Claude Code".into(),
             call: Call::ListAccounts(agent::NoArgs {}),

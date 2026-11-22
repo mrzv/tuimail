@@ -401,18 +401,18 @@ The paths on this computer appear in `tuimail --help` and `tuimail --check`:
 
 | OS | Config (`accounts.toml`, `settings.toml`) | Data (`tuimail.db`, attachments, sockets) |
 | --- | --- | --- |
-| macOS | `~/.config/tuimail` | `~/Library/Application Support/tuimail` |
+| macOS | `~/.config/tuimail` | `~/.config/tuimail` |
 | Linux | `~/.config/tuimail` | `~/.local/share/tuimail` |
 | Windows | `%LOCALAPPDATA%\tuimail` | `%LOCALAPPDATA%\tuimail` |
 
-On Unix, tuimail reads the TOML files only from the configured location. If yours are still in the data folder, quit tuimail and move `accounts.toml` and `settings.toml` to the config folder yourself. Leave the mail and contacts cache where it is, or set `TM_DATA_DIR` if you want to keep everything together in one directory. Passwords stay in the keychain.
+On macOS, if your files are still in `~/Library/Application Support/tuimail`, quit tuimail and move the whole directory to `~/.config/tuimail` yourself. On Linux, if `accounts.toml` and `settings.toml` are still in the data folder, move only those two files to the config folder. Tuimail doesn't move files or fall back to the old paths. Passwords stay in the keychain.
 
 `tuimail.db` holds the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, the addresses used for completing To, Cc and Bcc, and any synchronized Google contacts. Attachments you open go to the data folder's `opened/` directory.
 
 | Variable | Use |
 | --- | --- |
 | `TM_DATA_DIR` | Keep config and data together in this folder instead (a full path) |
-| `XDG_CONFIG_HOME` | On Unix, use this absolute path instead of `~/.config` as the config base |
+| `XDG_CONFIG_HOME` | Use this absolute path instead of `~/.config` as the config base on Unix and the data base on macOS |
 | `TM_ICONS` | Which icons: `auto`, `nerd` or `plain` |
 
 ## Development

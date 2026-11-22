@@ -424,7 +424,12 @@ fn yours_alone(dir: &Path) -> Result<()> {
 /// named so no one can make it first: where the demo, which has no data
 /// folder, gives the editor its file.
 pub fn private_temp_dir() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("tuimail-{}", random_name()?));
+    private_temp_dir_in(&std::env::temp_dir())
+}
+
+/// Creates a new private temporary folder in the given system temp directory.
+pub(crate) fn private_temp_dir_in(base: &Path) -> Result<PathBuf> {
+    let dir = base.join(format!("tuimail-{}", random_name()?));
     #[cfg(unix)]
     let builder = {
         let mut builder = std::fs::DirBuilder::new();

@@ -325,7 +325,7 @@ or printed by a command of yours: see the README).
 
 Environment:
   TM_DATA_DIR     keep both in this folder instead (a full path)
-  XDG_CONFIG_HOME use this base for config on Unix (default ~/.config)
+  XDG_CONFIG_HOME use this base for Unix config and macOS data (default ~/.config)
   TM_ICONS      which icons: auto, nerd (Nerd Font) or plain
                 (also `icons` in settings.toml)
 ",

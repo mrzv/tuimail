@@ -17,8 +17,8 @@ impl Config {
     pub fn paths() -> Result<Self> {
         let overridden = var("TM_DATA_DIR");
         let data_dir = data_dir_from(overridden.as_deref())?;
-        let config_dir = if cfg!(unix) && overridden.is_none() {
-            unix_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir)?
+        let config_dir = if cfg!(all(unix, not(target_os = "macos"))) && overridden.is_none() {
+            unix_config_dir()?
         } else {
             data_dir.clone()
         };
@@ -189,9 +189,8 @@ pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// `TM_DATA_DIR`, else the platform's place for app data: `~/Library/Application
-/// Support/tuimail` on macOS, `~/.local/share/tuimail` on Linux, `%LOCALAPPDATA%\tuimail`
-/// on Windows. The same wherever the command is run from.
+/// `TM_DATA_DIR`, else the platform default: `~/.config/tuimail` on macOS,
+/// `~/.local/share/tuimail` on Linux, `%LOCALAPPDATA%\tuimail` on Windows.
 pub fn open_data_dir() -> Result<PathBuf> {
     make_data_dir(&data_dir_from(var("TM_DATA_DIR").as_deref())?)
 }
@@ -229,19 +228,19 @@ fn data_dir_from(set: Option<&str>) -> Result<PathBuf> {
         }
         return Ok(dir);
     }
+    if cfg!(target_os = "macos") {
+        return unix_config_dir();
+    }
     let base = dirs::data_local_dir().context("no home directory found; set TM_DATA_DIR")?;
     Ok(base.join("tuimail"))
 }
 
-fn unix_config_dir(
-    xdg: Option<std::ffi::OsString>,
-    home: impl FnOnce() -> Option<PathBuf>,
-) -> Result<PathBuf> {
-    let base = xdg
+fn unix_config_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
-            home()
+            dirs::home_dir()
                 .filter(|path| path.is_absolute())
                 .map(|path| path.join(".config"))
         })
