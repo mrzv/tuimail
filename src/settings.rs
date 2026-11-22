@@ -1,4 +1,4 @@
-//! User settings, kept in `settings.toml` in the data directory. Accounts
+//! User settings, kept in `settings.toml` in the config directory. Accounts
 //! are in `accounts.toml` beside it (`account.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -194,6 +194,7 @@ impl Settings {
         key: &str,
         change: impl FnOnce(Option<toml::Value>) -> Result<toml::Value>,
     ) -> Result<Self> {
+        let _guard = config::lock_config_write(path)?;
         let shown = config::shown(path);
         let mut table: toml::Table = match config::read_small(path) {
             Ok(text) => toml::from_str(&text)

@@ -1005,7 +1005,7 @@ impl App {
         settings: Settings,
         accounts: Vec<Account>,
         keychain: bool,
-        data_dir: Option<PathBuf>,
+        config: Option<crate::config::Config>,
         tx: UnboundedSender<AppEvent>,
         demo: bool,
     ) -> Self {
@@ -1015,7 +1015,7 @@ impl App {
             accounts,
             HashMap::new(),
             keychain,
-            data_dir,
+            config,
             tx,
             demo,
         )
@@ -1028,11 +1028,11 @@ impl App {
         accounts: Vec<Account>,
         passwords: HashMap<String, Secret>,
         keychain: bool,
-        data_dir: Option<PathBuf>,
+        config: Option<crate::config::Config>,
         tx: UnboundedSender<AppEvent>,
     ) -> Self {
         Self::build(
-            store, settings, accounts, passwords, keychain, data_dir, tx, false,
+            store, settings, accounts, passwords, keychain, config, tx, false,
         )
     }
 
@@ -1043,7 +1043,7 @@ impl App {
         accounts: Vec<Account>,
         mut passwords: HashMap<String, Secret>,
         keychain: bool,
-        data_dir: Option<PathBuf>,
+        config: Option<crate::config::Config>,
         tx: UnboundedSender<AppEvent>,
         demo: bool,
     ) -> Self {
@@ -1054,9 +1054,11 @@ impl App {
             .resolve(|name| std::env::var(name).ok());
         let mut app = Self {
             store,
-            settings_path: data_dir.as_deref().map(crate::settings::path),
-            accounts_path: data_dir.as_deref().map(account::path),
-            data_dir,
+            settings_path: config
+                .as_ref()
+                .map(|c| crate::settings::path(&c.config_dir)),
+            accounts_path: config.as_ref().map(|c| account::path(&c.config_dir)),
+            data_dir: config.map(|c| c.data_dir),
             settings,
             colors,
             icons,

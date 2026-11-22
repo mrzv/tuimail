@@ -237,7 +237,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         return crate::print(HELP);
     }
     let config = config::Config::load()?;
-    let path = account::path(&config.data_dir);
+    let path = account::path(&config.config_dir);
     let (accounts, warnings) = account::load(&path)?;
     for warning in warnings {
         eprintln!("{}", text::clean(&warning));

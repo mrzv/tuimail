@@ -6,30 +6,262 @@ use anyhow::{Context, Result, bail};
 
 use crate::text;
 
-/// Settings read from the environment, or, in development builds, from
-/// `.env` in the source folder ([`load_dotenv`]).
+/// The local folders for configuration and cached mail.
 pub struct Config {
-    /// Where your accounts, the mail cache (`tuimail.db`) and
-    /// `settings.toml` are kept.
+    pub config_dir: PathBuf,
     pub data_dir: PathBuf,
 }
 
+/// Keep source lookups and shared destination staging stable until startup
+/// has finished reading or moving the configuration.
+#[derive(Default)]
+pub struct MigrationLocks {
+    _first: Option<std::fs::File>,
+    _second: Option<std::fs::File>,
+}
+
+#[cfg(unix)]
+const CONFIG_FILES: [&str; 2] = ["accounts.toml", "settings.toml"];
+
 impl Config {
+    /// Resolve paths without creating folders or migrating files.
+    pub fn paths() -> Result<Self> {
+        let overridden = var("TM_DATA_DIR");
+        let data_dir = data_dir_from(overridden.as_deref())?;
+        let config_dir = if cfg!(unix) && overridden.is_none() {
+            unix_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir)?
+        } else {
+            data_dir.clone()
+        };
+        Ok(Self {
+            config_dir,
+            data_dir,
+        })
+    }
+
     pub fn load() -> Result<Self> {
-        let data_dir = make_private_dir(&data_dir()?)?;
-        Ok(Self { data_dir })
+        let (config, _locks) = Self::inspect()?;
+        #[cfg(unix)]
+        if config.config_dir != config.data_dir {
+            config.migrate_config()?;
+        }
+        Ok(config)
+    }
+
+    /// Check the folders without moving configuration. Hold the returned
+    /// locks while reading legacy files.
+    pub fn inspect() -> Result<(Self, MigrationLocks)> {
+        Self::paths()?.prepare()
+    }
+
+    fn prepare(mut self) -> Result<(Self, MigrationLocks)> {
+        let together = self.config_dir == self.data_dir;
+        self.data_dir = make_private_dir(&self.data_dir)?;
+        if together {
+            self.config_dir = self.data_dir.clone();
+            return Ok((self, MigrationLocks::default()));
+        }
+        #[cfg(unix)]
+        {
+            self.config_dir = protect_dir(&self.config_dir)?;
+            use std::os::unix::fs::MetadataExt;
+
+            let identity = |dir: &Path| -> std::io::Result<_> {
+                let meta = std::fs::metadata(dir)?;
+                Ok((meta.dev(), meta.ino()))
+            };
+            // Order by filesystem identity, not path: bind mounts can give
+            // the same directory different canonical names.
+            let (first, second) = match identity(&self.data_dir)?.cmp(&identity(&self.config_dir)?)
+            {
+                std::cmp::Ordering::Less => (&self.data_dir, &self.config_dir),
+                std::cmp::Ordering::Greater => (&self.config_dir, &self.data_dir),
+                std::cmp::Ordering::Equal => {
+                    self.config_dir = self.data_dir.clone();
+                    return Ok((self, MigrationLocks::default()));
+                }
+            };
+            let first = lock_config_dir(first)?;
+            let second = lock_config_dir(second)?;
+            self.clear_migration_staging()?;
+            check_private_entries(&self.config_dir)?;
+            Ok((
+                self,
+                MigrationLocks {
+                    _first: Some(first),
+                    _second: Some(second),
+                },
+            ))
+        }
+        #[cfg(not(unix))]
+        unreachable!("config and data share a path on this platform")
+    }
+
+    /// `--check` reads the file that startup would use without moving it.
+    pub fn inspect_file(&self, name: &str) -> Result<PathBuf> {
+        let path = self.config_dir.join(name);
+        if self.config_dir != self.data_dir && !exists(&path)? {
+            let legacy = self.data_dir.join(name);
+            if exists(&legacy)? {
+                return Ok(legacy);
+            }
+        }
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn staging(&self, name: &str) -> PathBuf {
+        self.config_dir.join(format!(".tuimail-migrate-{name}"))
+    }
+
+    #[cfg(unix)]
+    fn clear_migration_staging(&self) -> Result<()> {
+        use std::fs;
+        use std::io::ErrorKind::NotFound;
+        use std::os::unix::fs::MetadataExt;
+
+        for name in CONFIG_FILES {
+            let stage = self.staging(name);
+            let meta = match fs::symlink_metadata(&stage) {
+                Err(e) if e.kind() == NotFound => continue,
+                result => result?,
+            };
+            // A crash can leave both names of our staged file on filesystems
+            // where no-replace publication uses link/unlink.
+            let is_published = meta.nlink() == 2
+                && fs::symlink_metadata(self.config_dir.join(name))
+                    .is_ok_and(|to| to.dev() == meta.dev() && to.ino() == meta.ino());
+            if !meta.is_file() || meta.uid() != euid() || !(meta.nlink() == 1 || is_published) {
+                bail!(
+                    "{} isn't a tuimail migration file: move it away",
+                    shown(&stage)
+                );
+            }
+            fs::remove_file(stage)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn migrate_config(&self) -> Result<()> {
+        use std::fs::{self, File};
+        use std::io::ErrorKind::{AlreadyExists, NotFound};
+        use std::io::Write;
+
+        if self.config_dir == self.data_dir {
+            return Ok(());
+        }
+
+        for name in CONFIG_FILES {
+            let from = self.data_dir.join(name);
+            let to = self.config_dir.join(name);
+            if exists(&to)? {
+                continue;
+            }
+            let migrate = || -> std::io::Result<()> {
+                let bytes = match read_capped(&from, SMALL_FILE_LIMIT) {
+                    Err(e) if e.kind() == NotFound => return Ok(()),
+                    result => result?,
+                };
+                let mut file = tempfile::Builder::new()
+                    .prefix(&format!(".tuimail-migrate-{name}"))
+                    .rand_bytes(0)
+                    .tempfile_in(&self.config_dir)?;
+                file.write_all(&bytes)?;
+                file.as_file().sync_all()?;
+                match file.persist_noclobber(&to) {
+                    Ok(_) => {}
+                    Err(e) if e.error.kind() == AlreadyExists => return Ok(()),
+                    Err(e) => return Err(e.error),
+                }
+                // tempfile can report success even if its hard-link fallback
+                // leaves the staging name behind. Keep the legacy copy until
+                // that name is gone, so recovery can still run.
+                match fs::remove_file(self.staging(name)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                // Persist the destination and its path before deleting the
+                // source. If directory sync is unsupported or forbidden,
+                // use the new file but keep the legacy copy.
+                for dir in self.config_dir.ancestors() {
+                    match File::open(dir).and_then(|dir| dir.sync_all()) {
+                        Ok(()) => {}
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::PermissionDenied
+                                    | std::io::ErrorKind::Unsupported
+                            ) || e.raw_os_error() == Some(libc::EINVAL) =>
+                        {
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                fs::remove_file(&from)
+            };
+            migrate().with_context(|| format!("cannot move {} to {}", shown(&from), shown(&to)))?;
+        }
+        Ok(())
+    }
+}
+
+/// Serialize config read-modify-write operations with startup migration,
+/// including when an explicit TM_DATA_DIR points at the legacy folder.
+pub fn lock_config_write(path: &Path) -> Result<Option<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        Ok(Some(lock_config_dir(
+            dir.unwrap_or_else(|| Path::new(".")),
+        )?))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn lock_config_dir(dir: &Path) -> Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let path = dir.join(".tuimail-config.lock");
+
+    // Keep the inode in place for other callers. NFS needs a writable file
+    // descriptor for the exclusive lock.
+    let guard = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", shown(&path)))?;
+    let meta = guard.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() || meta.nlink() != 1 {
+        bail!("{} isn't a plain file of yours", shown(&path));
+    }
+    guard
+        .lock()
+        .with_context(|| format!("cannot lock {}", shown(&path)))?;
+    Ok(guard)
+}
+
+fn exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("cannot inspect {}", shown(path))),
     }
 }
 
 pub const SMALL_FILE_LIMIT: u64 = 1 << 20;
 
-/// Makes the data folder, or checks the one that's there, so only you can
-/// reach it, and gives its path with links resolved. In this order, so
-/// nothing is created or changed somewhere unsafe: the folders above it may
-/// be changed only by you or the system ([`private_place`]); it's then
-/// made, mode 0700, or found to be a real folder (not a link) that's yours;
-/// then set to 0700 again, and on macOS cleared of access rules inherited
-/// from above, which would let others in whatever the mode says.
 /// Reads a file tuimail keeps, refusing anything that isn't a plain file of
 /// a sane size, so a link to `/dev/zero` or a pipe can't hang the start.
 pub fn read_small(path: &Path) -> std::io::Result<String> {
@@ -59,8 +291,22 @@ pub fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Makes the data folder, or checks the one that's there, so only you can
+/// reach it, and gives its path with links resolved. In this order, so
+/// nothing is created or changed somewhere unsafe: the folders above it may
+/// be changed only by you or the system ([`private_place`]); it's then
+/// made, mode 0700, or found to be a real folder (not a link) that's yours;
+/// then set to 0700 again, and on macOS cleared of access rules inherited
+/// from above, which would let others in whatever the mode says.
 #[cfg(unix)]
 fn make_private_dir(dir: &Path) -> Result<PathBuf> {
+    let dir = protect_dir(dir)?;
+    check_private_entries(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn protect_dir(dir: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let shown = shown(dir);
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -84,6 +330,13 @@ fn make_private_dir(dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot protect {shown}"))?;
     #[cfg(target_os = "macos")]
     clear_acls(&dir);
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn check_private_entries(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let shown = shown(dir);
     // What's in it must be yours alone too: a link or file another account
     // left while it could still write here would stay in use (a link at
     // accounts.toml choosing the program that gives your password).
@@ -115,7 +368,7 @@ fn make_private_dir(dir: &Path) -> Result<PathBuf> {
             );
         }
     }
-    Ok(dir)
+    Ok(())
 }
 
 /// What an entry of the data folder must be.
@@ -168,11 +421,11 @@ pub fn euid() -> u32 {
 /// `TM_DATA_DIR`, else the platform's place for app data: `~/Library/Application
 /// Support/tuimail` on macOS, `~/.local/share/tuimail` on Linux, `%LOCALAPPDATA%\tuimail`
 /// on Windows. The same wherever the command is run from.
-pub fn data_dir() -> Result<PathBuf> {
-    data_dir_from(var("TM_DATA_DIR"))
+pub fn open_data_dir() -> Result<PathBuf> {
+    make_private_dir(&data_dir_from(var("TM_DATA_DIR").as_deref())?)
 }
 
-fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
+fn data_dir_from(set: Option<&str>) -> Result<PathBuf> {
     if let Some(dir) = set {
         let dir = PathBuf::from(dir);
         // On Windows even creating a folder on another machine hands that
@@ -188,6 +441,22 @@ fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
         return Ok(dir);
     }
     let base = dirs::data_local_dir().context("no home directory found; set TM_DATA_DIR")?;
+    Ok(base.join("tuimail"))
+}
+
+fn unix_config_dir(
+    xdg: Option<std::ffi::OsString>,
+    home: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf> {
+    let base = xdg
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home()
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(".config"))
+        })
+        .context("no home directory found; set XDG_CONFIG_HOME or TM_DATA_DIR")?;
     Ok(base.join("tuimail"))
 }
 
@@ -289,6 +558,88 @@ pub fn var(name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_recovers_interrupted_publication_without_replacing_config() {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let other_data = root.path().join("other-data");
+        let config_root = root.path().join("config");
+        let config_dir = config_root.join("tuimail");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&other_data).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let other_legacy = other_data.join("accounts.toml");
+        fs::write(&other_legacy, "# legacy\n").unwrap();
+        fs::write(data.join("settings.toml"), "threads = false\n").unwrap();
+        let config = Config {
+            config_dir,
+            data_dir: data,
+        };
+        let stage = config.staging("accounts.toml");
+        let accounts = config.config_dir.join("accounts.toml");
+        fs::write(&stage, "# already published\n").unwrap();
+        fs::hard_link(&stage, &accounts).unwrap();
+
+        let (config, guard) = config.prepare().unwrap();
+        assert_eq!(fs::metadata(&accounts).unwrap().nlink(), 1);
+        assert_eq!(
+            config.inspect_file("settings.toml").unwrap(),
+            config.data_dir.join("settings.toml")
+        );
+        config.migrate_config().unwrap();
+        drop(guard);
+        assert_eq!(
+            fs::read_to_string(&accounts).unwrap(),
+            "# already published\n"
+        );
+        assert_eq!(fs::read_to_string(other_legacy).unwrap(), "# legacy\n");
+        assert!(!config.data_dir.join("settings.toml").exists());
+        assert_eq!(
+            fs::read_to_string(config.config_dir.join("settings.toml")).unwrap(),
+            "threads = false\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_keeps_legacy_when_an_xdg_parent_cannot_be_synced() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        if euid() == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let parent = root.path().join("config");
+        fs::create_dir(&data_dir).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let legacy = data_dir.join("settings.toml");
+        let text = "threads = false\n";
+        fs::write(&legacy, text).unwrap();
+        let config_dir = parent.join("tuimail");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+        let result = Config {
+            data_dir,
+            config_dir,
+        }
+        .prepare()
+        .and_then(|(config, _guard)| {
+            config.migrate_config()?;
+            Ok(config)
+        });
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = result.unwrap();
+        assert_eq!(fs::read_to_string(legacy).unwrap(), text);
+        let dest = config.inspect_file("settings.toml").unwrap();
+        assert_eq!(dest, config.config_dir.join("settings.toml"));
+        assert_eq!(fs::read_to_string(dest).unwrap(), text);
+    }
+
     #[test]
     fn small_files_are_read_whole_and_nothing_else() {
         let dir = std::env::temp_dir().join(format!("tuimail-capped-{}", std::process::id()));
@@ -312,13 +663,10 @@ mod tests {
     #[test]
     fn a_data_folder_on_another_machine_is_refused() {
         for dir in ["//evil.example/s/tt", "\\\\evil.example\\s\\tt"] {
-            assert!(data_dir_from(Some(dir.into())).is_err(), "{dir}");
+            assert!(data_dir_from(Some(dir)).is_err(), "{dir}");
         }
-        assert!(
-            data_dir_from(Some("./.tuimail".into())).is_err(),
-            "relative"
-        );
-        assert!(data_dir_from(Some(".tuimail".into())).is_err(), "relative");
+        assert!(data_dir_from(Some("./.tuimail")).is_err(), "relative");
+        assert!(data_dir_from(Some(".tuimail")).is_err(), "relative");
     }
 
     #[test]

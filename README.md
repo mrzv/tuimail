@@ -38,7 +38,7 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 - **Works offline.** Headers and the messages you've opened are kept in a local cache, so the list and what you've read are there without a connection.
 - **Set up in a minute.** Type your address and password: the servers fill in for Gmail, iCloud, Outlook, Yahoo, Fastmail, Proton (through its Bridge), Zoho, GMX, WEB.DE, Yandex, Mail.ru, Posteo, mailbox.org and more, or are guessed for others. tuimail logs in to check before saving.
 - **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (picked in the settings, `O`), and Nerd Font icons where your terminal has them.
-- **Private by design.** No account with anyone but your mail provider, no telemetry, no servers in between. Your mail, accounts and settings stay in one folder on your computer, readable only by you.
+- **Private by design.** No account with anyone but your mail provider, no telemetry, no servers in between. Your mail, accounts and settings stay on your computer, readable only by you.
 
 ## Get started
 
@@ -100,7 +100,9 @@ To look around first, `tuimail --demo` shows made-up accounts and mail, connecti
 tuimail --check
 ```
 
-It says where your data folder is, whether a keychain is there for passwords, and each account it found: its servers, security and where its password comes from. An account it can't use, or a line in `accounts.toml` it doesn't understand, shows up as a warning.
+It says where your config and data folders are, whether a keychain is there for passwords, and each account it found: its servers, security and where its password comes from. An account it can't use, or a line in `accounts.toml` it doesn't understand, shows up as a warning.
+
+If an upgrade hasn't moved the TOML files yet, `--check` reads them from the old location without moving them.
 
 ## Keys
 
@@ -158,7 +160,7 @@ Writing:
 
 ## Accounts
 
-Accounts are kept in `accounts.toml` in [your data folder](#your-data). The setup screen (`+`) writes it; you can also edit it while tuimail isn't running:
+Accounts are kept in `accounts.toml` in [your config folder](#your-data). The setup screen (`+`) writes it; you can also edit it while tuimail isn't running:
 
 ```toml
 [[account]]
@@ -281,7 +283,7 @@ certificate = "/Users/you/Documents/bridge/cert.pem"
 
 Under **Sidebar**, choose **Choose which folders to show**. Use `j` / `k` to move and `Enter` or `Space` to show or hide a folder. Changes are saved immediately, separately for each account. Use the same list to bring hidden folders back. Hiding a folder only removes its sidebar row: its subfolders are controlled separately, and mail still syncs and can be moved there.
 
-Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
+Everything else is in `settings.toml` in [your config folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
 
 ```toml
 theme = "mocha"          # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
@@ -391,25 +393,28 @@ What an agent reads goes to its AI provider, as anything else you show it. AI ag
 - **Text from senders can't take over your terminal.** Control characters, escape sequences and direction-changing characters are taken out of everything shown, copied or notified.
 - **Attachments are handled with care.** File names are cleaned (no folders, no hidden extensions), files never overwrite one another, they're marked as downloaded from the internet, and only pictures, sound, video, PDF and plain text open without asking (Office files, archives, CSV and the rest ask first). Web links open only through your browser, and only `http` and `https`; the link list shows where each one really goes, with look-alike letters spelled out (`xn--`). `mailto` links and `U`'s addresses open here, as a message to write; `U`'s web page is shown before it opens.
 - **Pastes stay text.** A paste that arrives as keystrokes (as it always does on Windows) is never taken for commands, and a question that waits for `y` ignores one typed too soon.
-- **Local data is yours alone.** The data folder is made readable only by you; the cache (`tuimail.db`) overwrites what's deleted.
+- **Local data is yours alone.** The config and data folders are made readable only by you; the cache (`tuimail.db`) overwrites what's deleted.
 
 To report a problem, see [SECURITY.md](SECURITY.md).
 
 ## Your data
 
-Everything is in one folder on your machine (`tuimail --help` prints its path):
+The paths on this computer appear in `tuimail --help` and `tuimail --check`:
 
-| OS | Location |
-| --- | --- |
-| macOS | `~/Library/Application Support/tuimail` |
-| Linux | `~/.local/share/tuimail` |
-| Windows | `%LOCALAPPDATA%\tuimail` |
+| OS | Config (`accounts.toml`, `settings.toml`) | Data (`tuimail.db`, attachments, sockets) |
+| --- | --- | --- |
+| macOS | `~/.config/tuimail` | `~/Library/Application Support/tuimail` |
+| Linux | `~/.config/tuimail` | `~/.local/share/tuimail` |
+| Windows | `%LOCALAPPDATA%\tuimail` | `%LOCALAPPDATA%\tuimail` |
 
-It holds `accounts.toml`, `settings.toml`, and `tuimail.db`: the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, the addresses used for completing To, Cc and Bcc, and any synchronized Google contacts. Attachments you open go to its `opened/` folder. Passwords aren't in it: they're in your system's keychain. Deleting the folder starts tuimail afresh; remove the accounts with `x` first to take their passwords out of the keychain too.
+On Unix, the first start after upgrading moves each TOML file from the old data folder if the corresponding file in the config folder doesn't already exist. If the filesystem doesn't let tuimail sync the new folder to disk, tuimail uses the new copy but keeps the old one. Quit any older tuimail processes before upgrading. The mail and contacts cache stays put, and passwords stay in the keychain.
+
+`tuimail.db` holds the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, the addresses used for completing To, Cc and Bcc, and any synchronized Google contacts. Attachments you open go to the data folder's `opened/` directory.
 
 | Variable | Use |
 | --- | --- |
-| `TM_DATA_DIR` | Keep the data folder somewhere else (a full path) |
+| `TM_DATA_DIR` | Keep config and data together in this folder instead (a full path) |
+| `XDG_CONFIG_HOME` | On Unix, use this absolute path instead of `~/.config` as the config base |
 | `TM_ICONS` | Which icons: `auto`, `nerd` or `plain` |
 
 ## Development

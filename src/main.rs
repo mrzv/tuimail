@@ -80,7 +80,7 @@ async fn run() -> Result<()> {
                     text::clean(other)
                 ),
             };
-            return mcp::run(config::Config::load()?.data_dir, demo).await;
+            return mcp::run(config::open_data_dir()?, demo).await;
         }
         Some("-h" | "--help") => return print(&help()?),
         Some("-V" | "--version") => {
@@ -94,12 +94,33 @@ async fn run() -> Result<()> {
 
     // Everything that can fail does so before the terminal is taken over,
     // so errors print as normal text.
-    let config = config::Config::load()?;
-    let settings_path = settings::path(&config.data_dir);
+    let (config, _migration_lock) = if check {
+        config::Config::inspect()?
+    } else {
+        (config::Config::load()?, config::MigrationLocks::default())
+    };
+    let settings_path = if check {
+        config.inspect_file("settings.toml")?
+    } else {
+        settings::path(&config.config_dir)
+    };
+    let accounts_path = if check {
+        config.inspect_file("accounts.toml")?
+    } else {
+        account::path(&config.config_dir)
+    };
     let (settings, unknown_settings) = settings::Settings::load_checked(&settings_path)?;
-    let (accounts, warnings) = account::load(&account::path(&config.data_dir))?;
+    let (accounts, mut warnings) = account::load(&accounts_path)?;
     let keychain = secrets::init_keychain();
     if check {
+        for path in [&accounts_path, &settings_path] {
+            if path.parent() == Some(&config.data_dir) && config.config_dir != config.data_dir {
+                warnings.push(format!(
+                    "{} has not been moved to the config folder yet",
+                    config::shown(path)
+                ));
+            }
+        }
         return print_check(&config, &accounts, &warnings, keychain);
     }
     let store = store::Store::open(&config.data_dir.join("tuimail.db"))?;
@@ -124,16 +145,17 @@ async fn run() -> Result<()> {
     need_terminal()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut terminal = init_terminal()?;
+    let agent_socket = agent::socket(&config.data_dir, false);
     let mut app = app::App::with_passwords(
         store,
         settings,
         accounts,
         passwords,
         keychain,
-        Some(config.data_dir.clone()),
+        Some(config),
         tx,
     );
-    app.agent_socket = Some(agent::socket(&config.data_dir, false));
+    app.agent_socket = Some(agent_socket);
     let mut notes = warnings;
     if !unknown_settings.is_empty() {
         notes.push(format!(
@@ -218,8 +240,9 @@ fn print_check(
     keychain: bool,
 ) -> Result<()> {
     let mut out = format!(
-        "tuimail {}\ndata folder  {}\nkeychain     {}\n",
+        "tuimail {}\nconfig folder  {}\ndata folder    {}\nkeychain       {}\n",
         env!("CARGO_PKG_VERSION"),
+        config::shown(&config.config_dir),
         config::shown(&config.data_dir),
         if keychain {
             "the system's"
@@ -288,6 +311,7 @@ fn print(text: &str) -> Result<()> {
 }
 
 fn help() -> Result<String> {
+    let paths = config::Config::paths()?;
     Ok(format!(
         "tuimail {version}
 Email in your terminal: IMAP and POP3 to read, SMTP to send, with arrow
@@ -315,16 +339,18 @@ command connects to Google. See tuimail contacts --help for setup and
 account, search and pagination options.
 
 Passwords are kept in the system's keychain (or asked for each start,
-or printed by a command of yours: see the README). Accounts, settings
-and a cache of your mail are kept only on this computer, in:
-  {data}
+or printed by a command of yours: see the README).
+  Accounts and settings: {config}
+  Mail cache and local data: {data}
 
 Environment:
-  TM_DATA_DIR   keep them somewhere else (a full path)
+  TM_DATA_DIR     keep both in this folder instead (a full path)
+  XDG_CONFIG_HOME use this base for config on Unix (default ~/.config)
   TM_ICONS      which icons: auto, nerd (Nerd Font) or plain
                 (also `icons` in settings.toml)
 ",
         version = env!("CARGO_PKG_VERSION"),
-        data = config::shown(&config::data_dir()?),
+        config = config::shown(&paths.config_dir),
+        data = config::shown(&paths.data_dir),
     ))
 }

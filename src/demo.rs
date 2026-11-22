@@ -543,9 +543,9 @@ pub async fn run() -> Result<()> {
     let mut app = App::new(store, Settings::default(), accounts, false, None, tx, true);
     // Agents try it here, on made-up mail, once the setting is on
     // (`tuimail mcp --demo`): the data folder is only looked for then.
-    app.agent_socket = crate::config::Config::load()
+    app.agent_socket = crate::config::open_data_dir()
         .ok()
-        .map(|c| crate::agent::socket(&c.data_dir, true));
+        .map(|dir| crate::agent::socket(&dir, true));
     app.info("The demo: made-up mail, nothing is sent or fetched. ? lists the keys, q quits.");
     let result = app.run(&mut terminal, rx).await;
     let _ = crate::restore_terminal();

@@ -1,4 +1,4 @@
-//! Mail accounts, kept in `accounts.toml` in the data folder: one
+//! Mail accounts, kept in `accounts.toml` in the config folder: one
 //! `[[account]]` table each, written by the setup screen (`+`) or by hand.
 //! Passwords are never in it: they're in the system's keychain, asked for
 //! at start, or the output of a command of yours (`password`).
@@ -494,6 +494,7 @@ fn unknown_keys(text: &str) -> Vec<String> {
 
 /// Adds `account` to the file, or replaces the one with its address.
 pub fn save(path: &Path, account: &Account) -> Result<()> {
+    let _guard = config::lock_config_write(path)?;
     let shown = config::shown(path);
     let mut file: AccountsFile = match config::read_small(path) {
         Ok(text) => toml::from_str(&text)
@@ -510,6 +511,7 @@ pub fn save(path: &Path, account: &Account) -> Result<()> {
 
 /// Takes the account with address `id` out of the file.
 pub fn remove(path: &Path, id: &str) -> Result<()> {
+    let _guard = config::lock_config_write(path)?;
     let shown = config::shown(path);
     let text = config::read_small(path).with_context(|| format!("cannot read {shown}"))?;
     let mut file: AccountsFile = toml::from_str(&text)
