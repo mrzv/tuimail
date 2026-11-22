@@ -30,6 +30,8 @@ pub struct Settings {
     /// Show a message's plain-text part when it has one as well as HTML.
     /// Off: the HTML, turned into text (no pictures, nothing fetched).
     pub prefer_plain: bool,
+    /// Hide quoted passages at the end of the message in the reader.
+    pub hide_trailing_quotes: bool,
     /// Mark a message read when it's opened.
     pub mark_read: bool,
     /// Group the list's messages in conversations.
@@ -88,6 +90,7 @@ impl Default for Settings {
             notifications: Notifications::Auto,
             preview: true,
             prefer_plain: false,
+            hide_trailing_quotes: false,
             mark_read: true,
             threads: true,
             threads_collapsed: false,
@@ -241,12 +244,13 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 21] = [
+const KNOWN: [&str; 22] = [
     "theme",
     "icons",
     "notifications",
     "preview",
     "prefer_plain",
+    "hide_trailing_quotes",
     "mark_read",
     "threads",
     "threads_collapsed",

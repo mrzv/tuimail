@@ -805,18 +805,19 @@ pub struct HelpMenu {
 impl HelpMenu {
     pub const PREVIEW: usize = 0;
     pub const PREFER_PLAIN: usize = 1;
-    pub const MARK_READ: usize = 2;
-    pub const THREADS: usize = 3;
-    pub const THREADS_COLLAPSED: usize = 4;
-    pub const THREADS_INCLUDE_SENT: usize = 5;
-    pub const THREADS_COMPLETE_GMAIL: usize = 6;
-    pub const CONFIRM_DELETE: usize = 7;
-    pub const CONFIRM_SEND: usize = 8;
-    pub const NOTIFICATIONS: usize = 9;
-    pub const AGENTS: usize = 10;
-    pub const CONFIRM_AGENTS: usize = 11;
-    pub const FOLDER_VISIBILITY: usize = 12;
-    pub const THEMES: usize = 13;
+    pub const HIDE_TRAILING_QUOTES: usize = 2;
+    pub const MARK_READ: usize = 3;
+    pub const THREADS: usize = 4;
+    pub const THREADS_COLLAPSED: usize = 5;
+    pub const THREADS_INCLUDE_SENT: usize = 6;
+    pub const THREADS_COMPLETE_GMAIL: usize = 7;
+    pub const CONFIRM_DELETE: usize = 8;
+    pub const CONFIRM_SEND: usize = 9;
+    pub const NOTIFICATIONS: usize = 10;
+    pub const AGENTS: usize = 11;
+    pub const CONFIRM_AGENTS: usize = 12;
+    pub const FOLDER_VISIBILITY: usize = 13;
+    pub const THEMES: usize = 14;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -3168,6 +3169,7 @@ impl App {
     fn render(&mut self) {
         let width = self.reader_width.get().max(20);
         let prefer_plain = self.settings.prefer_plain;
+        let hide_trailing_quotes = self.settings.hide_trailing_quotes;
         self.renders += 1;
         let generation = self.renders;
         let Some(reader) = self.reader.as_mut() else {
@@ -3176,15 +3178,27 @@ impl App {
         let Some(raw) = reader.raw.clone() else {
             return;
         };
+        // A link picker indexes the body being replaced.
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.kind == PickerKind::Links)
+        {
+            self.picker = None;
+        }
         reader.pending = Some(generation);
         reader.selection = None;
         let plain = reader.plain.unwrap_or(prefer_plain);
+        let options = mail::RenderOptions {
+            prefer_plain: plain,
+            hide_trailing_quotes,
+        };
         let parsed_before = reader.parsed.clone();
         let tx = self.tx.clone();
         mail::in_background(
             move || {
                 let parsed = parsed_before.or_else(|| mail::parse(&raw).map(Arc::new))?;
-                let body = mail::render(&parsed, usize::from(width), plain);
+                let body = mail::render(&parsed, usize::from(width), options);
                 Some((parsed, body))
             },
             move |result| {
@@ -5526,7 +5540,7 @@ impl App {
 
     /// `o`: the message's links.
     fn pick_link(&mut self) {
-        let Some(body) = self.reader.as_ref().and_then(|r| r.body.as_ref()) else {
+        let Some(body) = self.reader.as_ref().and_then(Reader::selectable_body) else {
             return;
         };
         if body.links.is_empty() {
@@ -6741,6 +6755,10 @@ impl App {
                 }
                 self.render();
             }
+            HelpMenu::HIDE_TRAILING_QUOTES => self.save_setting(
+                "hide_trailing_quotes",
+                flip(self.settings.hide_trailing_quotes),
+            ),
             HelpMenu::MARK_READ => self.save_setting("mark_read", flip(self.settings.mark_read)),
             HelpMenu::THREADS_COLLAPSED => {
                 self.save_setting("threads_collapsed", flip(self.settings.threads_collapsed))
@@ -6875,6 +6893,7 @@ impl App {
         let grouping_changed = self.settings.threads != settings.threads
             || self.settings.threads_include_sent != settings.threads_include_sent
             || self.settings.threads_complete_gmail != settings.threads_complete_gmail;
+        let quotes_changed = self.settings.hide_trailing_quotes != settings.hide_trailing_quotes;
         self.settings = settings;
         if sidebar_changed {
             let rows = self.sidebar_rows();
@@ -6917,6 +6936,9 @@ impl App {
             {
                 self.moved_at = Some(Instant::now());
             }
+        }
+        if quotes_changed && self.reader.is_some() {
+            self.render();
         }
         // Another instance may have turned agents off in the settings file.
         if self.settings_path.is_some() && !self.settings.agents {
@@ -8350,6 +8372,56 @@ pub mod tests {
         assert_eq!(app.selected_item().unwrap().key(), newer);
     }
 
+    #[tokio::test]
+    async fn hide_trailing_quoted_text_is_saved_and_updates_the_open_message() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        let (account, folder, uid) = app.items[0].key();
+        let raw = b"From: sender@example.org\r\n\r\nThe new reply\r\n\r\n\
+                    > The old message https://old.example/\r\n";
+        app.store
+            .save_body(&app.accounts[account].id, &folder, uid, raw)
+            .unwrap();
+        let dir = crate::tools::private_temp_dir().unwrap();
+        let path = crate::settings::path(&dir);
+        app.settings_path = Some(path.clone());
+        open_first(&mut app).await;
+        assert!(screen(&mut app, 80, 25).contains("The old message"));
+
+        for hide in [true, false] {
+            app.on_key(key(KeyCode::Char('O')));
+            for _ in 0..HelpMenu::HIDE_TRAILING_QUOTES {
+                app.on_key(key(KeyCode::Down));
+            }
+            let menu = screen(&mut app, 80, 25);
+            let mark = if hide { "[ ]" } else { "[✓]" };
+            assert!(menu.contains(&format!("{mark} Hide trailing quoted text")));
+            app.on_key(key(KeyCode::Enter));
+            app.on_key(key(KeyCode::Esc));
+            // No interaction with links from the layout that's being replaced.
+            app.on_key(key(KeyCode::Char('o')));
+            assert!(app.picker.is_none());
+            wait_for_layout(&mut app).await;
+            let shown = screen(&mut app, 80, 25);
+            assert!(shown.contains("The new reply"));
+            assert_eq!(shown.contains("The old message"), !hide);
+            assert_eq!(shown.contains("(quoted text hidden)"), hide);
+            assert_eq!(Settings::load(&path).unwrap().hide_trailing_quotes, hide);
+            app.on_key(key(KeyCode::Char('o')));
+            if hide {
+                assert!(app.picker.is_none());
+                assert!(screen(&mut app, 80, 25).contains("No links in this message"));
+            } else {
+                let links = &app.picker.as_ref().unwrap().items;
+                assert_eq!(links, &["https://old.example/"]);
+                app.on_key(key(KeyCode::Esc));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn conversation_default_is_saved_and_v_overrides_it() {
         use crate::ui::tests::screen;
@@ -8362,7 +8434,7 @@ pub mod tests {
         app.settings_path = Some(path.clone());
         let settings_row = |app: &mut App| {
             app.on_key(key(KeyCode::Char('O')));
-            for _ in 0..4 {
+            for _ in 0..HelpMenu::THREADS_COLLAPSED {
                 app.on_key(key(KeyCode::Down));
             }
         };

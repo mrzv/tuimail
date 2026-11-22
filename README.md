@@ -278,6 +278,8 @@ certificate = "/Users/you/Documents/bridge/cert.pem"
 
 `O` (or `?` then `Tab`) opens the settings: the message beside the list, plain text or HTML, marking read, threading and its default view, including Sent or completing Gmail threads, asking before deleting and before sending, notifications, AI agents, sidebar folders, and the theme. `j` / `k` move, `Enter` or `Space` turns a setting on or off or opens its choices. Changes are saved at once, keeping other settings in `settings.toml` (but not its comments).
 
+Under **Reading**, **Hide trailing quoted text** hides `>`-quoted plain text and HTML blockquotes at the end of a message. Quotes followed by a reply stay visible. The reader marks where it hid text; turn the setting off to see it again. The original message is unchanged.
+
 Under **Sidebar**, choose **Choose which folders to show**. Use `j` / `k` to move and `Enter` or `Space` to show or hide a folder. Changes are saved immediately, separately for each account. Use the same list to bring hidden folders back. Hiding a folder only removes its sidebar row: its subfolders are controlled separately, and mail still syncs and can be moved there.
 
 Everything else is in `settings.toml` in [your config folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
@@ -288,6 +290,7 @@ icons = "auto"           # auto (Nerd Font icons in Ghostty, kitty and WezTerm),
 notifications = "auto"   # auto (what your terminal understands), off, bell, osc9, osc777 or osc99
 preview = true           # the open message beside the list, when the window is wide enough
 prefer_plain = false     # a message's plain-text part rather than its HTML, when it has both
+hide_trailing_quotes = false # hide quotes at the end of messages in the reader
 mark_read = true         # mark a message read once it's shown
 threads = true           # group the list in conversations
 threads_collapsed = false # collapse threads into single conversation rows by default

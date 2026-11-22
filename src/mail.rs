@@ -103,6 +103,9 @@ pub struct Parsed {
     pub cc: Vec<Addr>,
     /// The plain-text bodies, with MIME soft line breaks removed, joined.
     pub text: Option<String>,
+    /// Byte offset of the last unstuffed flowed line that looks quoted
+    /// after decoding, but was sent as literal text.
+    last_literal_quote: Option<usize>,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
     /// List-Unsubscribe's https or mailto link, if any.
@@ -322,6 +325,7 @@ fn parsed(
     };
     let [text_parts, html_parts] = body;
     let mut plain = String::new();
+    let mut last_literal_quote = None;
     for part in text_parts {
         let Some(text) = part.text() else {
             continue;
@@ -337,7 +341,7 @@ fn parsed(
             let delsp = ct
                 .attribute("delsp")
                 .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
-            append_flowed(&mut plain, &text, delsp);
+            append_flowed(&mut plain, &text, delsp, &mut last_literal_quote);
         } else {
             plain.push_str(&text);
         }
@@ -364,6 +368,7 @@ fn parsed(
         to: addrs(message.to()),
         cc: addrs(message.cc()),
         text: (!plain.trim().is_empty()).then_some(plain),
+        last_literal_quote,
         html: join(htmls),
         attachments,
         unsubscribe: unsubscribe_link(message),
@@ -776,6 +781,13 @@ impl Body {
         }
     }
 
+    fn note(&mut self, text: &str) {
+        self.lines.push(vec![Seg {
+            text: text.into(),
+            role: Role::Note,
+        }]);
+    }
+
     /// The text of line `i`, plain.
     #[cfg(test)]
     pub fn line(&self, i: usize) -> String {
@@ -783,19 +795,30 @@ impl Body {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct RenderOptions {
+    pub prefer_plain: bool,
+    pub hide_trailing_quotes: bool,
+}
+
 /// The message's text laid out `width` columns wide: the plain-text part,
 /// or the HTML turned into text when there's no plain one or `prefer_plain`
 /// is off.
-pub fn render(parsed: &Parsed, width: usize, prefer_plain: bool) -> Body {
+pub fn render(parsed: &Parsed, width: usize, options: RenderOptions) -> Body {
     let width = width.clamp(20, 400);
     let use_html = match (&parsed.text, &parsed.html) {
-        (Some(_), Some(_)) => !prefer_plain,
+        (Some(_), Some(_)) => !options.prefer_plain,
         (None, Some(_)) => true,
         _ => false,
     };
     let mut body = match (use_html, &parsed.html, &parsed.text) {
-        (true, Some(html), _) => render_html(html, width),
-        (_, _, Some(text)) => render_text(text, width),
+        (true, Some(html), _) => render_html(html, width, options.hide_trailing_quotes),
+        (_, _, Some(text)) => render_text(
+            text,
+            width,
+            options.hide_trailing_quotes,
+            parsed.last_literal_quote,
+        ),
         _ => Body::default(),
     };
     if body
@@ -803,23 +826,31 @@ pub fn render(parsed: &Parsed, width: usize, prefer_plain: bool) -> Body {
         .iter()
         .all(|l| l.iter().all(|s| s.text.trim().is_empty()))
     {
-        body.lines = vec![vec![Seg {
-            text: "(no text)".into(),
-            role: Role::Note,
-        }]];
+        body.lines.clear();
+        body.note("(no text)");
     }
     body
 }
 
 /// Plain text: lines wrapped to `width`, quoted lines marked by depth,
 /// links found and numbered.
-fn render_text(source: &str, width: usize) -> Body {
+fn render_text(
+    source: &str,
+    width: usize,
+    hide_trailing_quotes: bool,
+    last_literal_quote: Option<usize>,
+) -> Body {
     let mut body = Body::default();
     let (source, cut) = match source.char_indices().nth(MAX_TEXT) {
         Some((i, _)) => (&source[..i], true),
         None => (source, false),
     };
-    let cleaned = text::clean(source).replace('\t', "    ");
+    let before_quote = if hide_trailing_quotes && !cut {
+        before_trailing_quotes(source, last_literal_quote)
+    } else {
+        None
+    };
+    let cleaned = text::clean(before_quote.unwrap_or(source)).replace('\t', "    ");
     for line in cleaned.lines() {
         let (depth, rest) = quote_depth(line);
         let role = if depth > 0 {
@@ -864,18 +895,45 @@ fn render_text(source: &str, width: usize) -> Body {
             body.lines.push(segs);
         }
     }
-    if cut {
-        body.lines.push(vec![Seg {
-            text: "(the rest of this message is too long to show)".into(),
-            role: Role::Note,
-        }]);
+    if before_quote.is_some() {
+        body.note("(quoted text hidden)");
+    } else if cut {
+        body.note("(the rest of this message is too long to show)");
     }
     body
 }
 
+/// The prefix before the final `>`-quoted passage, if new text precedes it.
+fn before_trailing_quotes(source: &str, last_literal_quote: Option<usize>) -> Option<&str> {
+    let invisible = |c: char| c.is_whitespace() || text::is_hidden(c);
+    let mut prefix = source.trim_end_matches(invisible);
+    let mut found = false;
+    loop {
+        let (before, last) = prefix.rsplit_once('\n').unwrap_or(("", prefix));
+        let literal = last_literal_quote == Some(prefix.len() - last.len());
+        if literal || quote_depth(last).0 == 0 {
+            if !found {
+                return None;
+            }
+            let reply = last_literal_quote.is_some_and(|at| at < prefix.len())
+                || prefix
+                    .lines()
+                    .any(|line| quote_depth(line).0 == 0 && line.chars().any(|c| !invisible(c)));
+            return reply.then_some(prefix);
+        }
+        found = true;
+        prefix = before.trim_end_matches(invisible);
+    }
+}
+
 /// RFC 3676: unstuff lines, then join only soft breaks at the same quote
 /// depth. DelSp removes the marker space, not any spaces before it.
-fn append_flowed(out: &mut String, text: &str, delsp: bool) {
+fn append_flowed(
+    out: &mut String,
+    text: &str,
+    delsp: bool,
+    last_literal_quote: &mut Option<usize>,
+) {
     let mut lines = text
         .lines()
         .map(|line| {
@@ -886,6 +944,7 @@ fn append_flowed(out: &mut String, text: &str, delsp: bool) {
         .peekable();
     let final_break = text.ends_with('\n');
     let mut continued = false;
+    let mut start = out.len();
     while let Some((depth, rest)) = lines.next() {
         if !continued && depth != 0 {
             out.extend(std::iter::repeat_n('>', depth));
@@ -899,8 +958,14 @@ fn append_flowed(out: &mut String, text: &str, delsp: bool) {
         } else {
             rest
         });
-        if !continued && (next.is_some() || final_break) {
-            out.push('\n');
+        if !continued {
+            if depth == 0 && quote_depth(&out[start..]).0 > 0 {
+                *last_literal_quote = Some(start);
+            }
+            if next.is_some() || final_break {
+                out.push('\n');
+            }
+            start = out.len();
         }
     }
 }
@@ -1095,7 +1160,7 @@ fn url_in(text: &str, strict: bool) -> Option<(usize, usize)> {
 
 /// HTML laid out as text by html2text: links numbered, bold and italics
 /// kept, pictures shown by their alt text only. Nothing is fetched.
-pub fn render_html(html: &str, width: usize) -> Body {
+fn render_html(html: &str, width: usize, hide_trailing_quotes: bool) -> Body {
     use html2text::render::RichAnnotation;
     let mut body = Body {
         from_html: true,
@@ -1106,19 +1171,45 @@ pub fn render_html(html: &str, width: usize) -> Body {
         None => (html, false),
     };
     if too_deep(html) {
-        return render_text(&strip_tags(html), width);
+        return render_text(&strip_tags(html), width, false, None);
     }
     // Too narrow is laid out anyway: html2text giving up there drops the
     // sender's whole nesting by recursion, which can overflow even the
     // render stack.
-    let lines = html2text::config::rich()
+    let config = html2text::config::rich()
         .link_footnotes(false)
         .no_table_borders()
-        .allow_width_overflow()
-        .lines_from_read(html.as_bytes(), width);
-    let Ok(lines) = lines else {
-        return render_text(&strip_tags(html), width);
+        .allow_width_overflow();
+    let mut hidden = false;
+    let lines = if hide_trailing_quotes && !cut {
+        config.parse_html(html.as_bytes()).and_then(|dom| {
+            // nth_child counts elements from 1; the parser supplies html/head/body.
+            if let Some(body) = dom.document.nth_child(1).and_then(|html| html.nth_child(2)) {
+                trim_html_quote_tail(&body, &mut hidden, MAX_DEPTH, false);
+            }
+            let tree = config.dom_to_render_tree(&dom)?;
+            drop(dom);
+            config.render_to_lines(tree, width)
+        })
+    } else {
+        config.lines_from_read(html.as_bytes(), width)
     };
+    let Ok(lines) = lines else {
+        return render_text(&strip_tags(html), width, false, None);
+    };
+    if hidden
+        && !lines.iter().any(|line| {
+            line.tagged_strings().any(|piece| {
+                piece
+                    .s
+                    .chars()
+                    .any(|c| !c.is_whitespace() && !text::is_hidden(c))
+            })
+        })
+    {
+        // The preceding DOM nodes didn't render any text. Keep the quote.
+        return render_html(html, width, false);
+    }
     let mut blank = 0;
     for line in lines {
         let mut segs: Vec<Seg> = Vec::new();
@@ -1172,13 +1263,166 @@ pub fn render_html(html: &str, width: usize) -> Body {
     while body.lines.first().is_some_and(Vec::is_empty) {
         body.lines.remove(0);
     }
-    if cut {
-        body.lines.push(vec![Seg {
-            text: "(the rest of this message is too long to show)".into(),
-            role: Role::Note,
-        }]);
+    if hidden {
+        while body.lines.last().is_some_and(Vec::is_empty) {
+            body.lines.pop();
+        }
+        body.note("(quoted text hidden)");
+    } else if cut {
+        body.note("(the rest of this message is too long to show)");
     }
     body
+}
+
+enum HtmlTail {
+    Empty,
+    Quote,
+    Content,
+}
+
+/// Discard trailing blockquotes before layout assigns link numbers. Only
+/// descend through ordinary flow wrappers, not into tables, lists or code.
+/// Do not trim a quote-only subtree unless there is content before it.
+fn trim_html_quote_tail(
+    node: &html2text::Handle,
+    hidden: &mut bool,
+    depth_left: usize,
+    inside_quote: bool,
+) -> HtmlTail {
+    if depth_left == 0 {
+        return HtmlTail::Content;
+    }
+    use html2text::{Element, ns};
+    let Element { name, attrs, .. } = &node.data else {
+        return if html_leaf_is_empty(node) {
+            HtmlTail::Empty
+        } else {
+            HtmlTail::Content
+        };
+    };
+    if name.ns == ns!(svg) && &*name.local == "svg" {
+        // Like html2text, take the text of the last leading SVG title.
+        let mut visible = false;
+        for child in node.children.borrow().iter() {
+            let Element { name, .. } = &child.data else {
+                continue;
+            };
+            if name.ns != ns!(svg) || &*name.local != "title" {
+                break;
+            }
+            visible = child
+                .children
+                .borrow()
+                .iter()
+                .any(|leaf| !matches!(leaf.data, Element { .. }) && !html_leaf_is_empty(leaf));
+        }
+        return if visible {
+            HtmlTail::Content
+        } else {
+            HtmlTail::Empty
+        };
+    }
+    if name.ns != ns!(html) {
+        return HtmlTail::Content;
+    }
+    let quote = &*name.local == "blockquote";
+    match name.local.as_ref() {
+        "br" | "hr" | "wbr" | "link" | "meta" | "script" | "style" => return HtmlTail::Empty,
+        "img" => {
+            let (mut src, mut alt) = (false, false);
+            for attr in attrs.borrow().iter() {
+                match &*attr.name.local {
+                    "src" => src = !attr.value.is_empty(),
+                    "alt" => {
+                        alt = attr
+                            .value
+                            .chars()
+                            .any(|c| !c.is_whitespace() && !text::is_hidden(c));
+                    }
+                    _ => {}
+                }
+            }
+            return if src && alt {
+                HtmlTail::Content
+            } else {
+                HtmlTail::Empty
+            };
+        }
+        "body" | "div" | "p" | "span" | "section" | "article" | "blockquote" => {}
+        _ if inside_quote => {}
+        _ => return HtmlTail::Content,
+    }
+    let mut children = node.children.borrow_mut();
+    let mut quoted = false;
+    for i in (0..children.len()).rev() {
+        // Inside a blockquote, check for visible content without editing it.
+        match trim_html_quote_tail(&children[i], hidden, depth_left - 1, inside_quote || quote) {
+            HtmlTail::Empty => {}
+            _ if quote => return HtmlTail::Quote,
+            _ if inside_quote => return HtmlTail::Content,
+            HtmlTail::Quote => quoted = true,
+            HtmlTail::Content => {
+                if quoted {
+                    children.truncate(i + 1);
+                    *hidden = true;
+                }
+                return HtmlTail::Content;
+            }
+        }
+    }
+    if quoted {
+        HtmlTail::Quote
+    } else {
+        HtmlTail::Empty
+    }
+}
+
+// html2text exposes DOM elements but not its text variant. Inspect text
+// leaves via the serializer without buffering their contents.
+fn html_leaf_is_empty(node: &html2text::Handle) -> bool {
+    let mut whitespace = HtmlWhitespace::default();
+    matches!(node.data, html2text::Comment { .. })
+        || (node.serialize(&mut whitespace).is_ok() && !whitespace.pending_c2)
+}
+
+#[derive(Default)]
+struct HtmlWhitespace {
+    pending_c2: bool,
+}
+
+impl std::io::Write for HtmlWhitespace {
+    fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(0);
+        }
+        let invisible = |c: char| c.is_whitespace() || text::is_hidden(c);
+        let nonspace = std::io::ErrorKind::InvalidData;
+        // html5ever escapes NBSP and can write the lead byte of other
+        // U+0080–U+00BF characters separately from the continuation byte.
+        if self.pending_c2 {
+            let (last, rest) = bytes.split_first().unwrap();
+            if !(0x80..=0xbf).contains(last) || !invisible(char::from(*last)) {
+                return Err(nonspace.into());
+            }
+            self.pending_c2 = false;
+            bytes = rest;
+        }
+        if let Some(rest) = bytes.strip_suffix(&[0xc2]) {
+            self.pending_c2 = true;
+            bytes = rest;
+        }
+        if bytes == b"&nbsp;" || std::str::from_utf8(bytes).is_ok_and(|s| s.chars().all(invisible))
+        {
+            Ok(len)
+        } else {
+            Err(nonspace.into())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A link tuimail will offer to open: http, https or mailto, no spaces or
@@ -1396,7 +1640,7 @@ see https://example.com/menu. Thanks!\r\n\
     #[test]
     fn plain_text_is_wrapped_with_quotes_and_links_marked() {
         let parsed = parse(SIMPLE).unwrap();
-        let body = render(&parsed, 80, false);
+        let body = render(&parsed, 80, RenderOptions::default());
         assert_eq!(body.line(0), "Hi Bob,");
         assert_eq!(body.line(2), "see https://example.com/menu. Thanks!");
         assert_eq!(body.links, ["https://example.com/menu"]);
@@ -1406,7 +1650,7 @@ see https://example.com/menu. Thanks!\r\n\
         assert_eq!(body.line(5), ">> Even earlier");
         assert_eq!(body.lines[5][0].role, Role::Quote(2));
         // A link that wraps stays a link, on both lines.
-        let wrapped = render(&parsed, 25, false);
+        let wrapped = render(&parsed, 25, RenderOptions::default());
         let link_rows: Vec<String> = wrapped
             .lines
             .iter()
@@ -1419,7 +1663,7 @@ see https://example.com/menu. Thanks!\r\n\
             "https://example.com/menu",
             "{link_rows:?}"
         );
-        let narrow = render(&parsed, 20, false);
+        let narrow = render(&parsed, 20, RenderOptions::default());
         assert!(
             narrow
                 .lines
@@ -1434,7 +1678,7 @@ see https://example.com/menu. Thanks!\r\n\
         let raw = format!("From: a@b.c\r\n\r\n{line}\r\n");
         let parsed = parse(raw.as_bytes()).unwrap();
         let started = std::time::Instant::now();
-        let body = render(&parsed, 80, false);
+        let body = render(&parsed, 80, RenderOptions::default());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(body.links, ["https://x.example/a"]);
         let long = format!("x https://y.example/{} z", "a".repeat(400_000));
@@ -1467,7 +1711,7 @@ see https://example.com/menu. Thanks!\r\n\
 <p></p><p></p><p></p><p>Bye</p></body></html>";
         let parsed = parse(raw).unwrap();
         assert!(parsed.text.is_none() && parsed.html.is_some());
-        let body = render(&parsed, 60, false);
+        let body = render(&parsed, 60, RenderOptions::default());
         assert!(body.from_html);
         assert_eq!(
             body.links,
@@ -1498,7 +1742,7 @@ see https://example.com/menu. Thanks!\r\n\
 <p><a href=\"https://evil.example/b\">https://paypal.com/login</a></p>\
 <p><a href=\"https://r.example.com/2\">Try it</a></p>";
         let parsed = parse(raw).unwrap();
-        let body = render(&parsed, 60, false);
+        let body = render(&parsed, 60, RenderOptions::default());
         assert_eq!(body.links.len(), 5, "{:?}", body.links);
         let said: Vec<String> = (0..body.links.len()).map(|n| body.link_text(n)).collect();
         assert_eq!(said, ["Aerial view", "Try it", "", "", ""]);
@@ -1547,8 +1791,121 @@ see https://example.com/menu. Thanks!\r\n\
 --x\r\nContent-Type: text/plain\r\n\r\nplain version\r\n\
 --x\r\nContent-Type: text/html\r\n\r\n<p>html version</p>\r\n--x--\r\n";
         let parsed = parse(raw).unwrap();
-        assert!(render(&parsed, 60, false).line(0).contains("html version"));
-        assert!(render(&parsed, 60, true).line(0).contains("plain version"));
+        let plain = RenderOptions {
+            prefer_plain: true,
+            ..RenderOptions::default()
+        };
+        assert!(
+            render(&parsed, 60, RenderOptions::default())
+                .line(0)
+                .contains("html version")
+        );
+        assert!(render(&parsed, 60, plain).line(0).contains("plain version"));
+    }
+
+    #[test]
+    fn plain_text_hides_only_trailing_quoted_text_and_its_links() {
+        let options = RenderOptions {
+            hide_trailing_quotes: true,
+            ..RenderOptions::default()
+        };
+        let raw = b"From: a@b.c\r\nContent-Type: text/plain; format=flowed\r\n\r\n\
+                    > An inline question\r\nMy answer\r\n\r\n\
+                    On https://current.example/ I wrote:\r\n> Old text https://old.example/\r\n\
+                    > > Nested \r\n> > reply\r\n\r\n";
+        let parsed = parse(raw).unwrap();
+        let visible = render(&parsed, 80, RenderOptions::default());
+        assert_eq!(
+            visible.links,
+            ["https://current.example/", "https://old.example/"]
+        );
+        assert!(plain_text(&parsed).contains("Old text"));
+        let hidden = render(&parsed, 80, options);
+        assert_eq!(hidden.links, ["https://current.example/"]);
+        assert_eq!(hidden.line(0), "> An inline question");
+        assert_eq!(hidden.line(1), "My answer");
+        assert_eq!(hidden.line(3), "On https://current.example/ I wrote:");
+        assert_eq!(hidden.line(4), "(quoted text hidden)");
+        assert_eq!(hidden.lines.len(), 5);
+
+        for body in [
+            "> The whole message is quoted\r\n",
+            "New text\r\n> An inline question\r\nMy answer is below the quote\r\n",
+            "New text\r\n> An inline question\r\n > is the operator to use\r\n",
+            "New text\r\n> An inline question\r\n  \r\n > is the operator to use\r\n",
+        ] {
+            let raw =
+                format!("From: a@b.c\r\nContent-Type: text/plain; format=flowed\r\n\r\n{body}");
+            let parsed = parse(raw.as_bytes()).unwrap();
+            assert_eq!(
+                render(&parsed, 80, options),
+                render(&parsed, 80, RenderOptions::default()),
+            );
+        }
+
+        let raw = b"From: a@b.c\r\nContent-Type: text/plain; format=flowed\r\n\r\n\
+                    \x20> is the operator to use\r\n> Old text\r\n";
+        let hidden = render(&parse(raw).unwrap(), 80, options);
+        assert_eq!(hidden.line(0), "> is the operator to use");
+        assert_eq!(hidden.line(1), "(quoted text hidden)");
+        assert_eq!(hidden.lines.len(), 2);
+    }
+
+    #[test]
+    fn html_hides_only_trailing_blockquotes_and_their_links() {
+        let options = RenderOptions {
+            hide_trailing_quotes: true,
+            ..RenderOptions::default()
+        };
+        let raw = b"From: a@b.c\r\nContent-Type: text/html\r\n\r\n\
+                    <div><pre>&gt; not a blockquote</pre><blockquote>Inline question</blockquote>\
+                    <p class='gmail_attr'><a href='https://current.example/'>My answer</a></p>\
+                    <div class='gmail_quote gmail_quote_container'>\
+                    <div class='gmail_attr'>On Monday, Alice wrote:<br></div>\
+                    <blockquote><a href='https://old.example/'>Old text</a>\
+                    <blockquote>Nested reply</blockquote><img src='old.png' alt='Old image'>\
+                    <svg><title>Old diagram</title></svg></blockquote>\
+                    </div>\n</div><!-- trailing comment --><p>&nbsp;</p><br>&emsp;\xc2\x85&shy;<svg></svg>";
+        let parsed = parse(raw).unwrap();
+        let visible = render(&parsed, 80, RenderOptions::default());
+        assert_eq!(
+            visible.links,
+            ["https://current.example/", "https://old.example/"]
+        );
+        let hidden = render(&parsed, 80, options);
+        assert!(hidden.from_html);
+        assert_eq!(hidden.links, ["https://current.example/"]);
+        let lines: Vec<_> = (0..hidden.lines.len()).map(|i| hidden.line(i)).collect();
+        assert!(lines.iter().any(|line| line.contains("Inline question")));
+        assert!(lines.iter().any(|line| line.contains("My answer")));
+        assert!(lines.iter().any(|line| line.contains("> not a blockquote")));
+        assert!(lines.iter().any(|line| line.contains("Alice wrote")));
+        assert!(!lines.iter().any(|line| {
+            ["Old text", "Nested reply", "Old image", "Old diagram"]
+                .iter()
+                .any(|old| line.contains(old))
+        }));
+        assert_eq!(lines.last().unwrap(), "(quoted text hidden)");
+
+        for body in [
+            "<blockquote>The whole message</blockquote>",
+            "<input><blockquote>The only visible text</blockquote>",
+            "<p>New text</p><blockquote>Inline quote</blockquote><p>My answer</p>",
+            "<p>New text</p><p>&gt; Literal angle bracket, not a quote</p>",
+            "<p>New text</p><blockquote></blockquote>",
+            "<p>New text</p><blockquote><p><b> </b></p></blockquote>",
+            "<p>New text</p><blockquote><img alt='Old'></blockquote>",
+            "<p>New text</p><blockquote><div><img src='beacon'></div></blockquote>",
+            "<p>New text</p><blockquote><svg></svg></blockquote>",
+            "<p>New text</p><blockquote>Inline quote</blockquote><svg><title>New diagram</title></svg>",
+        ] {
+            let raw = format!("From: a@b.c\r\nContent-Type: text/html\r\n\r\n{body}");
+            let parsed = parse(raw.as_bytes()).unwrap();
+            assert_eq!(
+                render(&parsed, 80, options),
+                render(&parsed, 80, RenderOptions::default()),
+            );
+        }
     }
 
     #[test]
@@ -1591,7 +1948,7 @@ Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\naGVs
         let raw = b"From: a@b.c\r\nContent-Type: text/plain; format=flowed\r\n\r\n\
 This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r\n\r\n";
         let parsed = parse(raw).unwrap();
-        let body = render(&parsed, 80, false);
+        let body = render(&parsed, 80, RenderOptions::default());
         assert_eq!(body.line(0), "This is a long line that was split.");
         assert_eq!(body.line(1), "> quoted more");
         assert_eq!(body.line(2), "--", "the signature line, not joined");
@@ -1609,7 +1966,7 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
 Another paragraph \r\nstarts here.\r\n--m--\r\n";
         let parsed = parse(raw).unwrap();
         let target = "https://example.org/a-long-path?first=1&second=2";
-        let body = render(&parsed, 20, false);
+        let body = render(&parsed, 20, RenderOptions::default());
         assert_eq!(body.links, [target]);
         let pieces: Vec<_> = body
             .lines
@@ -1634,7 +1991,7 @@ Another paragraph \r\nstarts here.\r\n--m--\r\n";
         let raw = b"From: a@b.c\r\nSubject: x\x1b[2Jy\r\n\r\nline\x1b]52;c;ZXZpbA==\x07 end\r\n";
         let parsed = parse(raw).unwrap();
         assert!(!parsed.summary.subject.contains('\x1b'));
-        let body = render(&parsed, 80, false);
+        let body = render(&parsed, 80, RenderOptions::default());
         assert!(
             body.lines
                 .iter()
@@ -1650,7 +2007,7 @@ Another paragraph \r\nstarts here.\r\n--m--\r\n";
         let parsed = parse(raw.as_bytes()).unwrap();
         let handle = std::thread::Builder::new()
             .stack_size(crate::mail::RENDER_STACK)
-            .spawn(move || render(&parsed, 80, false))
+            .spawn(move || render(&parsed, 80, RenderOptions::default()))
             .unwrap();
         let body = handle.join().unwrap();
         assert!(!body.lines.is_empty());
@@ -1841,11 +2198,22 @@ Another paragraph \r\nstarts here.\r\n--m--\r\n";
             alternative(&format!("{named_plain}{html}")),
         ] {
             assert!(
-                render(&parsed, 60, false).line(0).contains("html version"),
+                render(&parsed, 60, RenderOptions::default())
+                    .line(0)
+                    .contains("html version"),
                 "{parsed:?}"
             );
             assert!(
-                render(&parsed, 60, true).line(0).contains("plain version"),
+                render(
+                    &parsed,
+                    60,
+                    RenderOptions {
+                        prefer_plain: true,
+                        ..RenderOptions::default()
+                    },
+                )
+                .line(0)
+                .contains("plain version"),
                 "{parsed:?}"
             );
             assert!(parsed.attachments.is_empty(), "{:?}", parsed.attachments);
@@ -2186,7 +2554,12 @@ Content-Type: multipart/alternative; boundary=x\r\n\r\n\
         let parsed = parse(raw.as_bytes()).unwrap();
         let handle = std::thread::Builder::new()
             .stack_size(crate::mail::RENDER_STACK)
-            .spawn(move || (render(&parsed, 400, false), plain_text(&parsed)))
+            .spawn(move || {
+                (
+                    render(&parsed, 400, RenderOptions::default()),
+                    plain_text(&parsed),
+                )
+            })
             .unwrap();
         let (body, plain) = handle.join().unwrap();
         assert!(!body.lines.is_empty());

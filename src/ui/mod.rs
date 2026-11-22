@@ -898,6 +898,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
     );
     add(
         &mut lines,
+        HelpMenu::HIDE_TRAILING_QUOTES,
+        check(settings.hide_trailing_quotes),
+        "Hide trailing quoted text",
+    );
+    add(
+        &mut lines,
         HelpMenu::MARK_READ,
         check(settings.mark_read),
         "Mark messages read when they're shown",
