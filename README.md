@@ -136,6 +136,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `q` | Quit |
 
 Web links use terminal hyperlinks (OSC 8). Kitty can ask before opening them with `allow_hyperlinks ask`, or show the target on hover with `show_hyperlink_targets always`. Use `o` for long URLs, or for `mailto:` links to write the message in tuimail. The demo does not emit terminal hyperlinks.
+Links split by `format=flowed` email wrapping keep their full destination on every displayed row. Literal line breaks in fixed plain text are not joined.
 
 Open a collapsed conversation to see its messages newest first, with only the newest body expanded. List actions target the newest message, not the whole conversation; actions in the reader target the message you've opened.
 

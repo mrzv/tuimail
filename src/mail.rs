@@ -101,10 +101,8 @@ pub struct Parsed {
     pub reply_to: Vec<Addr>,
     pub to: Vec<Addr>,
     pub cc: Vec<Addr>,
-    /// The plain-text bodies, joined.
+    /// The plain-text bodies, with MIME soft line breaks removed, joined.
     pub text: Option<String>,
-    /// The text is format=flowed: lines ending in a space go on.
-    pub flowed: bool,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
     /// List-Unsubscribe's https or mailto link, if any.
@@ -323,15 +321,25 @@ fn parsed(
         (!joined.trim().is_empty()).then_some(joined)
     };
     let [text_parts, html_parts] = body;
-    let mut flowed = false;
-    let mut texts = Vec::new();
+    let mut plain = String::new();
     for part in text_parts {
-        if let Some(text) = part.text() {
-            flowed |= part
-                .content_type()
-                .and_then(|ct| ct.attribute("format"))
-                .is_some_and(|f| f.eq_ignore_ascii_case("flowed"));
-            texts.push(text);
+        let Some(text) = part.text() else {
+            continue;
+        };
+        if !plain.is_empty() {
+            plain.push_str("\n\n");
+        }
+        if let Some(ct) = part.content_type()
+            && ct
+                .attribute("format")
+                .is_some_and(|f| f.eq_ignore_ascii_case("flowed"))
+        {
+            let delsp = ct
+                .attribute("delsp")
+                .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+            append_flowed(&mut plain, &text, delsp);
+        } else {
+            plain.push_str(&text);
         }
     }
     let htmls = html_parts.iter().filter_map(|p| p.text()).collect();
@@ -355,8 +363,7 @@ fn parsed(
         reply_to: addrs(message.reply_to()),
         to: addrs(message.to()),
         cc: addrs(message.cc()),
-        text: join(texts),
-        flowed,
+        text: (!plain.trim().is_empty()).then_some(plain),
         html: join(htmls),
         attachments,
         unsubscribe: unsubscribe_link(message),
@@ -777,7 +784,7 @@ pub fn render(parsed: &Parsed, width: usize, prefer_plain: bool) -> Body {
     };
     let mut body = match (use_html, &parsed.html, &parsed.text) {
         (true, Some(html), _) => render_html(html, width),
-        (_, _, Some(text)) => render_text(text, width, parsed.flowed),
+        (_, _, Some(text)) => render_text(text, width),
         _ => Body::default(),
     };
     if body
@@ -795,20 +802,15 @@ pub fn render(parsed: &Parsed, width: usize, prefer_plain: bool) -> Body {
 
 /// Plain text: lines wrapped to `width`, quoted lines marked by depth,
 /// links found and numbered.
-pub fn render_text(source: &str, width: usize, flowed: bool) -> Body {
+fn render_text(source: &str, width: usize) -> Body {
     let mut body = Body::default();
     let (source, cut) = match source.char_indices().nth(MAX_TEXT) {
         Some((i, _)) => (&source[..i], true),
         None => (source, false),
     };
     let cleaned = text::clean(source).replace('\t', "    ");
-    let lines: Vec<String> = if flowed {
-        unflow(&cleaned)
-    } else {
-        cleaned.lines().map(str::to_string).collect()
-    };
-    for line in lines {
-        let (depth, rest) = quote_depth(&line);
+    for line in cleaned.lines() {
+        let (depth, rest) = quote_depth(line);
         let role = if depth > 0 {
             Role::Quote(depth)
         } else {
@@ -831,8 +833,8 @@ pub fn render_text(source: &str, width: usize, flowed: bool) -> Body {
             });
             continue;
         }
-        // Links are found in the whole line, then the line is wrapped at
-        // spaces only, so a link that wraps stays one link.
+        // Find links before wrapping so every piece keeps the whole URL.
+        // A long word can wrap even when there is no space to break at.
         let links = find_urls(rest, &mut body);
         // By the columns ratatui draws (`text::cols`), so no row runs past
         // the pane and loses its end.
@@ -860,54 +862,36 @@ pub fn render_text(source: &str, width: usize, flowed: bool) -> Body {
     body
 }
 
-/// RFC 3676 format=flowed: a line ending in a space goes on in the next
-/// (unless it's the signature line), and a leading space was stuffed.
-fn unflow(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut open: Option<(u8, String)> = None;
-    for raw in text.lines() {
-        let (depth, rest) = quote_depth_strict(raw);
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+/// RFC 3676: unstuff lines, then join only soft breaks at the same quote
+/// depth. DelSp removes the marker space, not any spaces before it.
+fn append_flowed(out: &mut String, text: &str, delsp: bool) {
+    let mut lines = text
+        .lines()
+        .map(|line| {
+            let depth = line.bytes().take_while(|&b| b == b'>').count();
+            let rest = &line[depth..];
+            (depth, rest.strip_prefix(' ').unwrap_or(rest))
+        })
+        .peekable();
+    let final_break = text.ends_with('\n');
+    let mut continued = false;
+    while let Some((depth, rest)) = lines.next() {
+        if !continued && depth != 0 {
+            out.extend(std::iter::repeat_n('>', depth));
+            out.push(' ');
+        }
         let soft = rest.ends_with(' ') && rest != "-- ";
-        match open.take() {
-            Some((d, mut acc)) if d == depth => {
-                acc.push_str(rest);
-                if soft {
-                    open = Some((d, acc));
-                } else {
-                    out.push(requote(d, &acc));
-                }
-            }
-            previous => {
-                if let Some((d, acc)) = previous {
-                    out.push(requote(d, &acc));
-                }
-                if soft {
-                    open = Some((depth, rest.to_string()));
-                } else {
-                    out.push(requote(depth, rest));
-                }
-            }
+        let next = lines.peek();
+        continued = soft && next.is_some_and(|&(d, s)| d == depth && s != "-- ");
+        out.push_str(if soft && delsp {
+            &rest[..rest.len() - 1]
+        } else {
+            rest
+        });
+        if !continued && (next.is_some() || final_break) {
+            out.push('\n');
         }
     }
-    if let Some((d, acc)) = open {
-        out.push(requote(d, &acc));
-    }
-    out
-}
-
-fn requote(depth: u8, text: &str) -> String {
-    if depth == 0 {
-        text.to_string()
-    } else {
-        format!("{} {text}", ">".repeat(usize::from(depth)))
-    }
-}
-
-/// Flowed text quotes with `>` and no spaces between them.
-fn quote_depth_strict(line: &str) -> (u8, &str) {
-    let depth = line.bytes().take_while(|&b| b == b'>').count();
-    (depth.min(9) as u8, &line[depth..])
 }
 
 /// How deep `line` is quoted (`>`, `> >`, `>>`), and the rest of it.
@@ -1111,7 +1095,7 @@ pub fn render_html(html: &str, width: usize) -> Body {
         None => (html, false),
     };
     if too_deep(html) {
-        return render_text(&strip_tags(html), width, false);
+        return render_text(&strip_tags(html), width);
     }
     // Too narrow is laid out anyway: html2text giving up there drops the
     // sender's whole nesting by recursion, which can overflow even the
@@ -1122,7 +1106,7 @@ pub fn render_html(html: &str, width: usize) -> Body {
         .allow_width_overflow()
         .lines_from_read(html.as_bytes(), width);
     let Ok(lines) = lines else {
-        return render_text(&strip_tags(html), width, false);
+        return render_text(&strip_tags(html), width);
     };
     let mut blank = 0;
     for line in lines {
@@ -1281,12 +1265,7 @@ fn strip_tags(html: &str) -> String {
 /// forward: the plain part, else the HTML as text.
 pub fn plain_text(parsed: &Parsed) -> String {
     if let Some(text) = &parsed.text {
-        let text = text::clean(text::first_chars(text, MAX_TEXT));
-        return if parsed.flowed {
-            unflow(&text).join("\n")
-        } else {
-            text
-        };
+        return text::clean(text::first_chars(text, MAX_TEXT));
     }
     let Some(html) = &parsed.html else {
         return String::new();
@@ -1597,13 +1576,37 @@ Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\naGVs
     #[test]
     fn flowed_text_is_joined_back() {
         let raw = b"From: a@b.c\r\nContent-Type: text/plain; format=flowed\r\n\r\n\
-This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r\n";
+This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r\n\r\n";
         let parsed = parse(raw).unwrap();
-        assert!(parsed.flowed);
         let body = render(&parsed, 80, false);
         assert_eq!(body.line(0), "This is a long line that was split.");
         assert_eq!(body.line(1), "> quoted more");
         assert_eq!(body.line(2), "--", "the signature line, not joined");
+        assert_eq!(body.line(3), "sig");
+        assert_eq!(body.lines.len(), 5, "preserve the final blank row");
+        assert!(plain_text(&parsed).ends_with("sig\n\n"));
+    }
+
+    #[test]
+    fn flowed_links_keep_the_full_target_on_every_wrapped_row() {
+        let raw = b"From: a@b.c\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n\
+--m\r\nContent-Type: text/plain; format=flowed; delsp=YeS\r\n\r\n\
+>https://example.org/a-long- \r\n> path?first=1&second=2\r\n\
+--m\r\nContent-Type: text/plain; delsp=yes\r\n\r\n\
+Another paragraph \r\nstarts here.\r\n--m--\r\n";
+        let parsed = parse(raw).unwrap();
+        let target = "https://example.org/a-long-path?first=1&second=2";
+        let body = render(&parsed, 20, false);
+        assert_eq!(body.links, [target]);
+        let pieces: Vec<_> = body
+            .lines
+            .iter()
+            .filter_map(|line| line.iter().find(|s| s.role == Role::Link(0)))
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.concat(), target);
+        assert!(plain_text(&parsed).contains("Another paragraph \nstarts here."));
     }
 
     #[test]
