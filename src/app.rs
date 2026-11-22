@@ -1229,7 +1229,6 @@ impl App {
             let body = self.reader_view;
             terminal.draw(|frame| {
                 crate::ui::draw(frame, self);
-                crate::ui::reader::hyperlinks(frame, self);
                 // Invalidate only the pane whose mapping is changing.
                 if (self.list_hit_area.get(), self.list_scroll.get()) != list {
                     keys.mouse_frames.list.store(0, Ordering::Relaxed);
