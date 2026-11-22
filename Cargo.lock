@@ -3868,7 +3868,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tokio-rustls",
  "toml",

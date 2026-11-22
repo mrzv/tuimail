@@ -102,8 +102,6 @@ tuimail --check
 
 It says where your config and data folders are, whether a keychain is there for passwords, and each account it found: its servers, security and where its password comes from. An account it can't use, or a line in `accounts.toml` it doesn't understand, shows up as a warning.
 
-If an upgrade hasn't moved the TOML files yet, `--check` reads them from the old location without moving them.
-
 ## Keys
 
 The status bar shows the keys for where you are, and `?` lists them all. `Tab` there goes to the settings.
@@ -407,7 +405,7 @@ The paths on this computer appear in `tuimail --help` and `tuimail --check`:
 | Linux | `~/.config/tuimail` | `~/.local/share/tuimail` |
 | Windows | `%LOCALAPPDATA%\tuimail` | `%LOCALAPPDATA%\tuimail` |
 
-On Unix, the first start after upgrading moves each TOML file from the old data folder if the corresponding file in the config folder doesn't already exist. If the filesystem doesn't let tuimail sync the new folder to disk, tuimail uses the new copy but keeps the old one. Quit any older tuimail processes before upgrading. The mail and contacts cache stays put, and passwords stay in the keychain.
+On Unix, tuimail reads the TOML files only from the configured location. If yours are still in the data folder, quit tuimail and move `accounts.toml` and `settings.toml` to the config folder yourself. Leave the mail and contacts cache where it is, or set `TM_DATA_DIR` if you want to keep everything together in one directory. Passwords stay in the keychain.
 
 `tuimail.db` holds the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, the addresses used for completing To, Cc and Bcc, and any synchronized Google contacts. Attachments you open go to the data folder's `opened/` directory.
 

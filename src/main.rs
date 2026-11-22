@@ -94,33 +94,13 @@ async fn run() -> Result<()> {
 
     // Everything that can fail does so before the terminal is taken over,
     // so errors print as normal text.
-    let (config, _migration_lock) = if check {
-        config::Config::inspect()?
-    } else {
-        (config::Config::load()?, config::MigrationLocks::default())
-    };
-    let settings_path = if check {
-        config.inspect_file("settings.toml")?
-    } else {
-        settings::path(&config.config_dir)
-    };
-    let accounts_path = if check {
-        config.inspect_file("accounts.toml")?
-    } else {
-        account::path(&config.config_dir)
-    };
+    let config = config::Config::load()?;
+    let settings_path = settings::path(&config.config_dir);
+    let accounts_path = account::path(&config.config_dir);
     let (settings, unknown_settings) = settings::Settings::load_checked(&settings_path)?;
-    let (accounts, mut warnings) = account::load(&accounts_path)?;
+    let (accounts, warnings) = account::load(&accounts_path)?;
     let keychain = secrets::init_keychain();
     if check {
-        for path in [&accounts_path, &settings_path] {
-            if path.parent() == Some(&config.data_dir) && config.config_dir != config.data_dir {
-                warnings.push(format!(
-                    "{} has not been moved to the config folder yet",
-                    config::shown(path)
-                ));
-            }
-        }
         return print_check(&config, &accounts, &warnings, keychain);
     }
     let store = store::Store::open(&config.data_dir.join("tuimail.db"))?;

@@ -494,7 +494,6 @@ fn unknown_keys(text: &str) -> Vec<String> {
 
 /// Adds `account` to the file, or replaces the one with its address.
 pub fn save(path: &Path, account: &Account) -> Result<()> {
-    let _guard = config::lock_config_write(path)?;
     let shown = config::shown(path);
     let mut file: AccountsFile = match config::read_small(path) {
         Ok(text) => toml::from_str(&text)
@@ -511,7 +510,6 @@ pub fn save(path: &Path, account: &Account) -> Result<()> {
 
 /// Takes the account with address `id` out of the file.
 pub fn remove(path: &Path, id: &str) -> Result<()> {
-    let _guard = config::lock_config_write(path)?;
     let shown = config::shown(path);
     let text = config::read_small(path).with_context(|| format!("cannot read {shown}"))?;
     let mut file: AccountsFile = toml::from_str(&text)
