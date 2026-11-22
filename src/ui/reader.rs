@@ -1,17 +1,148 @@
 //! The message being read: its subject and who it's from and to, its
 //! attachments, then its text, scrolled.
 
+use std::ops::Range;
+
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::buffer::CellWidth;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{border, bordered, fit, fit_middle, hint_spans, scrollbar};
 use crate::app::{App, Focus, Item};
-use crate::mail::{self, Addr, Role};
+use crate::mail::{self, Addr, Body, Role, Seg};
 use crate::text::{cols, wrap};
 use crate::theme::Colors;
+
+/// The slice of a particular body layout that the last frame showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyView {
+    pub area: Rect,
+    pub generation: u64,
+    first: usize,
+}
+
+/// (Body line, column boundary), with `width` denoting the right margin.
+type BodyCell = (usize, usize);
+
+impl BodyView {
+    fn cell(self, pos: Position) -> BodyCell {
+        let width = usize::from(self.area.width);
+        if pos.y < self.area.top() {
+            (self.first, 0)
+        } else if pos.y >= self.area.bottom() {
+            (self.first + usize::from(self.area.height) - 1, width)
+        } else {
+            (
+                self.first + usize::from(pos.y - self.area.y),
+                usize::from(pos.x.saturating_sub(self.area.x)).min(width),
+            )
+        }
+    }
+
+    pub fn begin(self, pos: Position) -> BodySelection {
+        let anchor = self.cell(pos);
+        BodySelection {
+            anchor,
+            end: anchor,
+            width: usize::from(self.area.width),
+            dragging: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BodySelection {
+    anchor: BodyCell,
+    end: BodyCell,
+    width: usize,
+    pub dragging: bool,
+}
+
+impl BodySelection {
+    pub fn extend(&mut self, view: BodyView, pos: Position) {
+        self.end = view.cell(pos);
+    }
+
+    pub fn has_text(self, body: &Body) -> bool {
+        let ((first, _), (last, _)) = self.bounds();
+        self.anchor != self.end
+            && (first..=last).any(|row| self.glyphs(row, &body.lines[row]).next().is_some())
+    }
+
+    fn bounds(self) -> (BodyCell, BodyCell) {
+        (self.anchor.min(self.end), self.anchor.max(self.end))
+    }
+
+    fn glyphs(self, row: usize, line: &[Seg]) -> impl Iterator<Item = (usize, &str)> {
+        let ((first, left), (last, right)) = self.bounds();
+        let columns = if (first..=last).contains(&row) {
+            let start = if row == first { left } else { 0 };
+            let end = if row == last { right } else { self.width };
+            start..end
+        } else {
+            0..0
+        };
+        selected_glyphs(line, self.width, columns)
+    }
+
+    pub fn text(self, body: &Body) -> String {
+        let ((first, _), (last, _)) = self.bounds();
+        let mut out = String::new();
+        for (i, line) in body.lines[first..=last].iter().enumerate() {
+            if i != 0 {
+                out.push('\n');
+            }
+            for (_, glyph) in self.glyphs(first + i, line) {
+                out.push_str(glyph);
+            }
+        }
+        out
+    }
+}
+
+/// Match Paragraph's unwrapped rows. A wide glyph is selected whole if
+/// either column is in the selection; padding and clipped text aren't copied.
+fn selected_glyphs(
+    line: &[Seg],
+    width: usize,
+    columns: Range<usize>,
+) -> impl Iterator<Item = (usize, &str)> {
+    let mut column = 0;
+    line.iter()
+        .flat_map(|seg| seg.text.graphemes(true))
+        .filter_map(move |glyph| {
+            let w = usize::from(glyph.cell_width());
+            if w == 0 || w > width || glyph.contains(char::is_control) {
+                return None;
+            }
+            let start = column;
+            column += w;
+            Some((start, column, glyph))
+        })
+        .take_while(move |&(start, end, _)| start < columns.end && end <= width)
+        .filter(move |&(_, end, _)| end > columns.start && !columns.is_empty())
+        .map(|(start, _, glyph)| (start, glyph))
+}
+
+fn body_line<'a>(segs: &'a [Seg], c: &Colors) -> Line<'a> {
+    Line::from_iter(segs.iter().map(|seg| {
+        let style = match seg.role {
+            Role::Text => Style::new().fg(c.text),
+            Role::Quote(depth) if depth % 2 == 1 => Style::new().fg(c.quote),
+            Role::Quote(_) => Style::new().fg(c.quote_deeper),
+            Role::Link(_) => Style::new().fg(c.link).add_modifier(Modifier::UNDERLINED),
+            Role::Bold => Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+            Role::Italic => Style::new().fg(c.text).add_modifier(Modifier::ITALIC),
+            Role::Code => Style::new().fg(c.ok),
+            Role::Note => Style::new().fg(c.dim),
+        };
+        Span::styled(seg.text.as_str(), style)
+    }))
+}
 
 /// A sender as the reader shows it: the address always in full (cut in
 /// the middle, so its domain shows, if even it doesn't fit), then the name
@@ -91,7 +222,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Reader;
     let mut block = bordered().border_style(border(focused, &c));
     if focused {
-        let hint = if app.reader_thread().is_some() {
+        let hint = if app
+            .reader
+            .as_ref()
+            .is_some_and(crate::app::Reader::has_selection)
+        {
+            " `y` copy selection · `Esc` clear "
+        } else if app.reader_thread().is_some() {
             " `[ ]` newer/older reply "
         } else {
             " `o` links · `A` files · `J K` next/previous "
@@ -239,6 +376,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         "─".repeat(width),
         Style::new().fg(c.border),
     )));
+    let mut body_lines = [].as_slice();
     match (&reader.body, &reader.error) {
         (_, Some(error)) => {
             lines.push(Line::default());
@@ -255,27 +393,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 )));
                 lines.push(Line::default());
             }
-            for segs in &body.lines {
-                let spans: Vec<Span> = segs
-                    .iter()
-                    .map(|seg| {
-                        let style = match seg.role {
-                            Role::Text => Style::new().fg(c.text),
-                            Role::Quote(depth) if depth % 2 == 1 => Style::new().fg(c.quote),
-                            Role::Quote(_) => Style::new().fg(c.quote_deeper),
-                            Role::Link(_) => {
-                                Style::new().fg(c.link).add_modifier(Modifier::UNDERLINED)
-                            }
-                            Role::Bold => Style::new().fg(c.text).add_modifier(Modifier::BOLD),
-                            Role::Italic => Style::new().fg(c.text).add_modifier(Modifier::ITALIC),
-                            Role::Code => Style::new().fg(c.ok),
-                            Role::Note => Style::new().fg(c.dim),
-                        };
-                        Span::styled(seg.text.clone(), style)
-                    })
-                    .collect();
-                lines.push(Line::from(spans));
-            }
+            body_lines = &body.lines;
         }
         (None, None) => {
             lines.push(Line::default());
@@ -286,11 +404,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     let rows = usize::from(inner.height);
-    let (max, scroll) = {
+    let (max, scroll, body_view) = {
         let thread = app.reader_thread();
-        let max = (lines.len() + thread.as_ref().map_or(0, |(members, _)| members.len()))
-            .saturating_sub(rows);
+        let body_start = lines.len() + thread.as_ref().map_or(0, |(_, active)| active + 1);
+        let max = (lines.len()
+            + body_lines.len()
+            + thread.as_ref().map_or(0, |(members, _)| members.len()))
+        .saturating_sub(rows);
         let scroll = reader.scroll.min(max);
+        let body = body_lines.iter().map(|line| body_line(line, &c));
         // Lines wider than the pane are cut, not wrapped.
         let shown: Vec<_> = if let Some((members, active)) = thread {
             let now = crate::app::now();
@@ -301,16 +423,47 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 .clone()
                 .take(active + 1)
                 .chain(lines)
+                .chain(body)
                 .chain(headers.skip(active + 1))
                 .skip(scroll)
                 .take(rows)
                 .collect()
         } else {
-            lines.into_iter().skip(scroll).take(rows).collect()
+            lines
+                .into_iter()
+                .chain(body)
+                .skip(scroll)
+                .take(rows)
+                .collect()
         };
         frame.render_widget(Paragraph::new(shown), text_area);
-        (max, scroll)
+
+        let first = scroll.max(body_start);
+        let end = (scroll + rows).min(body_start + body_lines.len());
+        let mut body_view = None;
+        if first < end && width != 0 && reader.selectable_body().is_some() {
+            let y = text_area.y + (first - scroll) as u16;
+            if let Some(selection) = reader.selection.filter(|s| s.width == width) {
+                for (i, line) in body_lines[first - body_start..end - body_start]
+                    .iter()
+                    .enumerate()
+                {
+                    for (x, _) in selection.glyphs(first - body_start + i, line) {
+                        frame.buffer_mut()[(text_area.x + x as u16, y + i as u16)].bg = c.selected;
+                    }
+                }
+            }
+            if !app.mouse_blocked() {
+                body_view = Some(BodyView {
+                    area: Rect::new(text_area.x, y, text_area.width, (end - first) as u16),
+                    generation: reader.layout_generation,
+                    first: first - body_start,
+                });
+            }
+        }
+        (max, scroll, body_view)
     };
+    app.reader_view = body_view;
     if let Some(reader) = app.reader.as_mut() {
         reader.scroll = scroll;
     }

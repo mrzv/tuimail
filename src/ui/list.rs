@@ -61,7 +61,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .take(height)
         .map(|(i, (item, members))| row(app, item, members, i == app.selected, focused, width, now))
         .collect();
-    if !app.list_click_blocked() {
+    if !app.mouse_blocked() {
         app.list_hit_area.set(Rect {
             height: lines.len() as u16,
             ..inner

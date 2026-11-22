@@ -33,6 +33,7 @@ use crate::settings::{AttachmentOpener, Settings};
 use crate::setup::{self, Setup};
 use crate::store::{self, Change, Changed, Flags, Folder, Known, Message, Role, Store, What};
 use crate::theme::{self, Colors};
+use crate::ui::reader::{BodySelection, BodyView};
 use crate::worker::{self, Endpoints, Request, State, Worker};
 use crate::{contacts, net, tags, text, tools};
 
@@ -150,21 +151,57 @@ enum TerminalRequest {
     Attachment(std::process::Command),
 }
 
-fn list_click(mouse: &MouseEvent) -> bool {
-    mouse.kind == MouseEventKind::Down(MouseButton::Left) && mouse.modifiers.is_empty()
+fn used_mouse_event(mouse: &MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => mouse.modifiers.is_empty(),
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct MouseFrames<T> {
+    list: T,
+    body: T,
+}
+
+impl MouseFrames<AtomicU64> {
+    fn load(&self) -> MouseFrames<u64> {
+        MouseFrames {
+            list: self.list.load(Ordering::Relaxed),
+            body: self.body.load(Ordering::Relaxed),
+        }
+    }
 }
 
 struct TerminalBatch {
     events: Vec<Event>,
-    mouse_frame: u64,
+    mouse_frames: MouseFrames<u64>,
 }
 
 impl TerminalBatch {
-    fn for_frame(mut self, current: u64) -> Vec<Event> {
-        if self.mouse_frame == 0 || self.mouse_frame != current {
-            self.events
-                .retain(|event| !matches!(event, Event::Mouse(_)));
-        }
+    fn for_frame(
+        mut self,
+        current: MouseFrames<u64>,
+        list: Rect,
+        body: Option<BodyView>,
+    ) -> Vec<Event> {
+        self.events.retain(|event| {
+            let Event::Mouse(mouse) = event else {
+                return true;
+            };
+            let pos = Position::new(mouse.column, mouse.row);
+            let (then, now) = if mouse.kind != MouseEventKind::Down(MouseButton::Left)
+                || body.is_some_and(|view| view.area.contains(pos))
+            {
+                (self.mouse_frames.body, current.body)
+            } else if list.contains(pos) {
+                (self.mouse_frames.list, current.list)
+            } else {
+                return false;
+            };
+            then != 0 && then == now
+        });
         self.events
     }
 }
@@ -173,7 +210,7 @@ impl TerminalBatch {
 /// leaves neither a reader nor an EventStream shutdown wake-up behind.
 struct TerminalEvents {
     events: tokio::sync::mpsc::Receiver<std::io::Result<TerminalBatch>>,
-    mouse_frame: Arc<AtomicU64>,
+    mouse_frames: Arc<MouseFrames<AtomicU64>>,
     reader: Option<std::thread::JoinHandle<()>>,
     finished: std::sync::mpsc::Receiver<()>,
 }
@@ -182,19 +219,18 @@ impl TerminalEvents {
     fn new() -> std::io::Result<Self> {
         let (tx, events) = tokio::sync::mpsc::channel(1);
         let (finished_tx, finished) = std::sync::mpsc::sync_channel(1);
-        let mouse_frame = Arc::new(AtomicU64::new(0));
-        let displayed = Arc::clone(&mouse_frame);
+        let mouse_frames = Arc::new(MouseFrames::default());
+        let displayed = Arc::clone(&mouse_frames);
         #[cfg(windows)]
         let console = Self::open_console()?;
         let reader = std::thread::Builder::new().spawn(move || {
-            let mut drained_frame = 0;
+            let mut drained = MouseFrames::default();
             while !tx.is_closed() {
                 // A bounded wait lets stop join without injecting a wake-up
                 // into Crossterm's shared reader.
-                let current = displayed.load(Ordering::Relaxed);
-                // After a redraw, consume buffered input without accepting
-                // clicks until the queue has emptied under the new mapping.
-                let wait = if drained_frame == current {
+                let current = displayed.load();
+                // Accept clicks for a new mapping only after its queue drains.
+                let wait = if drained == current {
                     Duration::from_millis(100)
                 } else {
                     Duration::ZERO
@@ -205,12 +241,12 @@ impl TerminalEvents {
                 let ready = crossterm::event::poll(wait);
                 let result = match ready {
                     Ok(false) => {
-                        drained_frame = current;
+                        drained = current;
                         continue;
                     }
                     Ok(true) => Self::read_waiting().map(|events| TerminalBatch {
                         events,
-                        mouse_frame: drained_frame,
+                        mouse_frames: drained,
                     }),
                     Err(e) => Err(e),
                 };
@@ -226,7 +262,7 @@ impl TerminalEvents {
         })?;
         Ok(Self {
             events,
-            mouse_frame,
+            mouse_frames,
             reader: Some(reader),
             finished,
         })
@@ -316,7 +352,7 @@ impl TerminalEvents {
             }
         }
         // Crossterm also captures motion; don't redraw for mouse events we don't use.
-        events.retain(|event| !matches!(event, Event::Mouse(mouse) if !list_click(mouse)));
+        events.retain(|event| !matches!(event, Event::Mouse(mouse) if !used_mouse_event(mouse)));
         Ok(events)
     }
 }
@@ -505,6 +541,8 @@ pub struct Reader {
     pub raw: Option<Arc<Vec<u8>>>,
     pub parsed: Option<Arc<Parsed>>,
     pub body: Option<Body>,
+    pub(crate) layout_generation: u64,
+    pub(crate) selection: Option<BodySelection>,
     /// The width `body` was laid out for.
     pub width: u16,
     /// A layout is being made (its number).
@@ -529,6 +567,26 @@ struct ReaderThread {
 impl Reader {
     pub fn key(&self) -> (usize, String, u32) {
         (self.account, self.folder.clone(), self.uid)
+    }
+
+    pub(crate) fn selectable_body(&self) -> Option<&Body> {
+        if self.pending.is_none() && self.error.is_none() {
+            self.body.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection
+            .zip(self.selectable_body())
+            .is_some_and(|(selection, body)| selection.has_text(body))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let body = self.selectable_body()?;
+        selection.has_text(body).then(|| selection.text(body))
     }
 
     fn is_message(&self, item: &Item) -> bool {
@@ -827,6 +885,7 @@ pub struct App {
     pub focus: Focus,
 
     pub reader: Option<Reader>,
+    pub(crate) reader_view: Option<BodyView>,
     /// The reader pane's width, from the last frame.
     pub reader_width: Cell<u16>,
     /// The window is wide enough to show the message beside the list.
@@ -1015,6 +1074,7 @@ impl App {
             sidebar_scroll: Cell::new(0),
             focus: Focus::List,
             reader: None,
+            reader_view: None,
             reader_width: Cell::new(80),
             wide: Cell::new(false),
             reader_rows: Cell::new(20),
@@ -1159,19 +1219,27 @@ impl App {
             self.check(i, true);
         }
         loop {
-            let previous = (self.list_hit_area.get(), self.list_scroll.get());
+            let list = (self.list_hit_area.get(), self.list_scroll.get());
+            let body = self.reader_view;
             terminal.draw(|frame| {
                 crate::ui::draw(frame, self);
-                let area = self.list_hit_area.get();
-                if area.is_empty() || (area, self.list_scroll.get()) != previous {
-                    // Don't associate clicks with a mapping while it is changing.
-                    keys.mouse_frame.store(0, Ordering::Relaxed);
+                // Invalidate only the pane whose mapping is changing.
+                if (self.list_hit_area.get(), self.list_scroll.get()) != list {
+                    keys.mouse_frames.list.store(0, Ordering::Relaxed);
+                }
+                if self.reader_view != body {
+                    keys.mouse_frames.body.store(0, Ordering::Relaxed);
+                    self.finish_body_drag();
                 }
             })?;
-            if !self.list_hit_area.get().is_empty() && keys.mouse_frame.load(Ordering::Relaxed) == 0
-            {
+            let frames = keys.mouse_frames.load();
+            if !self.list_hit_area.get().is_empty() && frames.list == 0 {
                 mouse_frame += 1;
-                keys.mouse_frame.store(mouse_frame, Ordering::Relaxed);
+                keys.mouse_frames.list.store(mouse_frame, Ordering::Relaxed);
+            }
+            if self.reader_view.is_some() && frames.body == 0 {
+                mouse_frame += 1;
+                keys.mouse_frames.body.store(mouse_frame, Ordering::Relaxed);
             }
             self.after_draw();
             if self.quit {
@@ -1199,7 +1267,11 @@ impl App {
             tokio::select! {
                 event = keys.events.recv() => match event {
                     Some(Ok(batch)) => self.on_terminal_events(
-                        batch.for_frame(keys.mouse_frame.load(Ordering::Relaxed)),
+                        batch.for_frame(
+                            keys.mouse_frames.load(),
+                            self.list_hit_area.get(),
+                            self.reader_view,
+                        ),
                     ),
                     Some(Err(_)) | None => self.quit = true,
                 },
@@ -1664,6 +1736,7 @@ impl App {
                     return;
                 }
                 reader.pending = None;
+                reader.layout_generation = generation;
                 reader.width = width;
                 match (parsed, body) {
                     (Some(parsed), Some(body)) => {
@@ -3047,6 +3120,8 @@ impl App {
             raw,
             parsed: None,
             body: None,
+            layout_generation: 0,
+            selection: None,
             width: 0,
             pending: None,
             scroll: thread.as_ref().map_or(0, |t| t.active),
@@ -3096,6 +3171,7 @@ impl App {
             return;
         };
         reader.pending = Some(generation);
+        reader.selection = None;
         let plain = reader.plain.unwrap_or(prefer_plain);
         let parsed_before = reader.parsed.clone();
         let tx = self.tx.clone();
@@ -5670,6 +5746,7 @@ impl App {
         if !writing && presses.len() < PASTED_KEYS {
             return events.into_iter().for_each(|event| self.on_terminal(event));
         }
+        self.finish_body_drag();
         for event in events
             .into_iter()
             .filter(|e| !matches!(e, Event::Key(_) | Event::Mouse(_)))
@@ -5710,8 +5787,15 @@ impl App {
     fn on_terminal(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.on_key(key),
-            Event::Mouse(mouse) if list_click(&mouse) => self.on_list_click(mouse),
-            Event::Resize(..) => self.list_hit_area.set(Rect::ZERO),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
+            Event::Resize(..) => {
+                self.list_hit_area.set(Rect::ZERO);
+                self.reader_view = None;
+                if let Some(reader) = self.reader.as_mut() {
+                    reader.selection = None;
+                }
+            }
+            Event::FocusLost => self.finish_body_drag(),
             // A paste never answers a question, nor changes what it's about.
             Event::Paste(_) if self.confirm.is_some() => {
                 self.info("Answer the question first: y, or any other key")
@@ -5750,7 +5834,19 @@ impl App {
         }
     }
 
-    pub(crate) fn list_click_blocked(&self) -> bool {
+    fn finish_body_drag(&mut self) {
+        if let Some(reader) = self.reader.as_mut()
+            && let Some(selection) = &mut reader.selection
+            && selection.dragging
+        {
+            selection.dragging = false;
+            if !reader.has_selection() {
+                reader.selection = None;
+            }
+        }
+    }
+
+    pub(crate) fn mouse_blocked(&self) -> bool {
         self.confirm.is_some()
             || self.prompt.is_some()
             || self.picker.is_some()
@@ -5759,14 +5855,53 @@ impl App {
             || self.composer.is_some()
     }
 
-    fn on_list_click(&mut self, mouse: MouseEvent) {
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.mouse_blocked() || !used_mouse_event(&mouse) {
+            return;
+        }
+        let pos = Position::new(mouse.column, mouse.row);
+        let view = self.reader_view.filter(|view| {
+            self.reader.as_ref().is_some_and(|r| {
+                r.layout_generation == view.generation && r.selectable_body().is_some()
+            })
+        });
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(view) = view.filter(|view| view.area.contains(pos))
+                    && let Some(reader) = self.reader.as_mut()
+                {
+                    reader.selection = Some(view.begin(pos));
+                    self.focus = Focus::Reader;
+                    self.pending_g = false;
+                    self.moved_at = None;
+                    return;
+                }
+                self.on_list_click(pos);
+            }
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(view) = view
+                    && let Some(reader) = self.reader.as_mut()
+                    && let Some(selection) = &mut reader.selection
+                    && selection.dragging
+                {
+                    selection.extend(view, pos);
+                    if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                        self.finish_body_drag();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_list_click(&mut self, pos: Position) {
         let area = self.list_hit_area.get();
-        if self.list_click_blocked() || !area.contains(Position::new(mouse.column, mouse.row)) {
+        if !area.contains(pos) {
             return;
         }
         self.pending_g = false;
         self.focus = Focus::List;
-        let row = self.list_scroll.get() + usize::from(mouse.row - area.y);
+        let row = self.list_scroll.get() + usize::from(pos.y - area.y);
         if row == self.selected {
             self.moved_at = Some(Instant::now());
         }
@@ -5783,6 +5918,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        self.finish_body_drag();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl
             && key.code == KeyCode::Char('c')
@@ -5977,6 +6113,12 @@ impl App {
             }
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Home => reader.scroll = 0,
+            KeyCode::Char('y') if key.modifiers.is_empty() => {
+                if let Some(text) = reader.selected_text() {
+                    self.copy(&text);
+                }
+            }
+            KeyCode::Esc if reader.has_selection() => reader.selection = None,
             KeyCode::Char('G') | KeyCode::End => reader.scroll = usize::MAX / 2,
             KeyCode::Char('J') | KeyCode::Char('n') => self.step_message(1),
             KeyCode::Char('K') | KeyCode::Char('p') => self.step_message(-1),
@@ -7835,16 +7977,154 @@ pub mod tests {
         // A queued click from the previous list must not pick the message now
         // occupying the same screen row, even if all the geometry is unchanged.
         let stale = TerminalBatch {
-            mouse_frame: 1,
+            mouse_frames: MouseFrames { list: 1, body: 0 },
             events: vec![click.clone()],
         };
-        app.on_terminal_events(stale.for_frame(2));
+        app.on_terminal_events(stale.for_frame(
+            MouseFrames { list: 2, body: 0 },
+            app.list_hit_area.get(),
+            None,
+        ));
         assert_eq!(app.selected_item().unwrap().key(), before);
 
         app.on_terminal_events(vec![click]);
         assert_eq!(app.focus, Focus::List);
         assert_eq!(app.selected_item().unwrap().key(), newest);
         assert!(app.reader.is_none(), "the click selects without opening");
+    }
+
+    #[tokio::test]
+    async fn mouse_drag_selects_only_visible_message_text() {
+        use crate::ui::tests::drawn;
+
+        let mut app = app();
+        with_mail(&mut app);
+        let i = app
+            .items
+            .iter()
+            .position(|it| it.message.summary.subject == "Design review notes")
+            .unwrap();
+        let (account, folder, uid) = app.items[i + 1].key();
+        app.store
+            .save_body(
+                &app.accounts[account].id,
+                &folder,
+                uid,
+                "Subject: Re: Design review notes\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                 \r\nAn 界 wide glyph\r\n\r\nSecond line"
+                    .as_bytes(),
+            )
+            .unwrap();
+        app.settings.threads_collapsed = true;
+        app.reload();
+        let i = app
+            .items
+            .iter()
+            .position(|it| {
+                it.account == account && it.message.folder == folder && it.message.uid == uid
+            })
+            .unwrap();
+        app.select(app.row_for(i));
+        app.open_selected(true);
+        app.step_thread(1);
+        wait_for_layout(&mut app).await;
+        app.on_key(key(KeyCode::End));
+        let before = drawn(&mut app, 99, 11);
+        let area = app.reader_view.unwrap().area;
+        let start = (area.x + 4, area.y); // The second cell of 界.
+        let end = (area.x + 5, area.y + 2);
+        assert_eq!(before[(start.0 - 1, start.1)].symbol(), "界");
+        assert_eq!(before[end].symbol(), "d");
+        let mouse = |kind, (column, row)| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let press = mouse(MouseEventKind::Down(MouseButton::Left), (end.0 + 1, end.1));
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), start);
+        let release = mouse(MouseEventKind::Up(MouseButton::Left), start);
+
+        app.on_terminal_events(vec![press]);
+        // A background list reload invalidates queued list clicks, not this drag.
+        app.reload();
+        drawn(&mut app, 99, 11);
+        let queued = TerminalBatch {
+            mouse_frames: MouseFrames { list: 1, body: 2 },
+            events: vec![drag, release.clone()],
+        };
+        app.on_terminal_events(queued.for_frame(
+            MouseFrames { list: 3, body: 2 },
+            app.list_hit_area.get(),
+            app.reader_view,
+        ));
+        // A press from the old reader mapping now lands above the body.
+        let stale = TerminalBatch {
+            mouse_frames: MouseFrames { list: 3, body: 1 },
+            events: vec![mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                (area.x, area.y - 1),
+            )],
+        };
+        app.on_terminal_events(stale.for_frame(
+            MouseFrames { list: 3, body: 2 },
+            app.list_hit_area.get(),
+            app.reader_view,
+        ));
+        let selected = drawn(&mut app, 99, 11);
+        assert_eq!(
+            app.reader
+                .as_ref()
+                .and_then(Reader::selected_text)
+                .as_deref(),
+            Some("界 wide glyph\n\nSecond")
+        );
+        for pos in [(start.0 - 1, start.1), end] {
+            assert_eq!(selected[pos].bg, app.colors.selected);
+        }
+        for pos in [
+            (area.x, area.y - 1),
+            (start.0 - 2, start.1),
+            (end.0 + 1, end.1),
+        ] {
+            assert_eq!(selected[pos], before[pos]);
+        }
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Reader);
+        let cleared = drawn(&mut app, 99, 11);
+        assert_eq!(cleared[end], before[end]);
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Char('?'))),
+            mouse(MouseEventKind::Down(MouseButton::Left), start),
+            mouse(MouseEventKind::Drag(MouseButton::Left), end),
+        ]);
+        app.on_key(key(KeyCode::Esc));
+        drawn(&mut app, 99, 11);
+        app.on_terminal_events(vec![release]);
+        assert_eq!(app.reader.as_ref().and_then(Reader::selected_text), None);
+
+        let drag_between = |app: &mut App, from, to| {
+            app.on_terminal_events(vec![
+                mouse(MouseEventKind::Down(MouseButton::Left), from),
+                mouse(MouseEventKind::Drag(MouseButton::Left), to),
+                mouse(MouseEventKind::Up(MouseButton::Left), to),
+            ]);
+        };
+        drag_between(&mut app, (area.x + 1, area.y), (area.x + 2, area.y));
+        assert_eq!(
+            app.reader
+                .as_ref()
+                .and_then(Reader::selected_text)
+                .as_deref(),
+            Some("n")
+        );
+        drag_between(&mut app, (area.x + 16, area.y), (area.x + 17, area.y + 1));
+        assert_eq!(app.reader.as_ref().and_then(Reader::selected_text), None);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::List);
     }
 
     #[tokio::test]

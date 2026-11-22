@@ -4,7 +4,7 @@
 
 mod composer;
 mod list;
-mod reader;
+pub(crate) mod reader;
 mod setup;
 mod sidebar;
 
@@ -32,6 +32,7 @@ const WIDE: u16 = 100;
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.list_hit_area.set(Rect::ZERO);
+    app.reader_view = None;
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
     let [body, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
@@ -683,7 +684,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 33] = [
+const HELP: [(&str, &str); 34] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
@@ -703,11 +704,12 @@ const HELP: [(&str, &str); 33] = [
         "mark a message  /  all; actions take the marked",
     ),
     ("/", "search: here, and the server's folder"),
-    ("Esc", "end the search, unmark, back"),
+    ("Esc", "clear selection, end search, unmark, back"),
     ("v", "collapse or expand the conversation (list)"),
     ("J  K", "next, previous list row (reading)"),
     ("[  ]", "open the newer, older message in a conversation"),
     ("Space  b", "a page down, up (reading)"),
+    ("Drag  y", "select message text with the mouse, y to copy"),
     ("o", "the message's links: open, or y copy"),
     ("A", "attachments: open, v all with viewer, s save"),
     ("H", "its HTML or plain text"),

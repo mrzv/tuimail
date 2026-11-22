@@ -125,6 +125,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `J` / `K` | Reading: next / previous list row |
 | `[` / `]` | Reading a conversation: open the newer / older message |
 | `Space` / `b` | Reading: a page down / up |
+| Left drag over message text, then `y` | Select the visible text and copy it to the clipboard; `Esc` clears the selection |
 | `o` / `A` | Reading: links (`Enter` open, `y` copy) / attachments (`Enter` open, `v` all with viewer, `s` save) |
 | `H` | Reading: HTML or plain text |
 | `U` | Unsubscribe from a mailing list |
