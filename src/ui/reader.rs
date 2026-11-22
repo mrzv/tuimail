@@ -45,6 +45,16 @@ impl BodyView {
         }
     }
 
+    pub(crate) fn web_link_at(self, body: &Body, pos: Position) -> Option<&str> {
+        if !self.area.contains(pos) {
+            return None;
+        }
+        let (row, column) = self.cell(pos);
+        let (_, _, _, role) = visible_glyphs(&body.lines[row], usize::from(self.area.width))
+            .find(|&(_, end, _, _)| column < end)?;
+        web_link(body, role.link_index()?)
+    }
+
     pub fn begin(self, pos: Position) -> BodySelection {
         let anchor = self.cell(pos);
         BodySelection {
@@ -52,6 +62,7 @@ impl BodyView {
             end: anchor,
             width: usize::from(self.area.width),
             dragging: true,
+            moved: false,
         }
     }
 }
@@ -62,11 +73,19 @@ pub(crate) struct BodySelection {
     end: BodyCell,
     width: usize,
     pub dragging: bool,
+    moved: bool,
 }
 
 impl BodySelection {
-    pub fn extend(&mut self, view: BodyView, pos: Position) {
+    pub fn drag(&mut self, view: BodyView, pos: Position) {
+        self.moved = true;
+        self.release(view, pos);
+    }
+
+    /// A drag that returns to its starting cell is still not a click.
+    pub fn release(&mut self, view: BodyView, pos: Position) -> bool {
         self.end = view.cell(pos);
+        !self.moved && self.anchor == self.end
     }
 
     pub fn has_text(self, body: &Body) -> bool {
@@ -141,7 +160,7 @@ fn body_line<'a>(segs: &'a [Seg], c: &Colors) -> Line<'a> {
             Role::Text => Style::new().fg(c.text),
             Role::Quote(depth) if depth % 2 == 1 => Style::new().fg(c.quote),
             Role::Quote(_) => Style::new().fg(c.quote_deeper),
-            Role::Link(_) => Style::new().fg(c.link).add_modifier(Modifier::UNDERLINED),
+            Role::Link(_) | Role::ImageLink(_) => Style::new().fg(c.link),
             Role::Bold => Style::new().fg(c.text).add_modifier(Modifier::BOLD),
             Role::Italic => Style::new().fg(c.text).add_modifier(Modifier::ITALIC),
             Role::Code => Style::new().fg(c.ok),
@@ -491,6 +510,16 @@ pub(crate) fn hyperlinks(frame: &mut Frame, app: &App) {
     }
 }
 
+fn web_link(body: &Body, index: usize) -> Option<&str> {
+    let url = body.links.get(index)?.as_str();
+    // Keep mailto in the composer via the link picker.
+    (mail::usable_link(url)
+        && !url
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("mailto:")))
+    .then_some(url)
+}
+
 fn link_body(buffer: &mut Buffer, view: BodyView, body: &Body) {
     if body.links.is_empty() {
         return;
@@ -502,20 +531,16 @@ fn link_body(buffer: &mut Buffer, view: BodyView, body: &Body) {
     {
         let y = view.area.y + row as u16;
         let mut glyphs = visible_glyphs(line, usize::from(view.area.width)).peekable();
-        while let Some((start, mut end, glyph, Role::Link(index))) =
-            glyphs.find(|item| matches!(item.3, Role::Link(_)))
+        while let Some((start, mut end, glyph, index)) = glyphs
+            .find_map(|(start, end, glyph, role)| Some((start, end, glyph, role.link_index()?)))
         {
-            let Some(url) = body.links.get(index).filter(|url| {
-                // Keep mailto in the composer via the link picker.
-                // Kitty truncates its 2048-byte ID-plus-URL storage; leave
-                // room for the ID and keep longer links in the picker.
-                url.len() <= 2000
-                    && mail::usable_link(url)
-                    && !url
-                        .get(..7)
-                        .is_some_and(|s| s.eq_ignore_ascii_case("mailto:"))
-            }) else {
-                while glyphs.next_if(|item| item.3 == Role::Link(index)).is_some() {}
+            // Kitty truncates its 2048-byte ID-plus-URL storage; leave room
+            // for the ID. A regular click can still confirm a longer URL.
+            let Some(url) = web_link(body, index).filter(|url| url.len() <= 2000) else {
+                while glyphs
+                    .next_if(|item| item.3.link_index() == Some(index))
+                    .is_some()
+                {}
                 continue;
             };
 
@@ -529,7 +554,8 @@ fn link_body(buffer: &mut Buffer, view: BodyView, body: &Body) {
             );
             symbol.push_str(glyph);
             while let Some((_, next_end, glyph, _)) = glyphs.next_if(|&(next, _, _, role)| {
-                role == Role::Link(index) && buffer[(view.area.x + next as u16, y)].style() == style
+                role.link_index() == Some(index)
+                    && buffer[(view.area.x + next as u16, y)].style() == style
             }) {
                 end = next_end;
                 symbol.push_str(glyph);
@@ -563,7 +589,7 @@ mod tests {
     #[test]
     fn terminal_hyperlinks_follow_the_visible_text_and_clear_on_redraw() {
         let body = mail::render_html(
-            "<a href='https://one.example/path'><strong>界Web</strong></a> \
+            "<a href=' https://one.example/path '><strong>界Web</strong></a> \
              <a href='mailto:a@example.org'>mail</a>",
             40,
         );

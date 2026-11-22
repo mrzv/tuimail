@@ -126,6 +126,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `[` / `]` | Reading a conversation: open the newer / older message |
 | `Space` / `b` | Reading: a page down / up |
 | Left drag over message text, then `y` | Select the visible text and copy it to the clipboard; `Esc` clears the selection |
+| Left click on a web link | Inspect the destination and confirm before opening |
 | `Ctrl`+`Shift`+left click on a web link | Open the link in Kitty (default binding); `o` shows the destination first and works in any terminal |
 | `o` / `A` | Reading: links (`Enter` open, `y` copy) / attachments (`Enter` open, `v` all with viewer, `s` save) |
 | `H` | Reading: HTML or plain text |
@@ -135,7 +136,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `?` / `O` | Every key / the settings and themes |
 | `q` | Quit |
 
-Web links use terminal hyperlinks (OSC 8). Kitty can ask before opening them with `allow_hyperlinks ask`, or show the target on hover with `show_hyperlink_targets always`. Use `o` for long URLs, or for `mailto:` links to write the message in tuimail. The demo does not emit terminal hyperlinks.
+Web links are blue, without an underline, in both plain-text and HTML views. HTML links on images can be clicked on their alt text; images are never fetched. A regular click works even in terminals without OSC 8 support. For Kitty's modifier-click, use `allow_hyperlinks ask` to confirm first, `show_hyperlink_targets always` to show the target on hover, or `url_style none` to disable Kitty's own hover underline. Use a regular click or `o` for long URLs, and `o` for `mailto:` links to write the message in tuimail. The demo does not emit terminal hyperlinks.
 Links split by `format=flowed` email wrapping keep their full destination on every displayed row. Literal line breaks in fixed plain text are not joined.
 
 Open a collapsed conversation to see its messages newest first, with only the newest body expanded. List actions target the newest message, not the whole conversation; actions in the reader target the message you've opened.

@@ -700,11 +700,22 @@ pub enum Role {
     Quote(u8),
     /// Link number n (into [`Body::links`]).
     Link(usize),
+    /// Alt text of a linked image, not a label for the link picker.
+    ImageLink(usize),
     Bold,
     Italic,
     Code,
     /// What tuimail adds: "[image: …]", "(cut here)".
     Note,
+}
+
+impl Role {
+    pub(crate) fn link_index(self) -> Option<usize> {
+        match self {
+            Self::Link(index) | Self::ImageLink(index) => Some(index),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1123,8 +1134,11 @@ pub fn render_html(html: &str, width: usize) -> Body {
             let mut image = false;
             for annotation in &piece.tag {
                 role = match annotation {
-                    RichAnnotation::Link(url) if usable_link(url) => {
-                        link = body.link(url);
+                    RichAnnotation::Link(url) => {
+                        let url = url.trim_matches([' ', '\t', '\n', '\r', '\x0c']);
+                        if usable_link(url) {
+                            link = body.link(url);
+                        }
                         role
                     }
                     RichAnnotation::Image(_) => {
@@ -1137,13 +1151,12 @@ pub fn render_html(html: &str, width: usize) -> Body {
                     _ => role,
                 };
             }
-            // Links keep their role through inline styling, but an image's
-            // alt text is a note, not the link's label.
-            if image {
-                role = Role::Note;
-            } else if let Some(n) = link {
-                role = Role::Link(n);
-            }
+            role = match (link, image) {
+                (Some(n), true) => Role::ImageLink(n),
+                (Some(n), false) => Role::Link(n),
+                (None, true) => Role::Note,
+                (None, false) => role,
+            };
             match segs.last_mut() {
                 Some(last) if last.role == role => last.text.push_str(&text),
                 _ => segs.push(Seg { text, role }),

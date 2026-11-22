@@ -778,9 +778,10 @@ pub enum Confirm {
         opener: Option<AttachmentOpener>,
     },
     RemoveAccount(usize),
-    /// `U`'s web page, shown before it opens.
+    /// A clicked web link or the page behind `U`, shown before opening.
     OpenLink {
         url: String,
+        unsubscribe: bool,
     },
     /// Quit with changes not yet made on the server.
     Quit {
@@ -926,6 +927,8 @@ pub struct App {
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
     confirm_at: Instant,
+    /// The current link question's host fit in its last rendered frame.
+    pub(crate) link_confirm_visible: bool,
     /// `d`'s questions still to ask: one each account and folder.
     deletes_waiting: VecDeque<Confirm>,
     pub help: Option<HelpMenu>,
@@ -1098,6 +1101,7 @@ impl App {
             picker: None,
             confirm: None,
             confirm_at: Instant::now(),
+            link_confirm_visible: false,
             deletes_waiting: VecDeque::new(),
             help: None,
             status: None,
@@ -5561,7 +5565,10 @@ impl App {
             composer.complete_from(&self.accounts[account].id, &self.store);
             self.composer = Some(composer);
         } else {
-            self.confirm(Confirm::OpenLink { url: link });
+            self.confirm(Confirm::OpenLink {
+                url: link,
+                unsubscribe: true,
+            });
         }
     }
 
@@ -5790,6 +5797,7 @@ impl App {
             Event::Key(key) => self.on_key(key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Resize(..) => {
+                self.link_confirm_visible = false;
                 self.list_hit_area.set(Rect::ZERO);
                 self.reader_view = None;
                 if let Some(reader) = self.reader.as_mut() {
@@ -5885,9 +5893,25 @@ impl App {
                     && let Some(selection) = &mut reader.selection
                     && selection.dragging
                 {
-                    selection.extend(view, pos);
-                    if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
-                        self.finish_body_drag();
+                    if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
+                        selection.drag(view, pos);
+                        return;
+                    }
+                    let clicked = selection.release(view, pos);
+                    let url = if clicked && mouse.modifiers.is_empty() {
+                        reader
+                            .selectable_body()
+                            .and_then(|body| view.web_link_at(body, pos))
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    self.finish_body_drag();
+                    if let Some(url) = url {
+                        self.confirm(Confirm::OpenLink {
+                            url,
+                            unsubscribe: false,
+                        });
                     }
                 }
             }
@@ -6525,6 +6549,7 @@ impl App {
     fn confirm(&mut self, confirm: Confirm) {
         self.confirm = Some(confirm);
         self.confirm_at = Instant::now();
+        self.link_confirm_visible = false;
     }
 
     /// `y` answers yes; for an unsaved message, `n` discards it; any other
@@ -6586,7 +6611,10 @@ impl App {
             Confirm::OpenAttachments { files, opener } if yes => {
                 self.extract(files, true, true, opener)
             }
-            Confirm::OpenLink { url } if yes => self.open_link(&url),
+            Confirm::OpenLink { url, .. } if yes && self.link_confirm_visible => {
+                self.open_link(&url)
+            }
+            confirm @ Confirm::OpenLink { .. } if yes => self.confirm = Some(confirm),
             Confirm::RemoveAccount(i) if yes => self.remove_account(i),
             Confirm::Quit { .. } if yes => self.quit = true,
             confirm if early => self.confirm = Some(confirm),
@@ -7215,13 +7243,29 @@ pub fn link_host(url: &str) -> String {
         .chars()
         .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
         .collect();
-    let rest = url.split_once(':').map_or(url.as_str(), |(_, r)| r);
+    let (scheme, rest) = url.split_once(':').unwrap_or(("", url.as_str()));
     let rest = rest.trim_start_matches(['/', '\\']);
-    let host = rest.split(['/', '\\', '?', '#']).next().unwrap_or(rest);
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or(rest);
+    let web = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http");
+    let (host, port) = if web {
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        // Keep an IPv6 literal intact. A numeric port may be padded with
+        // arbitrarily many zeroes and must not crowd out the hostname.
+        authority
+            .rsplit_once(':')
+            .filter(|(host, _)| !host.starts_with('[') || host.ends_with(']'))
+            .map_or((authority, ""), |(host, port)| (host, port))
+    } else {
+        (authority, "")
+    };
     // Then `%XX` decoded and letters mapped as IDNA maps them (NFKC, lower
     // case): `%2E`, `․` and `﹒` are all a dot to the browser, so here.
     let host = percent_decoded(host);
-    let host = host.rsplit('@').next().unwrap_or(&host);
+    let host = if web {
+        host.as_str()
+    } else {
+        host.rsplit('@').next().unwrap_or(&host)
+    };
     let host = text::one_line(host, host.len());
     let host = host.nfkc().collect::<String>().to_lowercase();
     // Letters from other alphabets are shown as the browser sends them
@@ -7234,13 +7278,28 @@ pub fn link_host(url: &str) -> String {
             .collect::<Vec<_>>()
             .join(".")
     };
-    // A long host keeps its end: the site it belongs to is there.
+    // A long hostname keeps its end: the site it belongs to is there.
     let count = host.chars().count();
-    if count <= 80 {
+    let mut host = if count <= 80 {
         host
     } else {
         format!("…{}", host.chars().skip(count - 79).collect::<String>())
+    };
+    if !port.is_empty() {
+        use std::fmt::Write as _;
+        host.push(':');
+        let digits = port.trim_start_matches('0');
+        if digits.is_empty() {
+            host.push('0');
+        } else if digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(number) = digits.parse::<u16>()
+        {
+            let _ = write!(host, "{number}");
+        } else {
+            host.push('?');
+        }
     }
+    host
 }
 
 /// A host's label as DNS has it: punycode for one with letters outside
@@ -7768,6 +7827,16 @@ pub mod tests {
             "{host}"
         );
         assert_eq!(host.chars().count(), 80);
+        let padded = "0".repeat(120);
+        assert_eq!(
+            link_host(&format!("https://target.example:{padded}443/")),
+            "target.example:443"
+        );
+        assert_eq!(
+            link_host(&format!("https://[2001:db8::1]:{padded}8443/")),
+            "[2001:db8::1]:8443"
+        );
+        assert_eq!(link_host("https://[2001:db8::1]/"), "[2001:db8::1]");
     }
 
     #[test]
@@ -8126,6 +8195,81 @@ pub mod tests {
         assert_eq!(app.reader.as_ref().and_then(Reader::selected_text), None);
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.focus, Focus::List);
+    }
+
+    #[tokio::test]
+    async fn mouse_click_confirms_the_target_of_a_linked_html_image() {
+        use crate::ui::tests::drawn;
+        use ratatui::style::Modifier;
+
+        let mut app = app();
+        with_mail(&mut app);
+        let (account, folder, uid) = app.items[0].key();
+        app.store
+            .save_body(
+                &app.accounts[account].id,
+                &folder,
+                uid,
+                b"From: sender@example.org\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+                  <a href=' https://long-subdomain-for-the-fixture.target.example/receipt '>\
+                  <img src='https://tracker.example/counter' alt='Receipt'></a>",
+            )
+            .unwrap();
+        open_first(&mut app).await;
+        let frame = drawn(&mut app, 120, 30);
+        let area = app.reader_view.unwrap().area;
+        let (column, row) = (area.top()..area.bottom())
+            .flat_map(|y| (area.left()..area.right()).map(move |x| (x, y)))
+            .find(|&pos| frame[pos].symbol() == "R")
+            .unwrap();
+        assert_eq!(frame[(column, row)].fg, app.colors.link);
+        assert!(!frame[(column, row)].modifier.contains(Modifier::UNDERLINED));
+
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), column);
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), column + 1);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), column);
+        app.on_terminal_events(vec![down.clone(), drag, up.clone()]);
+        assert!(app.confirm.is_none(), "dragging back is not a click");
+        app.on_terminal_events(vec![down, up]);
+        let prompt = crate::ui::tests::screen(&mut app, 120, 30);
+        assert!(prompt.contains("Open this link?"), "{prompt}");
+        assert!(
+            prompt.contains("https://long-subdomain-for-the-fixture.target.example/receipt"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("tracker.example"), "{prompt}");
+
+        let compact = crate::ui::tests::screen(&mut app, 32, 5);
+        assert!(compact.contains("target.example"), "{compact}");
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_terminal(Event::Resize(12, 4));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(
+            app.confirm.is_some(),
+            "resize invalidates the rendered host"
+        );
+        assert!(app.status.is_none());
+        crate::ui::tests::drawn(&mut app, 12, 4);
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.confirm.is_some(), "host is clipped");
+        assert!(app.status.is_none());
+        crate::ui::tests::drawn(&mut app, 32, 5);
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.confirm.is_none());
+        assert!(
+            app.status
+                .unwrap()
+                .text
+                .starts_with("Would open https://long-subdomain-for-the-fixture.target.example")
+        );
     }
 
     #[tokio::test]

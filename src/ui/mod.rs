@@ -511,10 +511,14 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The question waiting for `y`, in a popup in the middle.
-fn confirm(frame: &mut Frame, app: &App, area: Rect) {
+fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = &app.colors;
     let Some(confirm) = &app.confirm else {
         return;
+    };
+    let url = match confirm {
+        Confirm::OpenLink { url, .. } => Some(url.as_str()),
+        _ => None,
     };
     let (title, text, hint) = match confirm {
         Confirm::Agent { id } => {
@@ -626,14 +630,14 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
                 " `y` open · any other key cancels ",
             )
         }
-        Confirm::OpenLink { url } => (
-            " Unsubscribe? ",
-            format!(
-                "Open the list's unsubscribe page on {}?\n  {}",
-                fit_middle(&crate::app::link_host(url), 50),
-                fit_middle(url, 60)
-            ),
-            " `y` open · any other key cancels ",
+        Confirm::OpenLink { url, unsubscribe } => (
+            if *unsubscribe {
+                " Unsubscribe? "
+            } else {
+                " Open this link? "
+            },
+            crate::app::link_host(url),
+            " `y` open · `Esc` cancel ",
         ),
         Confirm::Quit { waiting } => (
             " Quit? ",
@@ -656,13 +660,33 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
         ),
     };
     let hint_width = cols(&hint.replace('`', ""));
-    let width = (cols(&text).max(hint_width).max(cols(title)) + 6)
+    let url_width = url.map_or(0, |url| cols(url).min(60));
+    let width = (cols(&text).max(url_width).max(hint_width).max(cols(title)) + 6)
         .min(70)
         .min(usize::from(area.width)) as u16;
+    let room = usize::from(width.saturating_sub(4));
     // Wrapped by the columns ratatui draws (an agent's name of halfwidth
     // sound marks would otherwise push its question out of the box).
-    let wrapped = crate::text::wrap(&text, usize::from(width).saturating_sub(4));
-    let height = (wrapped.len() as u16 + 4).min(area.height);
+    let mut wrapped = crate::text::wrap(&text, room);
+    let (height, hint) = if url.is_some() {
+        // A short terminal gets the host first, without a blank spacer.
+        // Never accept y when a resize or clipping hid the host.
+        app.link_confirm_visible =
+            room != 0 && !text.is_empty() && wrapped.len() + 2 <= usize::from(area.height);
+        if !app.link_confirm_visible {
+            wrapped = crate::text::wrap("Resize to see the destination", room);
+        }
+        (
+            (wrapped.len() as u16 + 3).min(area.height),
+            if app.link_confirm_visible {
+                hint
+            } else {
+                " Esc cancel "
+            },
+        )
+    } else {
+        ((wrapped.len() as u16 + 4).min(area.height), hint)
+    };
     let popup = centered(area, width, height);
     frame.render_widget(Clear, popup);
     let block = bordered()
@@ -675,16 +699,28 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::new().bg(c.panel));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let mut lines = vec![Line::default()];
+    let mut lines = Vec::new();
+    if url.is_none() {
+        lines.push(Line::default());
+    }
     lines.extend(
         wrapped
             .into_iter()
             .map(|l| Line::from(Span::styled(format!(" {l}"), Style::new().fg(c.text)))),
     );
+    if let Some(url) = url
+        && app.link_confirm_visible
+        && lines.len() < usize::from(inner.height)
+    {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", fit_middle(url, room)),
+            Style::new().fg(c.text),
+        )));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 35] = [
+const HELP: [(&str, &str); 36] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
@@ -710,6 +746,7 @@ const HELP: [(&str, &str); 35] = [
     ("[  ]", "open the newer, older message in a conversation"),
     ("Space  b", "a page down, up (reading)"),
     ("Drag  y", "select message text with the mouse, y to copy"),
+    ("Click", "show a web link's destination before opening"),
     ("Ctrl-Shift-click", "open a web link in Kitty"),
     ("o", "the message's links: open, or y copy"),
     ("A", "attachments: open, v all with viewer, s save"),
