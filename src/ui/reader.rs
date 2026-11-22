@@ -250,13 +250,28 @@ fn thread_header(item: &Item, active: bool, width: usize, now: i64, c: &Colors) 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
     let focused = app.focus == Focus::Reader;
+    let reader = app.reader.as_ref();
+    let (body, error) = reader
+        .map(|r| (r.body.as_ref(), r.error.as_ref()))
+        .unwrap_or_default();
     let mut block = bordered().border_style(border(focused, &c));
+    // Label the body on screen, not the preference for the next layout.
+    if let (Some(body), None) = (body, error)
+        && let Some(parsed) = reader.and_then(|r| r.parsed.as_deref())
+        && (parsed.text.is_some() || parsed.html.is_some())
+    {
+        let label = if body.from_html {
+            " HTML "
+        } else {
+            " Plain text "
+        };
+        if label.len() + 2 <= usize::from(area.width) {
+            let title = Span::styled(label, Style::new().fg(c.subtext));
+            block = block.title_top(Line::from(title).right_aligned());
+        }
+    }
     if focused {
-        let hint = if app
-            .reader
-            .as_ref()
-            .is_some_and(crate::app::Reader::has_selection)
-        {
+        let hint = if reader.is_some_and(crate::app::Reader::has_selection) {
             " `y` copy selection · `Esc` clear "
         } else if app.reader_thread().is_some() {
             " `[ ]` newer/older reply "
@@ -276,7 +291,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.reader_width
         .set(text_area.width.saturating_sub(1).max(20));
     app.reader_rows.set(inner.height);
-    let Some(reader) = app.reader.as_ref() else {
+    let Some(reader) = reader else {
         let lines = vec![
             Line::default(),
             Line::from(Span::styled(
@@ -407,7 +422,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::new().fg(c.border),
     )));
     let mut body_lines = [].as_slice();
-    match (&reader.body, &reader.error) {
+    match (body, error) {
         (_, Some(error)) => {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -415,16 +430,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(c.red),
             )));
         }
-        (Some(body), None) => {
-            if body.from_html {
-                lines.push(Line::from(Span::styled(
-                    fit("HTML as text, nothing fetched · H plain text", width),
-                    Style::new().fg(c.dim),
-                )));
-                lines.push(Line::default());
-            }
-            body_lines = &body.lines;
-        }
+        (Some(body), None) => body_lines = &body.lines,
         (None, None) => {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -502,8 +508,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::Focus;
-    use crate::app::tests::{app, open_first, with_mail};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::tests::{app, open_first, wait_for_layout, with_mail};
+    use crate::app::{App, Focus};
     use crate::store::Flags;
     use crate::ui::tests::screen;
 
@@ -603,6 +611,51 @@ mod tests {
         // Narrow: the reader takes the window, then Esc goes back.
         let shown = screen(&mut app, 60, 30);
         assert!(shown.contains("Are we still on"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn the_border_tracks_the_body_shown_when_switching_formats() {
+        let mut app = app();
+        with_mail(&mut app);
+        let (account, folder, uid) = app.items[0].key();
+        let raw = b"From: sender@example.org\r\nMIME-Version: 1.0\r\n\
+                    Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+                    --alt\r\nContent-Type: text/plain\r\n\r\nPlain version.\r\n\
+                    --alt\r\nContent-Type: text/html\r\n\r\n<p>HTML version.</p>\r\n\
+                    --alt--\r\n";
+        app.store
+            .save_body(&app.accounts[account].id, &folder, uid, raw)
+            .unwrap();
+        open_first(&mut app).await;
+
+        let check = |app: &mut App, label: &str, text: &str| {
+            let shown = screen(app, 60, 22);
+            let top = shown.lines().next().unwrap();
+            assert!(top.ends_with(label), "{top}");
+            assert!(shown.contains(text), "{shown}");
+        };
+        check(&mut app, " HTML ╮", "HTML version.");
+        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        check(&mut app, " HTML ╮", "HTML version.");
+        wait_for_layout(&mut app).await;
+        check(&mut app, " Plain text ╮", "Plain version.");
+    }
+
+    #[tokio::test]
+    async fn attachment_only_messages_have_no_format_label() {
+        let shown = reading(
+            "From: sender@example.org\r\nMIME-Version: 1.0\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=document.bin",
+        )
+        .await;
+        assert!(shown.contains("document.bin"), "{shown}");
+        assert!(shown.contains("(no text)"), "{shown}");
+        let top = shown.lines().next().unwrap();
+        assert!(
+            !top.contains(" Plain text ") && !top.contains(" HTML "),
+            "{top}"
+        );
     }
 
     #[tokio::test]
