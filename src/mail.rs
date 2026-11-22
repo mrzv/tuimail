@@ -1135,17 +1135,30 @@ pub fn render_html(html: &str, width: usize) -> Body {
                 continue;
             }
             let mut role = Role::Text;
+            let mut link = None;
+            let mut image = false;
             for annotation in &piece.tag {
                 role = match annotation {
                     RichAnnotation::Link(url) if usable_link(url) => {
-                        body.link(url).map_or(role, Role::Link)
+                        link = body.link(url);
+                        role
                     }
-                    RichAnnotation::Image(_) => Role::Note,
+                    RichAnnotation::Image(_) => {
+                        image = true;
+                        role
+                    }
                     RichAnnotation::Strong => Role::Bold,
                     RichAnnotation::Emphasis => Role::Italic,
                     RichAnnotation::Code | RichAnnotation::Preformat(_) => Role::Code,
                     _ => role,
                 };
+            }
+            // Links keep their role through inline styling, but an image's
+            // alt text is a note, not the link's label.
+            if image {
+                role = Role::Note;
+            } else if let Some(n) = link {
+                role = Role::Link(n);
             }
             match segs.last_mut() {
                 Some(last) if last.role == role => last.text.push_str(&text),
@@ -1174,8 +1187,10 @@ pub fn render_html(html: &str, width: usize) -> Body {
 /// A link tuimail will offer to open: http, https or mailto, no spaces or
 /// control characters, not absurdly long.
 pub fn usable_link(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:"))
+    let (scheme, rest) = url.split_once(':').unwrap_or_default();
+    (scheme.eq_ignore_ascii_case("mailto")
+        || (rest.starts_with("//")
+            && (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))))
         && url.len() <= 4096
         && !url
             .chars()

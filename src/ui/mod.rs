@@ -684,7 +684,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 34] = [
+const HELP: [(&str, &str); 35] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
@@ -710,6 +710,7 @@ const HELP: [(&str, &str); 34] = [
     ("[  ]", "open the newer, older message in a conversation"),
     ("Space  b", "a page down, up (reading)"),
     ("Drag  y", "select message text with the mouse, y to copy"),
+    ("Ctrl-Shift-click", "open a web link in Kitty"),
     ("o", "the message's links: open, or y copy"),
     ("A", "attachments: open, v all with viewer, s save"),
     ("H", "its HTML or plain text"),

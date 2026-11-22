@@ -1,10 +1,12 @@
 //! The message being read: its subject and who it's from and to, its
 //! attachments, then its text, scrolled.
 
+use std::fmt::Write;
+use std::num::NonZeroU16;
 use std::ops::Range;
 
 use ratatui::Frame;
-use ratatui::buffer::CellWidth;
+use ratatui::buffer::{Buffer, CellDiffOption, CellWidth};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -111,21 +113,26 @@ fn selected_glyphs(
     width: usize,
     columns: Range<usize>,
 ) -> impl Iterator<Item = (usize, &str)> {
+    visible_glyphs(line, width)
+        .take_while(move |&(start, _, _, _)| start < columns.end)
+        .filter(move |&(_, end, _, _)| end > columns.start && !columns.is_empty())
+        .map(|(start, _, glyph, _)| (start, glyph))
+}
+
+fn visible_glyphs(line: &[Seg], width: usize) -> impl Iterator<Item = (usize, usize, &str, Role)> {
     let mut column = 0;
     line.iter()
-        .flat_map(|seg| seg.text.graphemes(true))
-        .filter_map(move |glyph| {
+        .flat_map(|seg| seg.text.graphemes(true).map(|glyph| (glyph, seg.role)))
+        .filter_map(move |(glyph, role)| {
             let w = usize::from(glyph.cell_width());
             if w == 0 || w > width || glyph.contains(char::is_control) {
                 return None;
             }
             let start = column;
             column += w;
-            Some((start, column, glyph))
+            Some((start, column, glyph, role))
         })
-        .take_while(move |&(start, end, _)| start < columns.end && end <= width)
-        .filter(move |&(_, end, _)| end > columns.start && !columns.is_empty())
-        .map(|(start, _, glyph)| (start, glyph))
+        .take_while(move |&(_, end, _, _)| end <= width)
 }
 
 fn body_line<'a>(segs: &'a [Seg], c: &Colors) -> Line<'a> {
@@ -470,12 +477,139 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     scrollbar(frame, area, max, scroll, &c);
 }
 
+/// Add terminal-only metadata after drawing, using the same body and viewport
+/// as mouse selection. A popup has no body view, so no link lies under it.
+pub(crate) fn hyperlinks(frame: &mut Frame, app: &App) {
+    if !app.demo
+        && let Some(view) = app.reader_view
+        && let Some(body) = app
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.selectable_body())
+    {
+        link_body(frame.buffer_mut(), view, body);
+    }
+}
+
+fn link_body(buffer: &mut Buffer, view: BodyView, body: &Body) {
+    if body.links.is_empty() {
+        return;
+    }
+    let mut symbol = String::new();
+    for (row, line) in body.lines[view.first..][..usize::from(view.area.height)]
+        .iter()
+        .enumerate()
+    {
+        let y = view.area.y + row as u16;
+        let mut glyphs = visible_glyphs(line, usize::from(view.area.width)).peekable();
+        while let Some((start, mut end, glyph, Role::Link(index))) =
+            glyphs.find(|item| matches!(item.3, Role::Link(_)))
+        {
+            let Some(url) = body.links.get(index).filter(|url| {
+                // Keep mailto in the composer via the link picker.
+                // Kitty truncates its 2048-byte ID-plus-URL storage; leave
+                // room for the ID and keep longer links in the picker.
+                url.len() <= 2000
+                    && mail::usable_link(url)
+                    && !url
+                        .get(..7)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("mailto:"))
+            }) else {
+                while glyphs.next_if(|item| item.3 == Role::Link(index)).is_some() {}
+                continue;
+            };
+
+            let x = view.area.x + start as u16;
+            let style = buffer[(x, y)].style();
+            symbol.clear();
+            let _ = write!(
+                symbol,
+                "\x1b]8;id=tuimail-{}-{index};{url}\x1b\\",
+                view.generation
+            );
+            symbol.push_str(glyph);
+            while let Some((_, next_end, glyph, _)) = glyphs.next_if(|&(next, _, _, role)| {
+                role == Role::Link(index) && buffer[(view.area.x + next as u16, y)].style() == style
+            }) {
+                end = next_end;
+                symbol.push_str(glyph);
+            }
+            symbol.push_str("\x1b]8;;\x1b\\");
+
+            // Diff the open, text and close together: a partial redraw must
+            // never leave an OSC 8 span open or retain a removed destination.
+            buffer[(x, y)]
+                .set_symbol(&symbol)
+                .set_diff_option(CellDiffOption::ForcedWidth(
+                    NonZeroU16::new((end - start) as u16).unwrap(),
+                ));
+            for tail in x + 1..view.area.x + end as u16 {
+                buffer[(tail, y)].set_diff_option(CellDiffOption::Skip);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use ratatui::widgets::Widget;
+
     use crate::app::Focus;
     use crate::app::tests::{app, open_first, with_mail};
     use crate::store::Flags;
     use crate::ui::tests::screen;
+
+    #[test]
+    fn terminal_hyperlinks_follow_the_visible_text_and_clear_on_redraw() {
+        let body = mail::render_html(
+            "<a href='https://one.example/path'><strong>界Web</strong></a> \
+             <a href='mailto:a@example.org'>mail</a>",
+            40,
+        );
+        let area = Rect::new(0, 0, 10, 1);
+        let view = BodyView {
+            area,
+            first: 0,
+            generation: 7,
+        };
+        let mut plain = Buffer::empty(area);
+        Paragraph::new(body_line(
+            &body.lines[0],
+            &Colors::named(crate::theme::DEFAULT),
+        ))
+        .render(area, &mut plain);
+        let mut linked = plain.clone();
+        link_body(&mut linked, view, &body);
+        assert_eq!(
+            linked[(0, 0)].symbol(),
+            "\x1b]8;id=tuimail-7-0;https://one.example/path\x1b\\界Web\x1b]8;;\x1b\\",
+        );
+        assert_eq!(linked[(6, 0)].symbol(), "m");
+        assert_eq!(linked[(6, 0)].diff_option, CellDiffOption::None);
+        assert!(linked.diff(&linked).is_empty());
+
+        let mut next = body;
+        next.links[0] = "https://two.example/path".into();
+        let mut changed = plain.clone();
+        link_body(&mut changed, view, &next);
+        let updates = linked.diff(&changed);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].2.symbol().contains("https://two.example/path"));
+
+        next.links[0] = "https://two.example/\x1b]8;;unexpected".into();
+        let mut unsafe_target = plain.clone();
+        link_body(&mut unsafe_target, view, &next);
+        assert_eq!(unsafe_target, plain);
+        next.links[0] = format!("https://two.example/{}", "a".repeat(2000));
+        let mut long_target = plain.clone();
+        link_body(&mut long_target, view, &next);
+        assert_eq!(long_target, plain);
+        // Identical visible glyphs must still be rewritten to remove their
+        // hyperlink metadata. The trailing cell of 界 is not a glyph.
+        let cleared: Vec<_> = changed.diff(&plain).iter().map(|item| item.0).collect();
+        assert_eq!(cleared, [0, 2, 3, 4]);
+    }
 
     /// The reader on a message with these headers, at 160 columns.
     async fn reading(headers: &str) -> String {
