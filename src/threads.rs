@@ -39,6 +39,12 @@ fn ids(summary: &Summary) -> impl Iterator<Item = &str> {
         .filter(|id| !id.is_empty())
 }
 
+fn named_parents(summary: &Summary) -> impl Iterator<Item = &str> {
+    std::iter::once(summary.in_reply_to.as_str())
+        .chain(summary.references.split_whitespace().rev())
+        .filter(|id| !id.is_empty())
+}
+
 /// Messages connected to the seed indices by their conversation headers.
 /// Shared references count even when the message they name isn't cached.
 pub fn connected(summaries: &[&Summary], seeds: impl IntoIterator<Item = usize>) -> Vec<bool> {
@@ -129,51 +135,54 @@ fn infer_groups(summaries: &[&Summary], groups: &mut [(usize, Option<u64>)]) {
 /// `summaries` as threads: each conversation in turn, newest first.
 #[cfg(test)]
 pub fn arrange(summaries: &[&Summary]) -> Vec<Placed> {
-    arrange_arrived(summaries, &[], &mut [])
+    arrange_arrived(summaries, summaries.len(), &[], &mut [])
 }
 
 /// As [`arrange`], knowing where each message is and its UID there
 /// (`arrived`: a number for its account and folder, and its UID): of
 /// messages with one Message-ID in one folder, the one that came first is
 /// the one replies go under, not one a sender dated later.
-/// Native conversation groups are scoped to an account. Their members stay
-/// together even without reply headers; sender headers can't cross groups.
-/// `groups` holds each account and native thread ID as scratch space;
+/// Groups are scoped to an account; native thread IDs keep their members
+/// together even without reply headers. Sender headers can't cross groups.
+/// `groups` holds each account and optional thread ID as scratch space;
 /// missing IDs are inferred from unambiguous header connections.
+/// The first `listed` messages establish the conversations. Supplemental
+/// drafts can reply within those conversations but cannot change their grouping.
 pub fn arrange_arrived(
     summaries: &[&Summary],
+    listed: usize,
     arrived: &[(usize, u32)],
     groups: &mut [(usize, Option<u64>)],
 ) -> Vec<Placed> {
-    let n = summaries.len();
-    // A Message-ID's first message: a copy (in two inboxes) stands alone.
-    infer_groups(summaries, groups);
-    let group = |i: usize| {
-        groups
-            .get(i)
-            .and_then(|&(account, thread)| thread.map(|thread| (account, thread)))
+    let messages = &summaries[..listed];
+    let listed_groups = listed.min(groups.len());
+    infer_groups(messages, &mut groups[..listed_groups]);
+    let group = |i: usize| groups.get(i).copied();
+    // A Message-ID's first message: another copy stands alone.
+    let index_ids = |by_id: &mut HashMap<_, usize>, use_native| {
+        for (i, s) in messages.iter().enumerate() {
+            if s.message_id.is_empty() {
+                continue;
+            }
+            let group =
+                group(i).map(|(account, native)| (account, if use_native { native } else { None }));
+            let first = by_id.entry((s.message_id.as_str(), group)).or_insert(i);
+            if let (Some(&(place, uid)), Some(&(was_place, was_uid))) =
+                (arrived.get(i), arrived.get(*first))
+                && place == was_place
+                && uid < was_uid
+            {
+                *first = i;
+            }
+        }
     };
     let mut by_id = HashMap::new();
-    for (i, s) in summaries.iter().enumerate() {
-        if s.message_id.is_empty() {
-            continue;
-        }
-        let first = by_id.entry((s.message_id.as_str(), group(i))).or_insert(i);
-        if let (Some(&(place, uid)), Some(&(was_place, was_uid))) =
-            (arrived.get(i), arrived.get(*first))
-            && place == was_place
-            && uid < was_uid
-        {
-            *first = i;
-        }
-    }
+    index_ids(&mut by_id, true);
     // Each message answers the nearest one it names that's here: the one
     // it replies to, else the latest of its references.
-    let mut parent: Vec<Option<usize>> = vec![None; n];
-    for (i, s) in summaries.iter().enumerate() {
-        let named =
-            std::iter::once(s.in_reply_to.as_str()).chain(s.references.split_whitespace().rev());
-        for id in named.filter(|id| !id.is_empty()) {
+    let mut parent: Vec<Option<usize>> = vec![None; summaries.len()];
+    for (i, s) in messages.iter().enumerate() {
+        for id in named_parents(s) {
             if let Some(&p) = by_id.get(&(id, group(i)))
                 && p != i
                 && !answers(&parent, p, i)
@@ -186,30 +195,61 @@ pub fn arrange_arrived(
     // Gmail's native grouping also includes messages without References.
     // Join its otherwise separate roots under the oldest one.
     let mut group_roots = HashMap::new();
-    for i in 0..n {
-        if parent[i].is_none()
-            && let Some(group) = group(i)
+    for (i, p) in parent[..listed].iter().enumerate() {
+        if p.is_none()
+            && let Some((account, Some(thread))) = group(i)
         {
-            let root = group_roots.entry(group).or_insert(i);
+            let root = group_roots.entry((account, thread)).or_insert(i);
             if (summaries[i].date, i) < (summaries[*root].date, *root) {
                 *root = i;
             }
         }
     }
-    for i in 0..n {
-        if parent[i].is_none()
-            && let Some(root) = group(i).and_then(|g| group_roots.get(&g)).copied()
+    for (i, p) in parent[..listed].iter_mut().enumerate() {
+        if p.is_none()
+            && let Some((account, Some(thread))) = group(i)
+            && let Some(&root) = group_roots.get(&(account, thread))
             && root != i
         {
-            parent[i] = Some(root);
+            *p = Some(root);
         }
     }
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Attach only to listed messages, without using draft headers as
+    // evidence for Gmail group inference or as parents of other mail.
+    let draft_parent = |by_id: &HashMap<_, usize>, i: usize, group| {
+        named_parents(summaries[i]).find_map(|id| by_id.get(&(id, group)).copied())
+    };
+    let mut header_only = false;
+    for (i, p) in parent.iter_mut().enumerate().skip(listed) {
+        if let Some((account, Some(thread))) = group(i) {
+            *p = draft_parent(&by_id, i, group(i))
+                .or_else(|| group_roots.get(&(account, thread)).copied())
+                .or_else(|| draft_parent(&by_id, i, Some((account, None))));
+        } else if group_roots.is_empty() {
+            *p = draft_parent(&by_id, i, group(i));
+        } else {
+            header_only = true;
+        }
+    }
+    if header_only {
+        // Look up the nearest named parent across this account's groups.
+        by_id.clear();
+        index_ids(&mut by_id, false);
+        for (i, p) in parent.iter_mut().enumerate().skip(listed) {
+            if group(i).is_none_or(|(_, native)| native.is_none()) {
+                *p = draft_parent(&by_id, i, group(i));
+            }
+        }
+    }
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); listed];
     let mut roots = Vec::new();
+    let mut attached = 0;
     for (i, p) in parent.iter().enumerate() {
-        match p {
-            Some(p) => children[*p].push(i),
-            None => roots.push(i),
+        if let Some(p) = p {
+            children[*p].push(i);
+            attached += usize::from(i >= listed);
+        } else if i < listed {
+            roots.push(i);
         }
     }
     let date = |i: usize| summaries[i].date;
@@ -217,19 +257,21 @@ pub fn arrange_arrived(
         list.sort_by_key(|&i| (date(i), i));
     }
     // A conversation is as new as its newest message.
-    let mut newest = vec![i64::MIN; n];
+    let mut newest = vec![i64::MIN; listed];
     for &root in &roots {
         let mut stack = vec![root];
         let mut latest = i64::MIN;
         while let Some(i) = stack.pop() {
             latest = latest.max(date(i));
-            stack.extend(&children[i]);
+            if let Some(kids) = children.get(i) {
+                stack.extend(kids);
+            }
         }
         newest[root] = latest;
     }
     roots.sort_by_key(|&i| (std::cmp::Reverse(newest[i]), i));
     let subject = |i: usize| base_subject(&summaries[i].subject);
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(listed + attached);
     for root in roots {
         // Depth first; with each message, whether each level above it (and
         // it) has more to come below, for the lines.
@@ -242,7 +284,9 @@ pub fn arrange_arrived(
                 tree,
                 same_subject,
             });
-            let kids = &children[i];
+            let Some(kids) = children.get(i) else {
+                continue;
+            };
             for (k, &child) in kids.iter().enumerate().rev() {
                 let mut levels = more.clone();
                 levels.push(k + 1 < kids.len());
@@ -355,7 +399,7 @@ mod tests {
             summary("a", "", "", 10, "Plan"),
         ];
         let refs: Vec<&Summary> = list.iter().collect();
-        let placed = arrange_arrived(&refs, &[(0, 5), (0, 2), (0, 1)], &mut []);
+        let placed = arrange_arrived(&refs, refs.len(), &[(0, 5), (0, 2), (0, 1)], &mut []);
         let reply = placed.iter().position(|p| p.index == 1).unwrap();
         assert_eq!(placed[reply - 1].index, 2, "under the first: {placed:?}");
     }
@@ -471,7 +515,7 @@ mod tests {
             (1, Some(7)),
             (0, Some(7)),
         ];
-        let placed = arrange_arrived(&refs, &[], &mut groups);
+        let placed = arrange_arrived(&refs, refs.len(), &[], &mut groups);
         let order: Vec<_> = placed.iter().map(|p| (p.index, p.tree.as_str())).collect();
         assert_eq!(order, [(2, ""), (1, ""), (4, "├─"), (0, "└─"), (3, "")]);
     }
@@ -497,7 +541,7 @@ mod tests {
             (0, None),
             (1, None),
         ];
-        let placed = arrange_arrived(&refs, &[], &mut groups);
+        let placed = arrange_arrived(&refs, refs.len(), &[], &mut groups);
         let order: Vec<_> = placed.iter().map(|p| p.index).collect();
         assert_eq!(order, [6, 5, 4, 1, 2, 0, 3]);
         assert!(placed[..4].iter().all(|p| p.tree.is_empty()));

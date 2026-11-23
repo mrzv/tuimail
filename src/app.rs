@@ -1525,8 +1525,8 @@ impl App {
             .sum()
     }
 
-    /// Looks for new mail in account `i`: its inbox, the folder open, Sent
-    /// for conversations, and the folders' counts (`all`, or now and then).
+    /// Looks for new mail in account `i`: its inbox, the folder open, supporting
+    /// conversation folders, and the folders' counts (`all`, or now and then).
     fn check(&mut self, i: usize, all: bool) {
         if self.demo {
             return;
@@ -1553,7 +1553,7 @@ impl App {
         {
             self.sync_folder(i, &folder);
         }
-        self.sync_sent(i);
+        self.sync_thread_folders(i);
     }
 
     /// A CardDAV refusal never invalidates otherwise working mail credentials.
@@ -1695,6 +1695,16 @@ impl App {
                 .map(|f| f.name.clone())
         {
             // A running check may have looked for new mail before a send.
+            self.sync_folder(i, &folder);
+        }
+    }
+
+    fn sync_thread_folders(&mut self, i: usize) {
+        self.sync_sent(i);
+        if !self.demo
+            && !self.accounts[i].is_pop()
+            && let Some(folder) = self.inbox_drafts(i).map(str::to_owned)
+        {
             self.sync_folder(i, &folder);
         }
     }
@@ -1949,7 +1959,7 @@ impl App {
                         folder: inbox,
                     };
                 }
-                self.sync_sent(i);
+                self.sync_thread_folders(i);
                 self.reload();
             }
             E::Synced(synced) => self.on_synced(i, synced),
@@ -2328,7 +2338,7 @@ impl App {
         if !self.accounts[i].folders.iter().any(|f| f.name == folder) {
             // A folder just made: list them again.
             self.send(i, Request::Folders);
-        } else if self.shows(i, folder) {
+        } else if self.shows(i, folder) || self.inbox_drafts(i) == Some(folder) {
             self.sync_folder(i, folder);
         }
     }
@@ -2536,7 +2546,9 @@ impl App {
         };
         here || self.settings.threads
             && self.search.is_none()
-            && (self.settings.threads_include_sent && self.role_of(i, folder) == Some(Role::Sent)
+            && (self.inbox_drafts(i) == Some(folder)
+                || self.settings.threads_include_sent
+                    && self.role_of(i, folder) == Some(Role::Sent)
                 || self.settings.threads_complete_gmail
                     && self.role_of(i, folder) == Some(Role::All))
             && match self.place {
@@ -2742,8 +2754,87 @@ impl App {
         self.reload_keeping(current.as_ref());
     }
 
+    /// The Drafts folder to keep cached for the active threaded inbox.
+    fn inbox_drafts(&self, i: usize) -> Option<&str> {
+        if !self.settings.threads {
+            return None;
+        }
+        let account = &self.accounts[i];
+        let inbox = account
+            .folder_for(Role::Inbox)
+            .map_or("INBOX", |f| f.name.as_str());
+        if let Place::Folder { account, folder } = &self.place
+            && (*account != i || folder != inbox)
+        {
+            return None;
+        }
+        account
+            .folder_for(Role::Drafts)
+            .filter(|f| f.selectable && f.name != inbox)
+            .map(|f| f.name.as_str())
+    }
+
+    fn extend_sent(&self, found: &mut Vec<Message>, id: &str, folder: &str, complete: bool) {
+        if found.is_empty() {
+            return;
+        }
+        let mut extra = self
+            .store
+            .messages(id, folder, MAX_LISTED)
+            .unwrap_or_default();
+        if extra.is_empty() {
+            return;
+        }
+        // Prefer the displayed copy of a native message, or its
+        // Message-ID when either copy has no native metadata yet.
+        let native_ids: HashSet<u64> = found
+            .iter()
+            .filter_map(|m| m.gmail.map(|g| g.message_id))
+            .collect();
+        let mut ids: HashMap<&str, bool> = HashMap::new();
+        for message in found.iter() {
+            if !message.summary.message_id.is_empty() {
+                let unknown = ids.entry(&message.summary.message_id).or_default();
+                *unknown |= message.gmail.is_none();
+            }
+        }
+        extra.retain(|m| match m.gmail {
+            Some(g) => {
+                !native_ids.contains(&g.message_id)
+                    && !ids
+                        .get(m.summary.message_id.as_str())
+                        .copied()
+                        .unwrap_or(false)
+            }
+            None => !ids.contains_key(m.summary.message_id.as_str()),
+        });
+        if extra.is_empty() {
+            return;
+        }
+        let native_threads: HashSet<u64> = if complete {
+            found
+                .iter()
+                .filter_map(|m| m.gmail.map(|g| g.thread_id))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let listed = found.len();
+        found.extend(extra);
+        let summaries: Vec<&mail::Summary> = found.iter().map(|m| &m.summary).collect();
+        let seeds = found.iter().enumerate().filter_map(|(j, m)| {
+            (j < listed
+                || m.gmail
+                    .is_some_and(|g| native_threads.contains(&g.thread_id)))
+            .then_some(j)
+        });
+        let mut keep = crate::threads::connected(&summaries, seeds).into_iter();
+        found.retain(|_| keep.next().unwrap_or(false));
+    }
+
     fn reload_keeping(&mut self, current: Option<&(usize, String, u32)>) {
         let mut items = Vec::new();
+        let mut drafts = Vec::new();
         let targets: Vec<(usize, Option<String>)> = match &self.place {
             Place::Folder { account, folder } => {
                 if self.search.is_some() {
@@ -2799,75 +2890,60 @@ impl App {
             if self.settings.threads
                 && self.settings.threads_include_sent
                 && self.search.is_none()
-                && !found.is_empty()
                 && let Some(sent) = self.accounts[i].folder_for(Role::Sent)
                 && folder.as_deref() != Some(sent.name.as_str())
             {
-                let listed = found.len();
-                let mut outgoing = self
-                    .store
-                    .messages(id, &sent.name, MAX_LISTED)
-                    .unwrap_or_default();
-                // Prefer the displayed copy of a native message, or its
-                // Message-ID when either copy has no native metadata yet.
-                let native_ids: HashSet<u64> = found
-                    .iter()
-                    .filter_map(|m| m.gmail.map(|g| g.message_id))
-                    .collect();
-                let native_threads: HashSet<u64> = if complete {
-                    found
-                        .iter()
-                        .filter_map(|m| m.gmail.map(|g| g.thread_id))
-                        .collect()
-                } else {
-                    HashSet::new()
-                };
-                let mut ids: HashMap<&str, bool> = HashMap::new();
-                for message in &found {
-                    if !message.summary.message_id.is_empty() {
-                        let unknown = ids.entry(&message.summary.message_id).or_default();
-                        *unknown |= message.gmail.is_none();
-                    }
-                }
-                outgoing.retain(|m| match m.gmail {
-                    Some(g) => {
-                        !native_ids.contains(&g.message_id)
-                            && !ids
-                                .get(m.summary.message_id.as_str())
-                                .copied()
-                                .unwrap_or(false)
-                    }
-                    None => !ids.contains_key(m.summary.message_id.as_str()),
-                });
-                if !outgoing.is_empty() {
-                    found.extend(outgoing);
-                    let summaries: Vec<&mail::Summary> = found.iter().map(|m| &m.summary).collect();
-                    let seeds = found.iter().enumerate().filter_map(|(j, m)| {
-                        (j < listed
-                            || m.gmail
-                                .is_some_and(|g| native_threads.contains(&g.thread_id)))
-                        .then_some(j)
-                    });
-                    let mut keep = crate::threads::connected(&summaries, seeds).into_iter();
-                    found.retain(|_| keep.next().unwrap_or(false));
-                }
+                self.extend_sent(&mut found, id, &sent.name, complete);
             }
-            items.extend(found.into_iter().map(|message| Item {
+            let item = |message| Item {
                 account: i,
                 message,
                 thread: Thread::default(),
-            }));
+            };
+            if self.search.is_none()
+                && !found.is_empty()
+                && let Some(folder) = self.inbox_drafts(i)
+            {
+                let saved = self
+                    .store
+                    .messages(id, folder, MAX_LISTED)
+                    .unwrap_or_default();
+                if !saved.is_empty() {
+                    // A sent version can reuse a draft's Message-ID. Only
+                    // suppress a known native copy that's already editable.
+                    let listed_drafts: HashSet<_> = found
+                        .iter()
+                        .filter_map(|m| {
+                            let g = m.gmail?;
+                            self.is_draft(i, m).then_some(g.message_id)
+                        })
+                        .collect();
+                    drafts.extend(
+                        saved
+                            .into_iter()
+                            .filter(|m| {
+                                m.gmail
+                                    .is_none_or(|g| !listed_drafts.contains(&g.message_id))
+                            })
+                            .map(item),
+                    );
+                }
+            }
+            items.extend(found.into_iter().map(item));
         }
         if matches!(self.place, Place::AllInboxes) {
             items.sort_by_key(|it| std::cmp::Reverse(it.message.summary.date));
         }
         // In conversations; what a search finds stays newest first.
         if self.settings.threads && self.search.is_none() {
+            let listed = items.len();
+            items.extend(drafts);
             let summaries: Vec<&mail::Summary> =
                 items.iter().map(|it| &it.message.summary).collect();
             // Where each is (its account and folder, numbered), and its UID.
             let mut places: Vec<(usize, &str)> = Vec::new();
-            let arrived: Vec<(usize, u32)> = (items.iter())
+            let arrived: Vec<(usize, u32)> = items[..listed]
+                .iter()
                 .map(|it| {
                     let place = (it.account, it.message.folder.as_str());
                     let n = places.iter().position(|p| *p == place).unwrap_or_else(|| {
@@ -2877,25 +2953,28 @@ impl App {
                     (n, it.message.uid)
                 })
                 .collect();
-            let mut groups: Vec<_> = if self.settings.threads_complete_gmail {
-                items
-                    .iter()
-                    .map(|it| (it.account, it.message.gmail.map(|g| g.thread_id)))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let order = crate::threads::arrange_arrived(&summaries, &arrived, &mut groups);
+            let mut groups: Vec<_> = items
+                .iter()
+                .map(|it| {
+                    let native = if self.settings.threads_complete_gmail {
+                        it.message.gmail.map(|g| g.thread_id)
+                    } else {
+                        None
+                    };
+                    (it.account, native)
+                })
+                .collect();
+            let order = crate::threads::arrange_arrived(&summaries, listed, &arrived, &mut groups);
             let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
             items = order
                 .into_iter()
-                .filter_map(|placed| {
-                    let mut item = slots.get_mut(placed.index)?.take()?;
+                .map(|placed| {
+                    let mut item = slots[placed.index].take().unwrap();
                     item.thread = Thread {
                         tree: placed.tree,
                         same_subject: placed.same_subject,
                     };
-                    Some(item)
+                    item
                 })
                 .collect();
         }
@@ -3046,13 +3125,13 @@ impl App {
                     return;
                 }
                 self.sync_folder(account, &folder);
-                self.sync_sent(account);
+                self.sync_thread_folders(account);
             }
             Place::AllInboxes => {
                 for i in 0..self.accounts.len() {
                     let inbox = self.accounts[i].inbox();
                     self.sync_folder(i, &inbox);
-                    self.sync_sent(i);
+                    self.sync_thread_folders(i);
                 }
             }
         }
@@ -7286,7 +7365,7 @@ impl App {
                 }
                 self.reload_keeping(current.as_ref());
                 for i in 0..self.accounts.len() {
-                    self.sync_sent(i);
+                    self.sync_thread_folders(i);
                 }
             } else {
                 self.rebuild_rows(current.as_ref());
@@ -9119,14 +9198,55 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_draft_is_marked_and_editable_between_other_replies() {
+    async fn inbox_conversation_opens_and_replaces_the_draft_in_its_own_folder() {
         use crate::ui::tests::screen;
 
         let mut app = app();
         let id = app.accounts[0].id.clone();
-        let uids = add_thread_with_uncached_draft(&mut app);
+        let mut folders = local_folders();
+        let drafts = folders
+            .iter_mut()
+            .find(|folder| folder.role == Some(Role::Drafts))
+            .unwrap();
+        drafts.name = "Saved replies".into();
+        let drafts = drafts.name.clone();
+        app.store.set_folders(&id, &folders).unwrap();
+        app.accounts[0].folders = folders;
+        let [original, newest] = [DRAFT_CONVERSATION[0], DRAFT_CONVERSATION[2]].map(|raw| {
+            app.store
+                .add_local(&id, "INBOX", raw, Flags::default(), None)
+                .unwrap()
+        });
+        let mut draft = store::tests::header(10, "Re: Plans", 0);
+        draft.summary = mail::summarize(DRAFT_CONVERSATION[1]);
+        let old = draft.uid;
         app.settings.threads_collapsed = true;
-        app.reload();
+        app.demo = false; // Deliver mail as the offline test worker would.
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "INBOX".into(),
+        });
+        let (account, folder) = app
+            .test_sent
+            .take()
+            .into_iter()
+            .find_map(|(account, request)| match request {
+                Request::Sync { folder, .. } if folder == drafts => Some((account, folder)),
+                _ => None,
+            })
+            .expect("opening the inbox must check the actual Drafts folder");
+        app.on_worker(
+            account,
+            worker::Event::Synced(worker::Synced {
+                folder,
+                uidvalidity: 19,
+                new: vec![draft],
+                low: old,
+                high: old,
+                total: 1,
+                ..Default::default()
+            }),
+        );
         app.focus = Focus::List;
         app.open_selected(false);
         wait_for_layout(&mut app).await;
@@ -9136,7 +9256,6 @@ pub mod tests {
         assert!(shown.contains("A newer reply."), "{shown}");
         assert!(app.composer.is_none());
 
-        app.demo = false; // Exercise an uncached IMAP draft, without a worker.
         app.on_key(key(KeyCode::Char(']')));
         assert_eq!(app.focus, Focus::List);
         // Enter while the draft is downloading must use the same request.
@@ -9146,16 +9265,21 @@ pub mod tests {
         let bodies: Vec<_> = requests
             .iter()
             .filter_map(|(_, request)| match request {
-                Request::Body { folder, uid, .. } => Some((folder.as_str(), *uid)),
+                Request::Body {
+                    folder,
+                    uid,
+                    uidvalidity,
+                    ..
+                } => Some((folder.as_str(), *uid, *uidvalidity)),
                 _ => None,
             })
             .collect();
-        assert_eq!(bodies, [("INBOX", uids[1])]);
+        assert_eq!(bodies, [(drafts.as_str(), old, 19)]);
         app.on_worker(
             0,
             worker::Event::Body {
-                folder: "INBOX".into(),
-                uid: uids[1],
+                folder: drafts.clone(),
+                uid: old,
                 result: Ok(Some(DRAFT_CONVERSATION[1].to_vec())),
             },
         );
@@ -9197,15 +9321,72 @@ pub mod tests {
         assert!(shown.contains("A newer reply."), "{shown}");
         assert!(app.composer.is_none());
 
-        for (i, uid) in uids.into_iter().enumerate() {
-            assert_eq!(
-                app.store.message(&id, "INBOX", uid).unwrap().is_some(),
-                i != 1
-            );
-        }
-        let saved = app.store.messages(&id, "Drafts", 10).unwrap();
+        let mut inbox = app.store.uids(&id, "INBOX", 1, u32::MAX).unwrap();
+        inbox.sort_unstable();
+        assert_eq!(inbox, [original, newest]);
+        assert!(app.store.message(&id, &drafts, old).unwrap().is_none());
+        let saved = app.store.messages(&id, &drafts, 10).unwrap();
+        assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].summary.subject, "Re: Plans");
         assert_eq!(saved[0].summary.in_reply_to, "plans@example.org");
+
+        app.on_key(key(KeyCode::Char('[')));
+        app.wait_until(|a| a.composer.is_some()).await;
+        let draft = app.composer.as_ref().unwrap().draft();
+        assert_eq!(draft.bcc, "archive@example.org");
+        assert!(draft.body.contains("Unfinished reply."));
+    }
+
+    #[test]
+    fn inbox_draft_conversations_require_a_listed_reply_in_the_same_account() {
+        let mut app = two_accounts();
+        for account in &app.accounts {
+            app.store.reset_folder(&account.id, "INBOX").unwrap();
+            app.store.reset_folder(&account.id, "Drafts").unwrap();
+        }
+        let root = |date| {
+            let mut root = store::tests::header(1, "Plans", date);
+            root.summary.message_id = "plans@example.org".into();
+            root.summary.in_reply_to = "missing@example.org".into();
+            root
+        };
+        for (i, account) in app.accounts.iter().enumerate() {
+            let mut draft = store::tests::header(2, "Unfinished reply", 40 + i as i64);
+            draft.summary.in_reply_to = "plans@example.org".into();
+            let mut orphan = store::tests::header(3, "Unrelated draft", 50);
+            orphan.summary.in_reply_to = "missing@example.org".into();
+            app.store
+                .add_headers(&account.id, "Drafts", &[draft, orphan])
+                .unwrap();
+        }
+        app.store
+            .add_headers(&app.accounts[0].id, "INBOX", &[root(10)])
+            .unwrap();
+        app.settings.threads_collapsed = true;
+        app.open_place(Place::AllInboxes);
+        let rows = |app: &App| {
+            app.visible_items()
+                .map(|(item, count)| (item.account, item.message.uid, count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&app), [(0, 2, 2)]);
+
+        // A second copy of the Inbox parent must not reparent the first
+        // account's draft, or pull the second draft into its conversation.
+        app.on_worker(
+            1,
+            worker::Event::Headers {
+                folder: "INBOX".into(),
+                headers: vec![root(20)],
+            },
+        );
+        assert_eq!(rows(&app), [(1, 2, 2), (0, 2, 2)]);
+        app.run_search("Plans");
+        assert_eq!(rows(&app), [(1, 1, 1), (0, 1, 1)]);
+        app.search = None;
+        app.settings.threads = false;
+        app.reload();
+        assert_eq!(rows(&app), [(1, 1, 1), (0, 1, 1)]);
     }
 
     #[tokio::test]
@@ -12028,6 +12209,65 @@ pub mod tests {
             app.items[1..]
                 .iter()
                 .all(|item| !item.thread.tree.is_empty())
+        );
+    }
+
+    #[test]
+    fn inbox_draft_with_shared_message_id_preserves_gmail_conversations() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+        let mut first = store::tests::header(1, "Trip", 10);
+        first.summary.message_id = "trip@example.org".into();
+        let native = store::Gmail {
+            message_id: 1,
+            thread_id: 7,
+            sent: false,
+        };
+        first.gmail = Some(native);
+        let mut second = store::tests::header(2, "Dinner", 40);
+        second.summary.message_id = "dinner@example.org".into();
+        second.gmail = Some(store::Gmail {
+            message_id: 2,
+            thread_id: 8,
+            ..native
+        });
+        app.store
+            .add_headers(&id, "INBOX", &[first, second])
+            .unwrap();
+        let mut sent = store::tests::header(1, "Re: Trip", 20);
+        sent.summary.message_id = "reply@example.org".into();
+        sent.summary.in_reply_to = "trip@example.org".into();
+        app.store.add_headers(&id, "Sent", &[sent]).unwrap();
+        let mut draft = store::tests::header(1, "Re: Trip", 30);
+        draft.summary.message_id = "reply@example.org".into();
+        draft.summary.in_reply_to = "trip@example.org".into();
+        draft.summary.references = "dinner@example.org".into();
+        app.store.add_headers(&id, "Drafts", &[draft]).unwrap();
+
+        app.settings.threads_complete_gmail = true;
+        app.settings.threads_include_sent = true;
+        app.reload();
+
+        let rows: Vec<_> = app
+            .items
+            .iter()
+            .map(|it| {
+                (
+                    it.message.folder.as_str(),
+                    it.message.uid,
+                    it.thread.tree.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("INBOX", 2, ""),
+                ("INBOX", 1, ""),
+                ("Sent", 1, "├─"),
+                ("Drafts", 1, "└─"),
+            ]
         );
     }
 

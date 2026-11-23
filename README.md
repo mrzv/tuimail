@@ -141,7 +141,7 @@ Links split by `format=flowed` email wrapping keep their full destination on eve
 
 Open a collapsed conversation to see its messages newest first, starting with the newest body expanded. Switching focus between the list and reader keeps the reply you chose. Switching formats with `H` keeps a visible reply header on the same line. List actions such as starring or moving still target the newest message, not the whole conversation; in the reader they target the opened reply.
 
-`[Draft]` marks a draft reply and any collapsed conversation that contains one. Open it with `Enter` or step to it with `[` or `]` to edit it in the composer. Closing the composer without saving keeps that reply selected. Saving a replacement keeps you in the conversation on a neighboring reply.
+Inbox and All inboxes conversations include related drafts from the same account's Drafts folder. IMAP checks that folder while showing the inbox; unrelated drafts stay in Drafts. `[Draft]` marks a draft reply and any collapsed conversation that contains one. Open it with `Enter` or step to it with `[` or `]` to edit it in the composer. Closing the composer without saving keeps that reply selected. Saving a replacement keeps you in the conversation on a neighboring reply.
 
 To start with conversations collapsed, turn on **Collapse threads into conversations by default** in `O`. Changing the default resets individual `v` choices. The setting has no effect when threading is off or when viewing search results.
 
