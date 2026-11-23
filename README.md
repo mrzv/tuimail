@@ -109,6 +109,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | Key | Action |
 | --- | --- |
 | `←↓↑→` / `h j k l` | Move; `Enter`, `→` or `l` opens |
+| `Enter` on a draft | Edit the draft in the composer |
 | Left click on a message or conversation | Focus the message list and select that row |
 | `Tab` | Folders → messages → the message |
 | `gg` / `G`, `Ctrl-u` / `Ctrl-d` | First / last, half a page |
@@ -139,6 +140,8 @@ Web links are blue, without an underline, in both plain-text and HTML views. HTM
 Links split by `format=flowed` email wrapping keep their full destination on every displayed row. Literal line breaks in fixed plain text are not joined.
 
 Open a collapsed conversation to see its messages newest first, starting with the newest body expanded. Switching focus between the list and reader keeps the reply you chose. Switching formats with `H` keeps a visible reply header on the same line. List actions such as starring or moving still target the newest message, not the whole conversation; in the reader they target the opened reply.
+
+`[Draft]` marks a draft reply and any collapsed conversation that contains one. Open it with `Enter` or step to it with `[` or `]` to edit it in the composer. Closing the composer without saving keeps that reply selected. Saving a replacement keeps you in the conversation on a neighboring reply.
 
 To start with conversations collapsed, turn on **Collapse threads into conversations by default** in `O`. Changing the default resets individual `v` choices. The setting has no effect when threading is off or when viewing search results.
 

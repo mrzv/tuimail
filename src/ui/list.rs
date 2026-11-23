@@ -59,7 +59,17 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .skip(scroll)
         .take(height)
-        .map(|(i, (item, members))| row(app, item, members, i == app.selected, focused, width, now))
+        .map(|(i, (item, members))| {
+            row(
+                app,
+                item,
+                members,
+                app.row_has_draft(i),
+                i == app.selected,
+                width,
+                now,
+            )
+        })
         .collect();
     if !app.mouse_blocked() {
         app.list_hit_area.set(Rect {
@@ -136,8 +146,8 @@ fn row(
     app: &App,
     item: &Item,
     members: usize,
+    has_draft: bool,
     selected: bool,
-    focused: bool,
     width: usize,
     now: i64,
 ) -> Line<'static> {
@@ -153,7 +163,7 @@ fn row(
         .and_then(|f| f.role);
     let sent = role == Some(Role::Sent) || m.gmail.is_some_and(|g| g.sent);
     // In Sent and Drafts, who it's to matters.
-    let who = if sent || role == Some(Role::Drafts) {
+    let who = if sent || m.flags.draft || role == Some(Role::Drafts) {
         let to = m.summary.to.split(',').next().unwrap_or("").trim();
         let to = to.split('<').next().unwrap_or(to).trim().trim_matches('"');
         format!("To {}", if to.is_empty() { "?" } else { to })
@@ -252,6 +262,12 @@ fn row(
     };
     let tree = fit(&tree, cols(&tree).min(tree_width));
     let text_width = text_width.saturating_sub(cols(&tree));
+    let badge = if has_draft && text_width >= super::DRAFT_BADGE.len() {
+        super::DRAFT_BADGE
+    } else {
+        ""
+    };
+    let text_width = text_width - badge.len();
     let folder_width = cols(&folder).min(text_width);
     let folder = fit(&folder, folder_width);
     // Tags after the subject, in at most a third of its room.
@@ -272,7 +288,7 @@ fn row(
     } else {
         String::new()
     };
-    let bar = if selected && focused {
+    let bar = if selected && app.focus == Focus::List {
         Span::styled("▌", Style::new().fg(c.accent))
     } else {
         Span::raw(" ")
@@ -285,6 +301,7 @@ fn row(
         Span::styled(pad(&who, who_width), who_style),
         Span::raw(" "),
         Span::styled(tree, Style::new().fg(c.dim)),
+        Span::styled(badge, Style::new().fg(c.tag)),
         Span::styled(folder, Style::new().fg(c.dim)),
         Span::styled(subject, subject_style),
         Span::styled(tags, Style::new().fg(c.tag)),

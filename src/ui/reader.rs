@@ -209,10 +209,23 @@ fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a>
 }
 
 /// One line per member; the active message's body follows its header.
-fn thread_header(item: &Item, active: bool, width: usize, now: i64, c: &Colors) -> Line<'static> {
+fn thread_header(
+    item: &Item,
+    active: bool,
+    draft: bool,
+    width: usize,
+    now: i64,
+    c: &Colors,
+) -> Line<'static> {
     let m = &item.message;
     let date = mail::short_date(m.summary.date, now);
-    let room = width.saturating_sub(2 + if date.is_empty() { 0 } else { cols(&date) + 2 });
+    let badge = if draft && width >= 2 + super::DRAFT_BADGE.len() {
+        super::DRAFT_BADGE
+    } else {
+        ""
+    };
+    let room =
+        width.saturating_sub(2 + badge.len() + if date.is_empty() { 0 } else { cols(&date) + 2 });
     let subject = if m.summary.subject.is_empty() {
         "(no subject)"
     } else {
@@ -234,6 +247,7 @@ fn thread_header(item: &Item, active: bool, width: usize, now: i64, c: &Colors) 
     };
     Line::from(vec![
         Span::styled(if active { "▾ " } else { "▸ " }, style),
+        Span::styled(badge, Style::new().fg(c.tag)),
         Span::styled(addr, style),
         Span::styled(subject, style),
         Span::styled(
@@ -273,6 +287,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if focused {
         let hint = if reader.is_some_and(crate::app::Reader::has_selection) {
             " `y` copy selection · `Esc` clear "
+        } else if app.reader_is_draft() {
+            if app.reader_thread().is_some() {
+                " `Enter` edit draft · `[ ]` newer/older reply "
+            } else {
+                " `Enter` edit draft "
+            }
         } else if app.reader_thread().is_some() {
             " `[ ]` newer/older reply "
         } else {
@@ -453,9 +473,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         // Lines wider than the pane are cut, not wrapped.
         let shown: Vec<_> = if let Some((members, active)) = thread {
             let now = crate::app::now();
-            let headers = members
-                .enumerate()
-                .map(|(i, item)| thread_header(item, i == active, width, now, &c));
+            let headers = members.enumerate().map(|(i, item)| {
+                thread_header(
+                    item,
+                    i == active,
+                    app.is_draft(item.account, &item.message),
+                    width,
+                    now,
+                    &c,
+                )
+            });
             headers
                 .clone()
                 .take(active + 1)

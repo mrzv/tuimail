@@ -104,12 +104,11 @@ pub enum AppEvent {
     /// A reply, forward or saved draft made ready for the composer, by the
     /// account's id (an index could mean another once one is removed).
     Drafted {
-        account: String,
+        source: Kept,
         kind: Kind,
         draft: Option<Draft>,
-        replying: Option<Kept>,
-        draft_of: Option<Kept>,
-        /// Attachments listed that a forward couldn't read, so lacks.
+        edit: Option<u64>,
+        /// Attachments listed that couldn't be taken into the composer.
         lost: usize,
     },
     /// Attachments taken out of a message: saved, or to open together.
@@ -446,6 +445,7 @@ impl Item {
 struct ListEntry {
     members: Range<usize>,
     newest: usize,
+    has_draft: bool,
 }
 
 pub struct AccountState {
@@ -562,6 +562,8 @@ pub struct Reader {
     /// list.
     opened_at: Instant,
     marked_read: bool,
+    /// An explicit draft edit waiting for its body or the composer layout.
+    draft_edit: Option<u64>,
 }
 
 struct ReaderThread {
@@ -570,6 +572,13 @@ struct ReaderThread {
     active: usize,
     /// The user chose this reply with a bracket, rather than previewing the row.
     stepped: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Preview,
+    Read,
+    EditDraft,
 }
 
 impl Reader {
@@ -871,7 +880,7 @@ enum Append {
 enum Pending {
     Reply { all: bool },
     Forward,
-    EditDraft,
+    EditDraft(u64),
 }
 
 pub struct App {
@@ -960,6 +969,7 @@ pub struct App {
     pub help: Option<HelpMenu>,
     pub status: Option<Status>,
     pending: Option<((usize, String, u32), Pending)>,
+    next_draft_edit: u64,
     /// Flags changed here, and when.
     local_flags: HashMap<(usize, String, u32), Instant>,
     /// Messages moved or deleted here, and when: a check that read the
@@ -1135,6 +1145,7 @@ impl App {
             help: None,
             status: None,
             pending: None,
+            next_draft_edit: 0,
             local_flags: HashMap::new(),
             local_removed: HashMap::new(),
             appends: HashMap::new(),
@@ -1788,13 +1799,13 @@ impl App {
                 }
             }
             AppEvent::Drafted {
-                account,
+                source,
                 kind,
                 draft,
-                replying,
-                draft_of,
+                edit,
                 lost,
-            } => match (draft, self.account_index(&account)) {
+            } => match (draft, self.account_index(&source.account)) {
+                _ if edit.is_some_and(|id| !self.finish_draft_edit(id, &source)) => {}
                 // A reply made ready late never takes the place of a
                 // message being written, or of the one a question is about.
                 (Some(_), _) if self.composer.is_some() || self.confirm.is_some() => {
@@ -1808,8 +1819,11 @@ impl App {
                     };
                     let mut composer = Composer::new(account, kind, draft);
                     composer.complete_from(&self.accounts[account].id, &self.store);
-                    composer.replying = replying;
-                    composer.draft_of = draft_of;
+                    match composer.kind {
+                        Kind::Reply => composer.replying = Some(source),
+                        Kind::Draft if lost == 0 => composer.draft_of = Some(source),
+                        _ => {}
+                    }
                     self.composer = Some(composer);
                     if lost > 0 {
                         self.error(format!(
@@ -2302,7 +2316,9 @@ impl App {
     /// didn't come: dropped, saying why, so it doesn't open much later.
     fn drop_pending(&mut self, key: &(usize, String, u32), why: &str) {
         if self.pending.as_ref().is_some_and(|(k, _)| k == key) {
-            self.pending = None;
+            if matches!(self.pending.take(), Some((_, Pending::EditDraft(_)))) {
+                self.cancel_draft_edit();
+            }
             self.error(format!("Not opened in the composer: {why}"));
         }
     }
@@ -2607,8 +2623,58 @@ impl App {
     /// Deletes the saved draft a sent or saved message replaces: in its own
     /// account, only if it's still that message.
     fn replace_draft(&mut self, draft_of: Option<Kept>) {
-        if let Some((i, folder, uid)) = draft_of.and_then(|k| self.resolve(&k)) {
-            self.delete_forever(i, &folder, &[uid]);
+        let Some((i, folder, uid)) = draft_of.and_then(|k| self.resolve(&k)) else {
+            return;
+        };
+        // The replacement can be in a different folder (or not synced yet).
+        // In the current conversation, continue with a surviving reply.
+        let anchor = self.reader.as_ref().and_then(|r| {
+            let index = match &r.thread {
+                Some(thread) => thread.members[thread.active],
+                None => self.rows.get(self.selected)?.newest,
+            };
+            if (r.account, r.folder.as_str(), r.uid) != (i, folder.as_str(), uid)
+                || !r.is_message(&self.items[index])
+                || self.row_for(index) != self.selected
+                || self.focus == Focus::Sidebar
+            {
+                return None;
+            }
+            let neighbor = if let Some(thread) = &r.thread {
+                *thread.members.get(thread.active + 1).or_else(|| {
+                    thread
+                        .active
+                        .checked_sub(1)
+                        .and_then(|prev| thread.members.get(prev))
+                })?
+            } else {
+                let members = self.conversation_members(index);
+                if index + 1 < members.end {
+                    index + 1
+                } else if index > members.start {
+                    index - 1
+                } else {
+                    return None;
+                }
+            };
+            Some((self.items[neighbor].key(), self.focus, r.plain))
+        });
+        self.delete_forever(i, &folder, &[uid]);
+        if let Some(((account, folder, uid), focus, plain)) = anchor
+            && let Some(index) = self
+                .items
+                .iter()
+                .position(|it| it.key_ref() == (account, folder.as_str(), uid))
+        {
+            self.selected = self.row_for(index);
+            self.moved_at = None;
+            self.open_message(
+                index,
+                OpenMode::Preview,
+                self.thread_for(index, true),
+                plain,
+            );
+            self.focus = focus;
         }
     }
 
@@ -2863,12 +2929,19 @@ impl App {
                 self.rows.push(ListEntry {
                     members: start..end,
                     newest,
+                    has_draft: thread
+                        .iter()
+                        .any(|it| self.is_draft(it.account, &it.message)),
                 });
             } else {
-                self.rows.extend((start..end).map(|i| ListEntry {
-                    members: i..i + 1,
-                    newest: i,
-                }));
+                for (i, it) in (start..end).zip(thread) {
+                    let has_draft = self.is_draft(it.account, &it.message);
+                    self.rows.push(ListEntry {
+                        members: i..i + 1,
+                        newest: i,
+                        has_draft,
+                    });
+                }
             }
             start = end;
         }
@@ -2893,6 +2966,7 @@ impl App {
             });
         }
         self.refresh_reader_thread();
+        self.cancel_left_draft_edit();
     }
 
     fn row_for(&self, item: usize) -> usize {
@@ -2903,6 +2977,24 @@ impl App {
         self.rows
             .iter()
             .map(|row| (&self.items[row.newest], row.members.len()))
+    }
+
+    pub(crate) fn row_has_draft(&self, row: usize) -> bool {
+        self.rows[row].has_draft
+    }
+
+    fn conversation_members(&self, index: usize) -> std::ops::Range<usize> {
+        let mut root = index;
+        while root > 0 && !self.items[root].thread.tree.is_empty() {
+            root -= 1;
+        }
+        let end = index
+            + 1
+            + self.items[index + 1..]
+                .iter()
+                .take_while(|item| !item.thread.tree.is_empty())
+                .count();
+        root..end
     }
 
     fn toggle_conversation(&mut self) {
@@ -2917,20 +3009,11 @@ impl App {
         let members = if collapsed {
             row.members.clone()
         } else {
-            let mut root = row.members.start;
-            while root > 0 && !self.items[root].thread.tree.is_empty() {
-                root -= 1;
-            }
-            let end = root
-                + 1
-                + self.items[root + 1..]
-                    .iter()
-                    .take_while(|item| !item.thread.tree.is_empty())
-                    .count();
-            if end == root + 1 {
+            let members = self.conversation_members(row.newest);
+            if members.len() == 1 {
                 return;
             }
-            root..end
+            members
         };
         if collapsed == self.settings.threads_collapsed {
             self.thread_overrides
@@ -3043,30 +3126,32 @@ impl App {
             .or_else(|| self.rows.get(self.selected).map(|row| row.newest))
     }
 
-    /// Opens the message under the cursor in the reader; `enter` when asked
-    /// for (marked read at once), not just previewed.
+    /// Opens the selected message. A preview never starts the composer.
     fn open_selected(&mut self, enter: bool) {
         let Some(index) = self.selected_read_index() else {
             return;
         };
         let item = &self.items[index];
-        if enter {
+        let mode = if enter {
             self.moved_at = None;
-            // A draft opens in the composer unless reading a conversation.
-            if self.rows[self.selected].members.len() == 1
-                && self.role_of(item.account, &item.message.folder) == Some(Role::Drafts)
-            {
-                return self.start_from(item.key(), Pending::EditDraft);
-            }
-        }
+            self.open_mode(item)
+        } else {
+            OpenMode::Preview
+        };
         // Open already; Enter downloads again one that failed.
         if let Some(reader) = &mut self.reader
             && reader.is_message(item)
         {
+            if mode == OpenMode::EditDraft {
+                if reader.thread.is_some() {
+                    self.focus = Focus::Reader;
+                }
+                return self.edit_reader_draft();
+            }
             if enter && reader.raw.is_none() && reader.error.is_some() {
                 let thread = reader.thread.take();
                 let plain = reader.plain;
-                return self.open_message(index, true, thread, plain);
+                return self.open_message(index, mode, thread, plain);
             }
             if enter {
                 self.focus = Focus::Reader;
@@ -3074,7 +3159,7 @@ impl App {
             }
             return;
         }
-        self.open_message(index, enter, self.thread_for(index, false), None);
+        self.open_message(index, mode, self.thread_for(index, false), None);
     }
 
     fn thread_for(&self, index: usize, stepped: bool) -> Option<ReaderThread> {
@@ -3191,7 +3276,12 @@ impl App {
         let keep_list_focus = from_list && self.preview_after_batch();
         self.moved_at = None;
         self.selected = self.row_for(index);
-        self.open_message(index, true, Some(thread), plain);
+        self.open_message(
+            index,
+            self.open_mode(&self.items[index]),
+            Some(thread),
+            plain,
+        );
         if keep_list_focus {
             self.focus = Focus::List;
         }
@@ -3211,7 +3301,11 @@ impl App {
             {
                 self.open_message(
                     index,
-                    enter,
+                    if enter {
+                        OpenMode::Read
+                    } else {
+                        OpenMode::Preview
+                    },
                     self.thread_for(index, false),
                     Some(!self.settings.prefer_plain),
                 );
@@ -3233,13 +3327,22 @@ impl App {
         }
     }
 
+    fn open_mode(&self, item: &Item) -> OpenMode {
+        if self.is_draft(item.account, &item.message) {
+            OpenMode::EditDraft
+        } else {
+            OpenMode::Read
+        }
+    }
+
     fn open_message(
         &mut self,
         index: usize,
-        enter: bool,
+        mode: OpenMode,
         thread: Option<ReaderThread>,
         plain: Option<bool>,
     ) {
+        self.cancel_draft_edit();
         let item = &self.items[index];
         let account = item.account;
         let uid = item.message.uid;
@@ -3251,6 +3354,9 @@ impl App {
             .flatten()
             .map(Arc::new);
         let have = raw.is_some();
+        let enter = mode != OpenMode::Preview;
+        let edit = mode == OpenMode::EditDraft;
+        let focus_reader = enter && (!edit || thread.is_some());
         self.reader = Some(Reader {
             account,
             folder: item.message.folder.clone(),
@@ -3275,10 +3381,13 @@ impl App {
             } else {
                 Instant::now()
             },
-            marked_read: item.message.flags.seen,
+            marked_read: edit || item.message.flags.seen,
+            draft_edit: None,
         });
-        if enter {
+        if focus_reader {
             self.focus = Focus::Reader;
+        }
+        if mode == OpenMode::Read {
             self.mark_reader_read();
         }
         if have {
@@ -3296,6 +3405,9 @@ impl App {
                     uidvalidity: self.uidvalidity(account, &reader.folder),
                 },
             );
+        }
+        if edit {
+            self.edit_reader_draft();
         }
     }
 
@@ -3370,6 +3482,76 @@ impl App {
             .iter()
             .find(|f| f.name == folder)?
             .role
+    }
+
+    pub(crate) fn is_draft(&self, account: usize, message: &Message) -> bool {
+        message.flags.draft || self.role_of(account, &message.folder) == Some(Role::Drafts)
+    }
+
+    pub(crate) fn reader_is_draft(&self) -> bool {
+        let Some(reader) = &self.reader else {
+            return false;
+        };
+        let item = if let Some(thread) = &reader.thread {
+            Some(&self.items[thread.members[thread.active]])
+        } else {
+            self.selected_item()
+                .filter(|it| reader.is_message(it))
+                .or_else(|| self.items.iter().find(|it| reader.is_message(it)))
+        };
+        item.is_some_and(|it| self.is_draft(it.account, &it.message))
+    }
+
+    fn viewing_draft(&self) -> bool {
+        let Some(reader) = &self.reader else {
+            return false;
+        };
+        !self.mouse_blocked()
+            && match self.focus {
+                Focus::Reader => self.reader_is_draft(),
+                Focus::List => {
+                    (reader.thread.is_none() || self.preview_after_batch())
+                        && self.selected_read_index().is_some_and(|i| {
+                            let item = &self.items[i];
+                            reader.is_message(item) && self.is_draft(item.account, &item.message)
+                        })
+                }
+                Focus::Sidebar => false,
+            }
+    }
+
+    fn cancel_draft_edit(&mut self) {
+        if let Some(reader) = &mut self.reader {
+            reader.draft_edit = None;
+        }
+        if matches!(self.pending, Some((_, Pending::EditDraft(_)))) {
+            self.pending = None;
+        }
+    }
+
+    /// Check after each input, not just at completion: returning to a draft
+    /// by preview must not revive an edit the user left.
+    fn cancel_left_draft_edit(&mut self) {
+        let edit = self.reader.as_ref().and_then(|r| r.draft_edit);
+        if edit.is_some() && !self.viewing_draft()
+            || matches!(self.pending, Some((_, Pending::EditDraft(id))) if Some(id) != edit)
+        {
+            self.cancel_draft_edit();
+        }
+    }
+
+    fn finish_draft_edit(&mut self, id: u64, source: &Kept) -> bool {
+        if self.reader.as_ref().and_then(|r| r.draft_edit) != Some(id) {
+            return false;
+        }
+        let reader = self.reader.as_ref().unwrap();
+        let current = self.viewing_draft()
+            && self.accounts[reader.account].id == source.account
+            && reader.folder == source.folder
+            && reader.uid == source.uid
+            && self.uidvalidity(reader.account, &reader.folder) == source.uidvalidity;
+        self.cancel_draft_edit();
+        current
     }
 
     /// The messages an action applies to: those marked with Space, else
@@ -5236,23 +5418,31 @@ impl App {
         self.composer = Some(composer);
     }
 
-    /// Starts a reply, forward or the editing of a draft from the message
-    /// `key`, once its text is here.
+    /// Starts a reply or forward from `key`, once its text is here.
     fn start_from(&mut self, key: (usize, String, u32), pending: Pending) {
-        let id = self.accounts[key.0].id.clone();
-        if let Some(raw) = self
+        self.cancel_draft_edit();
+        let raw = self
             .reader
             .as_ref()
             .filter(|r| r.key() == key)
             .and_then(|r| r.raw.clone())
             .or_else(|| {
                 self.store
-                    .body(&id, &key.1, key.2)
+                    .body(&self.accounts[key.0].id, &key.1, key.2)
                     .ok()
                     .flatten()
                     .map(Arc::new)
-            })
-        {
+            });
+        self.start_from_raw(key, raw, pending);
+    }
+
+    fn start_from_raw(
+        &mut self,
+        key: (usize, String, u32),
+        raw: Option<Arc<Vec<u8>>>,
+        pending: Pending,
+    ) {
+        if let Some(raw) = raw {
             return self.draft_from(key, raw, pending);
         }
         if self.demo || self.accounts[key.0].is_pop() {
@@ -5270,55 +5460,71 @@ impl App {
         self.pending = Some((key, pending));
     }
 
+    fn edit_reader_draft(&mut self) {
+        let reader = self.reader.as_mut().unwrap();
+        if reader.draft_edit.is_some() {
+            return;
+        }
+        reader.marked_read = true;
+        let key = reader.key();
+        let raw = reader.raw.clone();
+        if raw.is_none() && (self.demo || self.accounts[reader.account].is_pop()) {
+            return self.error("That message isn't downloaded");
+        }
+        self.next_draft_edit += 1;
+        reader.draft_edit = Some(self.next_draft_edit);
+        let pending = Pending::EditDraft(self.next_draft_edit);
+        if raw.is_none() && reader.error.is_none() {
+            // The preview already asked for the body.
+            self.info("Downloading the message…");
+            self.pending = Some((key, pending));
+        } else {
+            if raw.is_none() {
+                reader.error = None;
+            }
+            self.start_from_raw(key, raw, pending);
+        }
+    }
+
     fn draft_from(&mut self, key: (usize, String, u32), raw: Arc<Vec<u8>>, pending: Pending) {
         let account = self.accounts[key.0].account.clone();
-        let kept = self.kept(&key);
+        let source = self.kept(&key);
         let tx = self.tx.clone();
-        let account_id = self.accounts[key.0].id.clone();
+        let edit = match pending {
+            Pending::EditDraft(id) => Some(id),
+            _ => None,
+        };
         mail::in_background(
             move || {
                 Some(match pending {
                     Pending::Reply { all } => {
                         let parsed = mail::parse(&raw)?;
-                        (
-                            Kind::Reply,
-                            compose::reply(&parsed, &account, all),
-                            None,
-                            kept,
-                            0,
-                        )
+                        (Kind::Reply, compose::reply(&parsed, &account, all), 0)
                     }
                     Pending::Forward => {
                         let (parsed, contents) = mail::parse_with_contents(&raw)?;
                         let lost = contents.lost();
                         let draft = compose::forward(&parsed, contents.files, &account);
-                        (Kind::Forward, draft, None, kept, lost)
+                        (Kind::Forward, draft, lost)
                     }
-                    Pending::EditDraft => {
+                    Pending::EditDraft(_) => {
                         let (parsed, contents) = mail::parse_with_contents(&raw)?;
                         let lost = contents.lost();
                         let draft = compose::from_saved(&parsed, contents);
-                        // Saving or sending deletes the draft it's made from:
-                        // not one with attachments this one lacks.
-                        let draft_of = (lost == 0).then(|| kept.clone());
-                        (Kind::Draft, draft, draft_of, kept, lost)
+                        (Kind::Draft, draft, lost)
                     }
                 })
             },
             move |result| {
-                let (kind, draft, draft_of, replying, lost) = match result.flatten() {
-                    Some((kind, draft, draft_of, kept, lost)) => {
-                        let replying = (kind == Kind::Reply).then_some(kept);
-                        (kind, Some(draft), draft_of, replying, lost)
-                    }
-                    None => (Kind::New, None, None, None, 0),
+                let (kind, draft, lost) = match result.flatten() {
+                    Some((kind, draft, lost)) => (kind, Some(draft), lost),
+                    None => (Kind::New, None, 0),
                 };
                 let _ = tx.send(AppEvent::Drafted {
-                    account: account_id,
+                    source,
                     kind,
                     draft,
-                    replying,
-                    draft_of,
+                    edit,
                     lost,
                 });
             },
@@ -5600,9 +5806,11 @@ impl App {
         if pop {
             let folder = drafts.unwrap_or_else(|| "Drafts".into());
             let id = self.accounts[i].id.clone();
-            if let Ok(uid) = self.store.add_local(&id, &folder, &built.raw, flags, None) {
-                self.make_previews(i, vec![(folder.clone(), uid, Arc::new(built.raw))]);
-            }
+            let uid = match self.store.add_local(&id, &folder, &built.raw, flags, None) {
+                Ok(uid) => uid,
+                Err(e) => return self.error(format!("Not saved in Drafts: {e:#}")),
+            };
+            self.make_previews(i, vec![(folder.clone(), uid, Arc::new(built.raw))]);
             self.refresh_counts(i, &folder);
             if self.shows(i, &folder) {
                 self.reload();
@@ -5957,7 +6165,10 @@ impl App {
     fn on_terminal(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.on_key(key),
-            Event::Mouse(mouse) => self.on_mouse(mouse),
+            Event::Mouse(mouse) => {
+                self.on_mouse(mouse);
+                self.cancel_left_draft_edit();
+            }
             Event::Resize(..) => {
                 self.link_confirm_visible = false;
                 self.list_hit_area.set(Rect::ZERO);
@@ -6097,6 +6308,7 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.handle_key(key);
+        self.cancel_left_draft_edit();
         // What the key changed is one change, to undo at once.
         let _ = self.keep_change();
     }
@@ -6289,6 +6501,9 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Enter && !ctrl && self.reader_is_draft() {
+            return self.edit_reader_draft();
+        }
         let page = usize::from(self.reader_rows.get().max(2));
         let Some(reader) = self.reader.as_mut() else {
             self.focus = Focus::List;
@@ -6324,6 +6539,7 @@ impl App {
             | KeyCode::Left
             | KeyCode::Backspace
             | KeyCode::Char('q') => {
+                self.cancel_draft_edit();
                 self.focus = Focus::List;
                 if !self.preview_shown()
                     && !self.selected_reader_thread().is_some_and(|t| t.stepped)
@@ -8785,6 +9001,287 @@ pub mod tests {
             app.reader.as_ref().unwrap().key(),
             app.selected_item().unwrap().key()
         );
+    }
+
+    const DRAFT_CONVERSATION: [&[u8]; 3] = [
+        b"From: alice@example.org\r\nSubject: Plans\r\n\
+          Date: Sat, 1 Feb 2025 10:00:00 +0000\r\nMessage-ID: <plans@example.org>\r\n\
+          \r\nLet's make plans.\r\n",
+        b"From: me@example.org\r\nTo: alice@example.org\r\nBcc: archive@example.org\r\n\
+          Subject: Re: Plans\r\nDate: Sat, 1 Feb 2025 10:01:00 +0000\r\n\
+          Message-ID: <unsent@example.org>\r\nIn-Reply-To: <plans@example.org>\r\n\
+          \r\nUnfinished reply.\r\n",
+        b"From: alice@example.org\r\nSubject: Re: Plans\r\n\
+          Date: Sat, 1 Feb 2025 10:02:00 +0000\r\nMessage-ID: <update@example.org>\r\n\
+          In-Reply-To: <plans@example.org>\r\n\r\nA newer reply.\r\n",
+    ];
+
+    fn add_thread_with_uncached_draft(app: &mut App) -> [u32; 3] {
+        let id = app.accounts[0].id.clone();
+        DRAFT_CONVERSATION.map(|raw| {
+            if raw == DRAFT_CONVERSATION[1] {
+                app.store
+                    .add_headers(
+                        &id,
+                        "INBOX",
+                        &[store::Header {
+                            uid: 10,
+                            summary: mail::summarize(raw),
+                            flags: Flags {
+                                draft: true,
+                                ..Flags::default()
+                            },
+                            size: raw.len() as u32,
+                            gmail: None,
+                        }],
+                    )
+                    .unwrap();
+                10
+            } else {
+                app.store
+                    .add_local(&id, "INBOX", raw, Flags::default(), None)
+                    .unwrap()
+            }
+        })
+    }
+
+    async fn take_draft_layout(app: &mut App) -> AppEvent {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = app.test_rx.as_mut().unwrap().recv().await.unwrap();
+                if matches!(event, AppEvent::Drafted { .. }) {
+                    break event;
+                }
+                app.on_event(event);
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn expanded_conversation_draft_reuses_the_preview_and_cancels_on_leaving() {
+        let mut app = app();
+        let uids = add_thread_with_uncached_draft(&mut app);
+        app.demo = false;
+        app.settings.threads_collapsed = false;
+        app.reload();
+        let row = app
+            .visible_items()
+            .position(|(it, _)| it.message.uid == uids[1])
+            .unwrap();
+        app.focus = Focus::List;
+        app.select(row);
+        crate::ui::tests::screen(&mut app, 160, 32);
+        app.open_selected(false);
+        app.on_key(key(KeyCode::Enter));
+        let bodies: Vec<_> = app
+            .test_sent
+            .take()
+            .into_iter()
+            .filter_map(|(_, request)| match request {
+                Request::Body { uid, .. } => Some(uid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies, [uids[1]]);
+        app.on_worker(
+            0,
+            worker::Event::Body {
+                folder: "INBOX".into(),
+                uid: uids[1],
+                result: Ok(Some(DRAFT_CONVERSATION[1].to_vec())),
+            },
+        );
+
+        // Hold the actual composer result until the cursor leaves and returns.
+        let layout = take_draft_layout(&mut app).await;
+        app.on_key(key(KeyCode::Up));
+        assert_ne!(app.selected, row);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.selected, row);
+        app.on_event(layout);
+        assert!(app.composer.is_none(), "returning must not revive the edit");
+
+        // Closing the focused reader leaves the preview, but not the edit.
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::List);
+        let layout = take_draft_layout(&mut app).await;
+        app.on_event(layout);
+        assert!(app.composer.is_none(), "backing out cancels the edit");
+
+        app.on_key(key(KeyCode::Enter));
+        app.wait_until(|a| a.composer.is_some()).await;
+        let draft = app.composer.as_ref().unwrap().draft();
+        assert!(draft.body.contains("Unfinished reply."));
+    }
+
+    #[tokio::test]
+    async fn conversation_draft_is_marked_and_editable_between_other_replies() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        let id = app.accounts[0].id.clone();
+        let uids = add_thread_with_uncached_draft(&mut app);
+        app.settings.threads_collapsed = true;
+        app.reload();
+        app.focus = Focus::List;
+        app.open_selected(false);
+        wait_for_layout(&mut app).await;
+        let shown = screen(&mut app, 160, 32);
+        assert!(shown.contains("▸ 3 [Draft]"), "{shown}");
+        assert!(shown.contains("▸ [Draft] me@example.org"), "{shown}");
+        assert!(shown.contains("A newer reply."), "{shown}");
+        assert!(app.composer.is_none());
+
+        app.demo = false; // Exercise an uncached IMAP draft, without a worker.
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(app.focus, Focus::List);
+        // Enter while the draft is downloading must use the same request.
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::BackTab));
+        let requests = app.test_sent.take();
+        let bodies: Vec<_> = requests
+            .iter()
+            .filter_map(|(_, request)| match request {
+                Request::Body { folder, uid, .. } => Some((folder.as_str(), *uid)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies, [("INBOX", uids[1])]);
+        app.on_worker(
+            0,
+            worker::Event::Body {
+                folder: "INBOX".into(),
+                uid: uids[1],
+                result: Ok(Some(DRAFT_CONVERSATION[1].to_vec())),
+            },
+        );
+        app.demo = true;
+        app.wait_until(|a| a.composer.is_some()).await;
+        let shown = screen(&mut app, 160, 32);
+        assert!(shown.contains("Unfinished reply."), "{shown}");
+        assert!(shown.contains("archive@example.org"), "{shown}");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::List);
+        app.on_key(key(KeyCode::Tab));
+        wait_for_layout(&mut app).await;
+        let shown = screen(&mut app, 160, 32);
+        assert!(shown.contains("▾ [Draft] me@example.org"), "{shown}");
+        assert!(shown.contains("Enter edit draft"), "{shown}");
+        app.on_key(key(KeyCode::Enter));
+        app.wait_until(|a| a.composer.is_some()).await;
+        assert_eq!(
+            app.composer.as_ref().unwrap().draft().bcc,
+            "archive@example.org"
+        );
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char(']')));
+        wait_for_layout(&mut app).await;
+        let shown = screen(&mut app, 160, 32);
+        assert!(shown.contains("Let's make plans."), "{shown}");
+        assert!(app.composer.is_none(), "brackets can pass the draft");
+        app.on_key(key(KeyCode::Char('[')));
+        app.wait_until(|a| a.composer.is_some()).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(app.composer.is_none(), "saved and closed");
+        wait_for_layout(&mut app).await;
+        let shown = screen(&mut app, 160, 32);
+        assert!(shown.contains("Let's make plans."), "{shown}");
+        app.on_key(key(KeyCode::Char('[')));
+        wait_for_layout(&mut app).await;
+        let shown = screen(&mut app, 160, 32);
+        assert!(shown.contains("A newer reply."), "{shown}");
+        assert!(app.composer.is_none());
+
+        for (i, uid) in uids.into_iter().enumerate() {
+            assert_eq!(
+                app.store.message(&id, "INBOX", uid).unwrap().is_some(),
+                i != 1
+            );
+        }
+        let saved = app.store.messages(&id, "Drafts", 10).unwrap();
+        assert_eq!(saved[0].summary.subject, "Re: Plans");
+        assert_eq!(saved[0].summary.in_reply_to, "plans@example.org");
+    }
+
+    #[tokio::test]
+    async fn conversation_enter_edits_the_newest_draft_even_without_the_flag() {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = app.accounts[0].id.clone();
+        for raw in &DRAFT_CONVERSATION[..2] {
+            app.store
+                .add_local(&id, "Drafts", raw, Flags::default(), None)
+                .unwrap();
+        }
+        app.settings.threads_collapsed = true;
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "Drafts".into(),
+        });
+        app.focus = Focus::List;
+        let row = app
+            .visible_items()
+            .position(|(it, n)| n == 2 && it.message.summary.subject == "Re: Plans")
+            .unwrap();
+        app.select(row);
+        app.on_key(key(KeyCode::Enter));
+        app.wait_until(|a| a.composer.is_some()).await;
+        let draft = app.composer.as_ref().unwrap().draft();
+        assert_eq!(draft.to, "alice@example.org");
+        assert!(draft.body.contains("Unfinished reply."));
+    }
+
+    #[tokio::test]
+    async fn saving_a_draft_stays_in_its_expanded_conversation() {
+        let mut app = app();
+        let id = app.accounts[0].id.clone();
+        for (i, raw) in DRAFT_CONVERSATION[..2].iter().enumerate() {
+            let flags = Flags {
+                draft: i == 1,
+                ..Flags::default()
+            };
+            app.store.add_local(&id, "INBOX", raw, flags, None).unwrap();
+        }
+        for second in [10, 20] {
+            let raw = format!(
+                "From: cam@example.org\r\nSubject: Unrelated {second}\r\n\
+                 Date: Sat, 1 Feb 2025 10:00:{second} +0000\r\n\r\nSeparate mail.\r\n"
+            );
+            app.store
+                .add_local(&id, "INBOX", raw.as_bytes(), Flags::default(), None)
+                .unwrap();
+        }
+        app.settings.threads_collapsed = false;
+        app.reload();
+        app.focus = Focus::List;
+        let row = app
+            .visible_items()
+            .position(|(item, _)| item.message.summary.subject == "Re: Plans")
+            .unwrap();
+        app.select(row);
+        app.on_key(key(KeyCode::Enter));
+        app.wait_until(|a| a.composer.is_some()).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let picked = &app.selected_item().unwrap().message.summary;
+        assert_eq!(
+            picked.subject, "Plans",
+            "the conversation moved below other mail"
+        );
+        assert!(app.composer.is_none());
+
+        app.wait_until(|a| {
+            a.store
+                .messages(&id, "Drafts", 1)
+                .unwrap()
+                .first()
+                .is_some_and(|m| m.preview.contains("Unfinished reply."))
+        })
+        .await;
     }
 
     #[tokio::test]

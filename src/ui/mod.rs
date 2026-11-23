@@ -29,6 +29,8 @@ const NARROW: u16 = 70;
 /// From this width (beside the sidebar), the message shows beside the list.
 const WIDE: u16 = 100;
 
+const DRAFT_BADGE: &str = "[Draft] ";
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.list_hit_area.set(Rect::ZERO);
@@ -727,8 +729,9 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 35] = [
+const HELP: [(&str, &str); 36] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
+    ("Enter", "open a draft in the composer (list or reader)"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
     ("c", "write a message"),
