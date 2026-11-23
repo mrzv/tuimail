@@ -562,6 +562,8 @@ struct ReaderThread {
     /// Indices into App::items, newest first.
     members: Vec<usize>,
     active: usize,
+    /// The user chose this reply with a bracket, rather than previewing the row.
+    stepped: bool,
 }
 
 impl Reader {
@@ -890,8 +892,11 @@ pub struct App {
     pub(crate) reader_view: Option<BodyView>,
     /// The reader pane's width, from the last frame.
     pub reader_width: Cell<u16>,
-    /// The window is wide enough to show the message beside the list.
+    /// Whether the last drawn layout could show the reader beside the list.
     pub wide: Cell<bool>,
+    /// The last resize in the current input batch, used for where a stepped
+    /// reply will be visible. Other keys act on the layout on screen.
+    batch_resize_width: Option<u16>,
     /// The reader's height in rows, from the last frame (for paging).
     pub reader_rows: Cell<u16>,
     pub list_rows: Cell<u16>,
@@ -1083,6 +1088,7 @@ impl App {
             reader_view: None,
             reader_width: Cell::new(80),
             wide: Cell::new(false),
+            batch_resize_width: None,
             reader_rows: Cell::new(20),
             list_rows: Cell::new(20),
             renders: 0,
@@ -3012,20 +3018,23 @@ impl App {
             }
         }
         // Open already; Enter downloads again one that failed.
-        if let Some(reader) = &self.reader
+        if let Some(reader) = &mut self.reader
             && reader.is_message(item)
             && !(enter && reader.raw.is_none() && reader.error.is_some())
         {
+            if let Some(thread) = &mut reader.thread {
+                thread.stepped = false;
+            }
             if enter {
                 self.focus = Focus::Reader;
                 self.mark_reader_read();
             }
             return;
         }
-        self.open_message(index, enter, self.thread_for(index), None);
+        self.open_message(index, enter, self.thread_for(index, false), None);
     }
 
-    fn thread_for(&self, index: usize) -> Option<ReaderThread> {
+    fn thread_for(&self, index: usize, stepped: bool) -> Option<ReaderThread> {
         let row = self.rows.get(self.row_for(index))?;
         if row.members.len() < 2 {
             return None;
@@ -3034,7 +3043,11 @@ impl App {
         members
             .sort_unstable_by_key(|&i| (std::cmp::Reverse(self.items[i].message.summary.date), i));
         let active = members.iter().position(|&i| i == index)?;
-        Some(ReaderThread { members, active })
+        Some(ReaderThread {
+            members,
+            active,
+            stepped,
+        })
     }
 
     fn refresh_reader_thread(&mut self) {
@@ -3058,7 +3071,8 @@ impl App {
             }
             return;
         }
-        let thread = index.and_then(|i| self.thread_for(i));
+        let stepped = reader.thread.as_ref().is_some_and(|t| t.stepped);
+        let thread = index.and_then(|i| self.thread_for(i, stepped));
         let previous = reader.thread.as_ref().map(|t| t.active);
         let active = thread.as_ref().map(|t| t.active);
         let reader = self.reader.as_mut().unwrap();
@@ -3078,11 +3092,30 @@ impl App {
         ))
     }
 
+    fn selected_reader_thread(&self) -> Option<&ReaderThread> {
+        let row = self.rows.get(self.selected)?;
+        let thread = self.reader.as_ref()?.thread.as_ref()?;
+        row.members
+            .contains(&thread.members[thread.active])
+            .then_some(thread)
+    }
+
     fn step_thread(&mut self, by: isize) {
-        let Some(reader) = self.reader.as_mut() else {
-            return;
+        let from_list = self.focus == Focus::List;
+        let shown = if from_list {
+            self.selected_reader_thread()
+        } else {
+            self.reader.as_ref().and_then(|r| r.thread.as_ref())
         };
-        let Some(thread) = reader.thread.as_mut() else {
+        // The preview can still show the previous row (or not be open yet).
+        let fresh = if from_list && shown.is_none() {
+            self.rows
+                .get(self.selected)
+                .and_then(|row| self.thread_for(row.newest, false))
+        } else {
+            None
+        };
+        let Some(thread) = shown.or(fresh.as_ref()) else {
             return;
         };
         let Some(next) = thread
@@ -3092,13 +3125,27 @@ impl App {
         else {
             return;
         };
+        let (mut thread, plain) = if let Some(thread) = fresh {
+            (thread, None)
+        } else {
+            let reader = self.reader.as_mut().unwrap();
+            (reader.thread.take().unwrap(), reader.plain)
+        };
         thread.active = next;
+        thread.stepped = true;
         let index = thread.members[next];
-        let plain = reader.plain;
-        let thread = reader.thread.take();
+        let keep_list_focus = from_list
+            && self.settings.preview
+            && match self.batch_resize_width {
+                Some(width) => crate::ui::pane_widths(&self.settings, width).1,
+                None => self.wide.get(),
+            };
         self.moved_at = None;
         self.selected = self.row_for(index);
-        self.open_message(index, true, thread, plain);
+        self.open_message(index, true, Some(thread), plain);
+        if keep_list_focus {
+            self.focus = Focus::List;
+        }
     }
 
     fn open_message(
@@ -4801,7 +4848,11 @@ impl App {
             self.items.retain(|it| !keys.contains(&it.key()));
             self.rebuild_rows(None);
         }
-        self.moved_at = Some(Instant::now());
+        // Keep a chosen reply if it's still in the selected conversation.
+        // An ordinary preview must follow the row's newest message.
+        if !self.selected_reader_thread().is_some_and(|t| t.stepped) {
+            self.moved_at = Some(Instant::now());
+        }
     }
 
     /// Moves messages to `to` (a folder of the same account).
@@ -5751,13 +5802,21 @@ impl App {
     /// commands. Where something is being written it's added as text;
     /// elsewhere it's ignored. A key held down acts as usual.
     fn on_terminal_events(&mut self, events: Vec<Event>) {
-        let presses: Vec<KeyEvent> = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Key(key) if key.kind != KeyEventKind::Release => Some(*key),
-                _ => None,
-            })
-            .collect();
+        let mut presses = Vec::new();
+        let mut width = None;
+        for event in &events {
+            match *event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => presses.push(key),
+                Event::Resize(columns, _) => width = Some(columns),
+                _ => {}
+            }
+        }
+        self.batch_resize_width = width;
+        self.dispatch_terminal_events(events, &presses);
+        self.batch_resize_width = None;
+    }
+
+    fn dispatch_terminal_events(&mut self, events: Vec<Event>, presses: &[KeyEvent]) {
         let repeated = presses.windows(2).all(|w| w[0].code == w[1].code);
         if presses.len() < 2 || repeated {
             return events.into_iter().for_each(|event| self.on_terminal(event));
@@ -6068,6 +6127,8 @@ impl App {
             KeyCode::Char('t') => self.pick_tag(),
             KeyCode::Char('s') => self.toggle_flag(FlagKind::Flagged),
             KeyCode::Char('u') => self.toggle_flag(FlagKind::Seen),
+            KeyCode::Char('[') => self.step_thread(-1),
+            KeyCode::Char(']') => self.step_thread(1),
             _ => return false,
         }
         true
@@ -6162,8 +6223,6 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => reader.scroll = usize::MAX / 2,
             KeyCode::Char('J') | KeyCode::Char('n') => self.step_message(1),
             KeyCode::Char('K') | KeyCode::Char('p') => self.step_message(-1),
-            KeyCode::Char('[') if !ctrl => self.step_thread(-1),
-            KeyCode::Char(']') if !ctrl => self.step_thread(1),
             KeyCode::Char('o') => self.pick_link(),
             KeyCode::Char('U') => self.unsubscribe(),
             KeyCode::Char('A') | KeyCode::Char('w') => self.pick_attachment(),
@@ -8370,6 +8429,121 @@ pub mod tests {
             "{list}"
         );
         assert_eq!(app.selected_item().unwrap().key(), newer);
+    }
+
+    #[tokio::test]
+    async fn conversation_shortcuts_follow_the_list_selection_before_preview() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.on_key(key(KeyCode::Char('d'))); // Move an unrelated message first.
+        let root = app
+            .items
+            .iter()
+            .position(|it| it.message.summary.subject == "Design review notes")
+            .unwrap();
+        app.select(root);
+        app.on_key(key(KeyCode::Char('v')));
+        let conversation = app.selected;
+        screen(&mut app, 160, 32);
+
+        // Step without waiting for the newest message to be previewed.
+        app.on_key(key(KeyCode::Char(']')));
+        wait_for_layout(&mut app).await;
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.selected, conversation);
+        assert!(screen(&mut app, 160, 32).contains("Agreed on all three"));
+        app.on_key(key(KeyCode::Char('z')));
+        if let Some(at) = &mut app.moved_at {
+            *at -= PREVIEW_AFTER;
+        }
+        app.on_tick();
+        wait_for_layout(&mut app).await;
+        assert!(screen(&mut app, 160, 32).contains("Agreed on all three"));
+
+        app.on_key(key(KeyCode::Char('[')));
+        wait_for_layout(&mut app).await;
+        assert!(screen(&mut app, 160, 32).contains("Yes: one popup"));
+        let conversation = app.selected; // Undo can shift the conversation to another row.
+
+        // Don't move back to the old conversation when its preview is stale.
+        let single = app
+            .rows
+            .iter()
+            .position(|row| row.members.len() == 1)
+            .unwrap();
+        app.select(single);
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(app.selected, single);
+        assert_eq!(app.focus, Focus::List);
+
+        app.select(conversation);
+        for resize_first in [true, false] {
+            app.focus = Focus::List;
+            app.open_selected(false);
+            screen(&mut app, 160, 32);
+            let mut batch = vec![Event::Resize(99, 32), Event::Key(key(KeyCode::Char(']')))];
+            if !resize_first {
+                batch.swap(0, 1);
+            }
+            app.on_terminal_events(batch);
+            wait_for_layout(&mut app).await;
+            assert_eq!(app.focus, Focus::Reader);
+            assert!(screen(&mut app, 99, 32).contains("Agreed on all three"));
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_back_key_keeps_its_meaning_during_a_resize() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.open_selected(true);
+        crate::ui::tests::screen(&mut app, 99, 32);
+
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Char('q'))),
+            Event::Resize(160, 32),
+        ]);
+
+        assert_eq!(app.focus, Focus::List);
+        assert!(!app.quit);
+    }
+
+    #[tokio::test]
+    async fn conversation_preview_returns_to_the_newest_after_undo() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.threads_collapsed = true;
+        app.reload();
+        app.focus = Focus::List;
+        crate::ui::tests::screen(&mut app, 160, 32);
+        let conversation = |app: &App| {
+            let root = app
+                .items
+                .iter()
+                .position(|it| it.message.summary.subject == "Design review notes")
+                .unwrap();
+            app.row_for(root)
+        };
+        app.select(conversation(&app));
+        app.open_selected(false);
+        app.on_key(key(KeyCode::Char('d')));
+        app.select(conversation(&app));
+        *app.moved_at.as_mut().unwrap() -= PREVIEW_AFTER;
+        app.on_tick();
+        let older = app.selected_item().unwrap().key();
+        assert_eq!(app.reader.as_ref().unwrap().key(), older);
+
+        app.on_key(key(KeyCode::Char('z')));
+        if let Some(at) = &mut app.moved_at {
+            *at -= PREVIEW_AFTER;
+        }
+        app.on_tick();
+        let newest = app.selected_item().unwrap().key();
+        assert_ne!(older, newest);
+        assert_eq!(app.reader.as_ref().unwrap().key(), newest);
     }
 
     #[tokio::test]

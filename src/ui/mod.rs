@@ -58,10 +58,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The sidebar width (zero when only one pane fits) and whether a preview fits.
+pub(crate) fn pane_widths(settings: &Settings, width: u16) -> (u16, bool) {
+    if width < NARROW {
+        return (0, false);
+    }
+    let side = settings.sidebar_width().min(width / 3);
+    (side, width - side >= WIDE)
+}
+
 /// The sidebar, the list and the reader, as many as fit.
 fn panes(frame: &mut Frame, app: &mut App, body: Rect) {
-    if body.width < NARROW {
-        app.wide.set(false);
+    let (side, wide) = pane_widths(&app.settings, body.width);
+    app.wide.set(wide);
+    if side == 0 {
         let shown = match app.focus {
             Focus::Reader if app.reader.is_some() => Focus::Reader,
             Focus::Sidebar => Focus::Sidebar,
@@ -74,12 +84,9 @@ fn panes(frame: &mut Frame, app: &mut App, body: Rect) {
         }
         return;
     }
-    let side = app.settings.sidebar_width().min(body.width / 3);
     let [side_area, rest] =
         Layout::horizontal([Constraint::Length(side), Constraint::Fill(1)]).areas(body);
     sidebar::draw(frame, app, side_area);
-    let wide = rest.width >= WIDE;
-    app.wide.set(wide);
     if wide && app.settings.preview {
         let list_width = (rest.width / 2).max(40);
         let [list_area, reader_area] =
@@ -743,7 +750,7 @@ const HELP: [(&str, &str); 35] = [
     ("Esc", "clear selection, end search, unmark, back"),
     ("v", "collapse or expand the conversation (list)"),
     ("J  K", "next, previous list row (reading)"),
-    ("[  ]", "open the newer, older message in a conversation"),
+    ("[  ]", "newer, older reply (conversation list or reader)"),
     ("Space  b", "a page down, up (reading)"),
     ("Drag  y", "select message text with the mouse, y to copy"),
     ("Click", "show a web link's destination before opening"),

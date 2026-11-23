@@ -123,7 +123,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `v` | Collapse / expand the selected conversation in the message list |
 | `/` | Search; `Esc` ends it |
 | `J` / `K` | Reading: next / previous list row |
-| `[` / `]` | Reading a conversation: open the newer / older message |
+| `[` / `]` | Open the newer / older message in a collapsed conversation, from the list or reader |
 | `Space` / `b` | Reading: a page down / up |
 | Left drag over message text, then `y` | Select the visible text and copy it to the clipboard; `Esc` clears the selection |
 | Left click on a web link | Inspect the destination and confirm before opening |
