@@ -1,0 +1,21 @@
+# Pure black in panes and popups; a charcoal surface marks selection.
+
+name = "High Contrast Black"
+
+[palette]
+bg = "#000000"
+bg_alt = "#000000"
+surface = "#303030"
+overlay = "#949494"
+comment = "#c0c0c0"
+subtext = "#e0e0e0"
+fg = "#ffffff"
+red = "#ff9090"
+orange = "#ffc184"
+yellow = "#ffec99"
+green = "#a4f7b1"
+cyan = "#a6f5ff"
+blue = "#8ecbff"
+purple = "#e0bcff"
+pink = "#ffc0e0"
+accent = "#ffffff"

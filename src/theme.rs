@@ -1,6 +1,5 @@
-//! Color themes: the same sixteen-color palettes as tuigram, tuimeta and
-//! tuitube (`themes/` in the repository), mapped to what tuimail paints by
-//! role, so drawing code never names a palette color directly.
+//! Sixteen-color palettes (`themes/` in the repository), mapped to what
+//! tuimail paints by role, so drawing code never names a palette color directly.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -12,7 +11,7 @@ use serde::Deserialize;
 pub const DEFAULT: &str = "mocha";
 
 /// The built-in themes by name, lightest Catppuccin flavor first.
-pub const BUILT_IN: [(&str, &str); 9] = [
+pub const BUILT_IN: [(&str, &str); 10] = [
     ("latte", include_str!("../themes/latte.toml")),
     ("frappe", include_str!("../themes/frappe.toml")),
     ("macchiato", include_str!("../themes/macchiato.toml")),
@@ -22,6 +21,10 @@ pub const BUILT_IN: [(&str, &str); 9] = [
     ("gruvbox", include_str!("../themes/gruvbox.toml")),
     ("nord", include_str!("../themes/nord.toml")),
     ("rose-pine", include_str!("../themes/rose-pine.toml")),
+    (
+        "high-contrast",
+        include_str!("../themes/high-contrast.toml"),
+    ),
 ];
 
 #[derive(Deserialize)]

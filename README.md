@@ -37,7 +37,7 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 - **AI agents, on your terms.** Claude Code, Claude Desktop, Cursor or any MCP client can read and sort your mail through `tuimail mcp`: mark, star, tag, move, mark spam, move to Trash. Each change asks you first (unless you say not to), shows on the screen and undoes with `z`. Agents can't delete anything for good, send, or open links.
 - **Works offline.** Headers and the messages you've opened are kept in a local cache, so the list and what you've read are there without a connection.
 - **Set up in a minute.** Type your address and password: the servers fill in for Gmail, iCloud, Outlook, Yahoo, Fastmail, Proton (through its Bridge), Zoho, GMX, WEB.DE, Yandex, Mail.ru, Posteo, mailbox.org and more, or are guessed for others. tuimail logs in to check before saving.
-- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (picked in the settings, `O`), and Nerd Font icons where your terminal has them.
+- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord, Rosé Pine and High Contrast Black themes (picked in the settings, `O`), and Nerd Font icons where your terminal has them.
 - **Private by design.** No account with anyone but your mail provider, no telemetry, no servers in between. Your mail, accounts and settings stay on your computer, readable only by you.
 
 ## Get started
@@ -282,10 +282,12 @@ Under **Reading**, **Hide trailing quoted text** hides `>`-quoted plain text and
 
 Under **Sidebar**, choose **Choose which folders to show**. Use `j` / `k` to move and `Enter` or `Space` to show or hide a folder. Changes are saved immediately, separately for each account. Use the same list to bring hidden folders back. Hiding a folder only removes its sidebar row: its subfolders are controlled separately, and mail still syncs and can be moved there.
 
+Under **Theme**, choose **High Contrast Black** for white text on a pure black background, with a charcoal highlight for the selected row.
+
 Everything else is in `settings.toml` in [your config folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
 
 ```toml
-theme = "mocha"          # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
+theme = "mocha"          # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine, high-contrast
 icons = "auto"           # auto (Nerd Font icons in Ghostty, kitty and WezTerm), nerd or plain
 notifications = "auto"   # auto (what your terminal understands), off, bell, osc9, osc777 or osc99
 preview = true           # the open message beside the list, when the window is wide enough
