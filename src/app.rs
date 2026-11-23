@@ -9404,6 +9404,7 @@ pub mod tests {
             .find(|folder| folder.role == Some(Role::Drafts))
             .unwrap();
         drafts.name = "Saved replies".into();
+        drafts.shown.clone_from(&drafts.name);
         let drafts = drafts.name.clone();
         app.store.set_folders(&id, &folders).unwrap();
         app.accounts[0].folders = folders;
@@ -9443,6 +9444,13 @@ pub mod tests {
             }),
         );
         app.focus = Focus::List;
+        app.toggle_conversation();
+        let shown = screen(&mut app, 160, 32);
+        assert!(
+            shown.contains(&format!("{} Re: Plans", app.icons.drafts)),
+            "{shown}"
+        );
+        app.toggle_conversation();
         app.open_selected(false);
         wait_for_layout(&mut app).await;
         for icons in [crate::icons::PLAIN, crate::icons::NERD] {
@@ -9586,6 +9594,16 @@ pub mod tests {
             },
         );
         assert_eq!(rows(&app), [(1, 2, 2), (0, 2, 2)]);
+        let shown = crate::ui::tests::screen(&mut app, 180, 32);
+        for account in ["work", "home"] {
+            assert!(
+                shown.contains(&format!(
+                    "▸ 2 {} [{account}] Unfinished reply",
+                    app.icons.drafts
+                )),
+                "{shown}"
+            );
+        }
         app.run_search("Plans");
         assert_eq!(rows(&app), [(1, 1, 1), (0, 1, 1)]);
         app.search = None;

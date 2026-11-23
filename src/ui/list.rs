@@ -161,9 +161,10 @@ fn row(
         .get(item.account)
         .and_then(|a| a.folders.iter().find(|f| f.name == m.folder))
         .and_then(|f| f.role);
+    let draft_folder = role == Some(Role::Drafts);
     let sent = role == Some(Role::Sent) || m.gmail.is_some_and(|g| g.sent);
     // In Sent and Drafts, who it's to matters.
-    let who = if sent || m.flags.draft || role == Some(Role::Drafts) {
+    let who = if sent || m.flags.draft || draft_folder {
         let to = m.summary.to.split(',').next().unwrap_or("").trim();
         let to = to.split('<').next().unwrap_or(to).trim().trim_matches('"');
         format!("To {}", if to.is_empty() { "?" } else { to })
@@ -203,38 +204,39 @@ fn row(
     };
     let who_style = strong(Style::new().fg(if unread { c.text } else { c.subtext }));
     let subject_style = strong(Style::new().fg(if unread { c.text } else { c.subtext }));
-    // Results outside the displayed folder say where they are kept.
+    // The pencil already identifies Drafts; other rows show their source.
     let outside = match &app.place {
         Place::Folder { account, folder } => *account != item.account || *folder != m.folder,
         Place::AllInboxes => app.accounts[item.account].inbox() != m.folder,
     };
-    let folder_icon = if sent && (app.search.is_some() || outside || role != Some(Role::Sent)) {
+    let show_folder = !draft_folder && (app.search.is_some() || outside);
+    let show_account = matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1;
+    let folder_icon = if draft_folder {
+        None
+    } else if sent && (show_folder || role != Some(Role::Sent)) {
         Some(icons.sent)
-    } else if role == Some(Role::All) && (app.search.is_some() || outside) {
+    } else if role == Some(Role::All) && show_folder {
         Some(icons.all)
     } else {
         None
     };
     let folder = if let Some(icon) = folder_icon {
-        if matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1 {
+        if show_account {
             format!("{} [{}] ", icon, fit(&app.account_tag(item.account), 10))
         } else {
             format!("{icon} ")
         }
-    } else if app.search.is_some()
-        || outside
-        || matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1
-    {
-        let label = match app.place {
-            Place::AllInboxes if app.accounts.len() > 1 && outside => {
+    } else if show_folder || show_account {
+        let label = match (show_account, outside && show_folder) {
+            (true, true) => {
                 format!(
                     "{} · {}",
                     app.folder_name(item.account, &m.folder),
                     app.account_tag(item.account)
                 )
             }
-            Place::AllInboxes if app.accounts.len() > 1 => app.account_tag(item.account),
-            _ => app.folder_name(item.account, &m.folder),
+            (true, false) => app.account_tag(item.account),
+            (false, _) => app.folder_name(item.account, &m.folder),
         };
         format!("[{}] ", fit(&label, 10))
     } else {
