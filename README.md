@@ -138,7 +138,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 Web links are blue, without an underline, in both plain-text and HTML views. HTML links on images can be clicked on their alt text; images are never fetched. Tuimail does not emit terminal hyperlink codes. Use `o` for `mailto:` links to write the message in tuimail.
 Links split by `format=flowed` email wrapping keep their full destination on every displayed row. Literal line breaks in fixed plain text are not joined.
 
-Open a collapsed conversation to see its messages newest first, starting with the newest body expanded. Switching focus between the list and reader keeps the reply you chose. List actions such as starring or moving still target the newest message, not the whole conversation; in the reader they target the opened reply.
+Open a collapsed conversation to see its messages newest first, starting with the newest body expanded. Switching focus between the list and reader keeps the reply you chose. Switching formats with `H` keeps a visible reply header on the same line. List actions such as starring or moving still target the newest message, not the whole conversation; in the reader they target the opened reply.
 
 To start with conversations collapsed, turn on **Collapse threads into conversations by default** in `O`. Changing the default resets individual `v` choices. The setting has no effect when threading is off or when viewing search results.
 

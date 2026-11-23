@@ -446,7 +446,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         let max = (lines.len()
             + body_lines.len()
             + thread.as_ref().map_or(0, |(members, _)| members.len()))
-        .saturating_sub(rows);
+        .saturating_sub(rows)
+        .max(reader.format_scroll_anchor);
         let scroll = reader.scroll.min(max);
         let body = body_lines.iter().map(|line| body_line(line, &c));
         // Lines wider than the pane are cut, not wrapped.
@@ -501,7 +502,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     app.reader_view = body_view;
     if let Some(reader) = app.reader.as_mut() {
-        reader.scroll = scroll;
+        reader.record_scroll(scroll, rows);
     }
     scrollbar(frame, area, max, scroll, &c);
 }
@@ -618,13 +619,17 @@ mod tests {
         let mut app = app();
         with_mail(&mut app);
         let (account, folder, uid) = app.items[0].key();
-        let raw = b"From: sender@example.org\r\nMIME-Version: 1.0\r\n\
-                    Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
-                    --alt\r\nContent-Type: text/plain\r\n\r\nPlain version.\r\n\
-                    --alt\r\nContent-Type: text/html\r\n\r\n<p>HTML version.</p>\r\n\
-                    --alt--\r\n";
+        let plain = "More plain.\r\n".repeat(24);
+        let html = "<p>More HTML.</p>".repeat(40);
+        let raw = format!(
+            "From: sender@example.org\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+             --alt\r\nContent-Type: text/plain\r\n\r\nPlain version.\r\n{plain}\r\n\
+             --alt\r\nContent-Type: text/html\r\n\r\n<p>HTML version.</p>{html}<p>End of HTML.</p>\r\n\
+             --alt--\r\n"
+        );
         app.store
-            .save_body(&app.accounts[account].id, &folder, uid, raw)
+            .save_body(&app.accounts[account].id, &folder, uid, raw.as_bytes())
             .unwrap();
         open_first(&mut app).await;
 
@@ -635,6 +640,8 @@ mod tests {
             assert!(shown.contains(text), "{shown}");
         };
         check(&mut app, " HTML ╮", "HTML version.");
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        check(&mut app, " HTML ╮", "End of HTML.");
         app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
         check(&mut app, " HTML ╮", "HTML version.");
         wait_for_layout(&mut app).await;

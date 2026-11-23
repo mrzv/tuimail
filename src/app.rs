@@ -548,6 +548,12 @@ pub struct Reader {
     /// A layout is being made (its number).
     pending: Option<u64>,
     pub scroll: usize,
+    /// Last drawn offset with the active reply's header visible, or zero.
+    drawn_reply_scroll: usize,
+    /// Keep that offset when the requested format replaces the current body.
+    keep_reply_position: bool,
+    /// Keeps a visible reply header in place if switching formats shortens its body.
+    pub(crate) format_scroll_anchor: usize,
     thread: Option<ReaderThread>,
     pub error: Option<String>,
     /// The plain part (true) or the HTML (false), chosen with `H`.
@@ -567,6 +573,20 @@ struct ReaderThread {
 }
 
 impl Reader {
+    fn set_scroll(&mut self, scroll: usize) {
+        self.scroll = scroll;
+        self.format_scroll_anchor = self.format_scroll_anchor.min(scroll);
+    }
+
+    pub(crate) fn record_scroll(&mut self, scroll: usize, rows: usize) {
+        self.scroll = scroll;
+        self.drawn_reply_scroll = self
+            .thread
+            .as_ref()
+            .filter(|thread| (scroll..scroll + rows).contains(&thread.active))
+            .map_or(0, |_| scroll);
+    }
+
     pub fn key(&self) -> (usize, String, u32) {
         (self.account, self.folder.clone(), self.uid)
     }
@@ -1749,6 +1769,10 @@ impl App {
                     return;
                 }
                 reader.pending = None;
+                if reader.keep_reply_position {
+                    reader.format_scroll_anchor = reader.drawn_reply_scroll.min(reader.scroll);
+                    reader.keep_reply_position = false;
+                }
                 reader.layout_generation = generation;
                 reader.width = width;
                 match (parsed, body) {
@@ -3105,6 +3129,9 @@ impl App {
         let reader = self.reader.as_mut().unwrap();
         if previous != active {
             reader.scroll = active.unwrap_or(0);
+            reader.drawn_reply_scroll = 0;
+            reader.keep_reply_position = false;
+            reader.format_scroll_anchor = 0;
         }
         reader.thread = thread;
     }
@@ -3197,7 +3224,11 @@ impl App {
         }
         if let Some(reader) = &mut self.reader {
             reader.plain = Some(!reader.plain.unwrap_or(self.settings.prefer_plain));
-            reader.scroll = reader.thread.as_ref().map_or(0, |t| t.active);
+            if reader.thread.is_some() {
+                reader.keep_reply_position = reader.body.is_some() && reader.error.is_none();
+            } else {
+                reader.set_scroll(0);
+            }
             self.render();
         }
     }
@@ -3233,6 +3264,9 @@ impl App {
             width: 0,
             pending: None,
             scroll: thread.as_ref().map_or(0, |t| t.active),
+            drawn_reply_scroll: 0,
+            keep_reply_position: false,
+            format_scroll_anchor: 0,
             thread,
             error: None,
             plain,
@@ -6244,7 +6278,7 @@ impl App {
             Focus::List => self.select(i),
             Focus::Reader => {
                 if let Some(reader) = self.reader.as_mut() {
-                    reader.scroll = if i == 0 { 0 } else { usize::MAX / 2 };
+                    reader.set_scroll(if i == 0 { 0 } else { usize::MAX / 2 });
                 }
             }
         }
@@ -6261,23 +6295,25 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => reader.scroll += 1,
-            KeyCode::Char('k') | KeyCode::Up => reader.scroll = reader.scroll.saturating_sub(1),
-            KeyCode::Char('d') if ctrl => reader.scroll += page / 2,
-            KeyCode::Char('u') if ctrl => reader.scroll = reader.scroll.saturating_sub(page / 2),
-            KeyCode::Char(' ') | KeyCode::PageDown => reader.scroll += page.saturating_sub(2),
+            KeyCode::Char('j') | KeyCode::Down => reader.set_scroll(reader.scroll + 1),
+            KeyCode::Char('k') | KeyCode::Up => reader.set_scroll(reader.scroll.saturating_sub(1)),
+            KeyCode::Char('d') if ctrl => reader.set_scroll(reader.scroll + page / 2),
+            KeyCode::Char('u') if ctrl => reader.set_scroll(reader.scroll.saturating_sub(page / 2)),
+            KeyCode::Char(' ') | KeyCode::PageDown => {
+                reader.set_scroll(reader.scroll + page.saturating_sub(2))
+            }
             KeyCode::Char('b') | KeyCode::PageUp => {
-                reader.scroll = reader.scroll.saturating_sub(page.saturating_sub(2))
+                reader.set_scroll(reader.scroll.saturating_sub(page.saturating_sub(2)))
             }
             KeyCode::Char('g') => self.pending_g = true,
-            KeyCode::Home => reader.scroll = 0,
+            KeyCode::Home => reader.set_scroll(0),
             KeyCode::Char('y') if key.modifiers.is_empty() => {
                 if let Some(text) = reader.selected_text() {
                     self.copy(&text);
                 }
             }
             KeyCode::Esc if reader.has_selection() => reader.selection = None,
-            KeyCode::Char('G') | KeyCode::End => reader.scroll = usize::MAX / 2,
+            KeyCode::Char('G') | KeyCode::End => reader.set_scroll(usize::MAX / 2),
             KeyCode::Char('J') | KeyCode::Char('n') => self.step_message(1),
             KeyCode::Char('K') | KeyCode::Char('p') => self.step_message(-1),
             KeyCode::Char('o') => self.pick_link(),
@@ -8632,32 +8668,108 @@ pub mod tests {
             .position(|it| it.message.summary.subject == "Design review notes")
             .unwrap();
         let (account, folder, uid) = app.items[root + 1].key();
+        let more = "<p>More HTML.</p>".repeat(40);
+        let raw = format!(
+            "From: leo@example.com\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+             --alt\r\nContent-Type: text/plain\r\n\r\nPlain reply from Leo.\r\n\
+             --alt\r\nContent-Type: text/html\r\n\r\n<p>HTML reply from Leo.</p>{more}\r\n\
+             --alt--\r\n"
+        );
         app.store
-            .save_body(
-                &app.accounts[account].id,
-                &folder,
-                uid,
-                b"From: leo@example.com\r\nMIME-Version: 1.0\r\n\
-                  Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
-                  --alt\r\nContent-Type: text/plain\r\n\r\nPlain reply from Leo.\r\n\
-                  --alt\r\nContent-Type: text/html\r\n\r\n<p>HTML reply from Leo.</p>\r\n\
-                  --alt--\r\n",
-            )
+            .save_body(&app.accounts[account].id, &folder, uid, raw.as_bytes())
             .unwrap();
         app.select(root);
         app.on_key(key(KeyCode::Char('v')));
         screen(&mut app, 160, 32);
-        app.on_key(key(KeyCode::Char(']')));
+        let view = |app: &mut App| {
+            let shown = screen(app, 160, 32);
+            let row = shown
+                .lines()
+                .position(|line| line.contains("▾ leo@example.com"))
+                .unwrap_or_else(|| panic!("{shown}"));
+            (shown, row)
+        };
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Char(']'))),
+            Event::Key(key(KeyCode::Char('H'))),
+        ]);
         wait_for_layout(&mut app).await;
-        assert!(screen(&mut app, 160, 32).contains("HTML reply from Leo."));
+        let (shown, header) = view(&mut app);
+        assert!(shown.contains("Plain reply from Leo."), "{shown}");
+        assert!(
+            shown
+                .lines()
+                .take(header)
+                .any(|line| line.contains("▸ maya@example.com")),
+            "format toggle before the first draw must not hide the newer reply: {shown}"
+        );
 
         app.on_key(key(KeyCode::Char('H')));
         wait_for_layout(&mut app).await;
-        let shown = screen(&mut app, 160, 32);
+        let (shown, html_header) = view(&mut app);
+        assert_eq!(html_header, header);
+        assert!(shown.contains("HTML reply from Leo."), "{shown}");
+
+        app.on_key(key(KeyCode::Char('H')));
+        assert_eq!(view(&mut app).1, header, "while the new body is laying out");
+        wait_for_layout(&mut app).await;
+        let (shown, plain_header) = view(&mut app);
+        assert_eq!(plain_header, header);
         assert_eq!(app.focus, Focus::List);
         assert!(shown.lines().next().unwrap().ends_with(" Plain text ╮"));
         assert!(shown.contains("Plain reply from Leo."), "{shown}");
         assert!(!shown.contains("HTML reply from Leo."), "{shown}");
+
+        // Even if the shorter part fits the pane, keep the reply's header on its row.
+        app.on_key(key(KeyCode::Char('H')));
+        wait_for_layout(&mut app).await;
+        assert_eq!(view(&mut app).1, header);
+        app.on_key(key(KeyCode::Tab));
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Down)),
+            Event::Key(key(KeyCode::Char('H'))),
+        ]);
+        let (outgoing, scrolled) = view(&mut app);
+        assert!(outgoing.contains("HTML reply from Leo."), "{outgoing}");
+        assert_eq!(scrolled + 1, header);
+        wait_for_layout(&mut app).await;
+        let (shown, short_header) = view(&mut app);
+        assert!(shown.contains("Plain reply from Leo."), "{shown}");
+        assert_eq!(short_header, scrolled);
+
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Home)),
+            Event::Key(key(KeyCode::Down)),
+        ]);
+        assert_eq!(
+            view(&mut app).1,
+            header,
+            "no extra scroll after going back up"
+        );
+
+        // The last shown position also matters if focus hides the outgoing frame.
+        app.settings.preview = false;
+        view(&mut app);
+        app.on_key(key(KeyCode::Char('H')));
+        wait_for_layout(&mut app).await;
+        let (shown, header) = view(&mut app);
+        assert!(shown.contains("HTML reply from Leo."), "{shown}");
+        app.on_key(key(KeyCode::Down));
+        let scrolled = view(&mut app).1;
+        assert_eq!(scrolled + 1, header);
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Char('H'))),
+            Event::Key(key(KeyCode::Tab)),
+        ]);
+        assert!(!screen(&mut app, 160, 32).contains("▾ leo@example.com"));
+        wait_for_layout(&mut app).await;
+        app.on_key(key(KeyCode::BackTab));
+        let (shown, short_header) = view(&mut app);
+        assert!(shown.contains("Plain reply from Leo."), "{shown}");
+        assert_eq!(short_header, scrolled);
+        app.settings.preview = true;
+        app.on_key(key(KeyCode::BackTab));
 
         // H on a different row acts before its delayed preview replaces Leo.
         let single = app
