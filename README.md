@@ -282,7 +282,7 @@ Under **Reading**, **Hide trailing quoted text** hides `>`-quoted plain text and
 
 Under **Sidebar**, choose **Choose which folders to show**. Use `j` / `k` to move and `Enter` or `Space` to show or hide a folder. Changes are saved immediately, separately for each account. Use the same list to bring hidden folders back. Hiding a folder only removes its sidebar row: its subfolders are controlled separately, and mail still syncs and can be moved there.
 
-Under **Theme**, choose **High Contrast Black** for white text on a pure black background, with a charcoal highlight for the selected row.
+Under **Theme**, **Tokyo Night** uses white for the main text. **High Contrast Black** uses white on pure black, with brighter Tokyo Night-inspired colors for borders, links and quotes, and a charcoal highlight for the selected row.
 
 Everything else is in `settings.toml` in [your config folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
 
