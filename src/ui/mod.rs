@@ -293,10 +293,10 @@ fn hints(app: &App) -> &'static str {
             "`Space` mark · `d` delete · `e` archive · `m` move · `t` tag · `u` read/unread · `s` star · `Esc` unmark"
         }
         Focus::List if app.search.is_some() => {
-            "`Enter` open · `Esc` end search · `/` search again · `r` reply · `d` delete · `?` help"
+            "`Enter` open · `H` html/text · `Esc` end search · `/` search again · `r` reply · `d` delete · `?` help"
         }
         Focus::List => {
-            "`Enter` open · `v` conversation · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `t` tag · `/` search · `?` help"
+            "`Enter` open · `H` html/text · `v` conversation · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `t` tag · `/` search · `?` help"
         }
         Focus::Reader => {
             "`j k` scroll · `J K` next/previous · `r` reply · `a` all · `f` forward · `o` links · `A` files · `H` html/text · `Esc` back"
@@ -756,7 +756,7 @@ const HELP: [(&str, &str); 35] = [
     ("Click", "show a web link's destination before opening"),
     ("o", "the message's links: open, or y copy"),
     ("A", "attachments: open, v all with viewer, s save"),
-    ("H", "its HTML or plain text"),
+    ("H", "switch HTML or plain text (list or reader)"),
     ("U", "unsubscribe from a mailing list"),
     ("R", "check for mail now"),
     ("+  /  x  /  P", "add an account / remove it / its password"),

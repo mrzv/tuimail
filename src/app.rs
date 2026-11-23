@@ -2960,6 +2960,9 @@ impl App {
     fn select(&mut self, i: usize) {
         let i = i.min(self.rows.len().saturating_sub(1));
         if i != self.selected {
+            if self.focus == Focus::List && !self.preview_shown() {
+                self.reader = None;
+            }
             self.selected = i;
             self.moved_at = Some(Instant::now());
         }
@@ -3000,18 +3003,33 @@ impl App {
         self.settings.preview && self.wide.get()
     }
 
+    fn preview_after_batch(&self) -> bool {
+        self.settings.preview
+            && self.batch_resize_width.map_or_else(
+                || self.wide.get(),
+                |width| crate::ui::pane_widths(&self.settings, width).1,
+            )
+    }
+
+    /// What to show, distinct from the newest message targeted by list actions.
+    fn selected_read_index(&self) -> Option<usize> {
+        self.selected_reader_thread()
+            .filter(|thread| thread.stepped)
+            .map(|thread| thread.members[thread.active])
+            .or_else(|| self.rows.get(self.selected).map(|row| row.newest))
+    }
+
     /// Opens the message under the cursor in the reader; `enter` when asked
     /// for (marked read at once), not just previewed.
     fn open_selected(&mut self, enter: bool) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(index) = self.selected_read_index() else {
             return;
         };
-        let index = row.newest;
         let item = &self.items[index];
         if enter {
             self.moved_at = None;
             // A draft opens in the composer unless reading a conversation.
-            if row.members.len() == 1
+            if self.rows[self.selected].members.len() == 1
                 && self.role_of(item.account, &item.message.folder) == Some(Role::Drafts)
             {
                 return self.start_from(item.key(), Pending::EditDraft);
@@ -3020,10 +3038,11 @@ impl App {
         // Open already; Enter downloads again one that failed.
         if let Some(reader) = &mut self.reader
             && reader.is_message(item)
-            && !(enter && reader.raw.is_none() && reader.error.is_some())
         {
-            if let Some(thread) = &mut reader.thread {
-                thread.stepped = false;
+            if enter && reader.raw.is_none() && reader.error.is_some() {
+                let thread = reader.thread.take();
+                let plain = reader.plain;
+                return self.open_message(index, true, thread, plain);
             }
             if enter {
                 self.focus = Focus::Reader;
@@ -3072,6 +3091,14 @@ impl App {
             return;
         }
         let stepped = reader.thread.as_ref().is_some_and(|t| t.stepped);
+        if stepped
+            && self.focus != Focus::Reader
+            && index.is_some_and(|i| self.row_for(i) != self.selected)
+        {
+            // Expanding or rebuilding the list can leave the reply off the selected row.
+            self.reader = None;
+            return;
+        }
         let thread = index.and_then(|i| self.thread_for(i, stepped));
         let previous = reader.thread.as_ref().map(|t| t.active);
         let active = thread.as_ref().map(|t| t.active);
@@ -3093,8 +3120,8 @@ impl App {
     }
 
     fn selected_reader_thread(&self) -> Option<&ReaderThread> {
-        let row = self.rows.get(self.selected)?;
         let thread = self.reader.as_ref()?.thread.as_ref()?;
+        let row = self.rows.get(self.selected)?;
         row.members
             .contains(&thread.members[thread.active])
             .then_some(thread)
@@ -3134,17 +3161,44 @@ impl App {
         thread.active = next;
         thread.stepped = true;
         let index = thread.members[next];
-        let keep_list_focus = from_list
-            && self.settings.preview
-            && match self.batch_resize_width {
-                Some(width) => crate::ui::pane_widths(&self.settings, width).1,
-                None => self.wide.get(),
-            };
+        let keep_list_focus = from_list && self.preview_after_batch();
         self.moved_at = None;
         self.selected = self.row_for(index);
         self.open_message(index, true, Some(thread), plain);
         if keep_list_focus {
             self.focus = Focus::List;
+        }
+    }
+
+    fn toggle_format(&mut self) {
+        if self.focus == Focus::List {
+            let Some(index) = self.selected_read_index() else {
+                return;
+            };
+            let enter = !self.preview_after_batch();
+            self.moved_at = None;
+            if !self
+                .reader
+                .as_ref()
+                .is_some_and(|r| r.is_message(&self.items[index]))
+            {
+                self.open_message(
+                    index,
+                    enter,
+                    self.thread_for(index, false),
+                    Some(!self.settings.prefer_plain),
+                );
+                return;
+            }
+            if enter {
+                self.focus = Focus::Reader;
+                self.mark_reader_read();
+            }
+        }
+        if let Some(reader) = &mut self.reader {
+            reader.plain = Some(!reader.plain.unwrap_or(self.settings.prefer_plain));
+            reader.scroll = reader.thread.as_ref().map_or(0, |t| t.active);
+            self.render();
         }
     }
 
@@ -6129,6 +6183,9 @@ impl App {
             KeyCode::Char('u') => self.toggle_flag(FlagKind::Seen),
             KeyCode::Char('[') => self.step_thread(-1),
             KeyCode::Char(']') => self.step_thread(1),
+            KeyCode::Char('H') if self.focus == Focus::List || self.reader.is_some() => {
+                self.toggle_format()
+            }
             _ => return false,
         }
         true
@@ -6226,19 +6283,15 @@ impl App {
             KeyCode::Char('o') => self.pick_link(),
             KeyCode::Char('U') => self.unsubscribe(),
             KeyCode::Char('A') | KeyCode::Char('w') => self.pick_attachment(),
-            KeyCode::Char('H') => {
-                let now_plain = reader.plain.unwrap_or(self.settings.prefer_plain);
-                reader.plain = Some(!now_plain);
-                reader.scroll = reader.thread.as_ref().map_or(0, |t| t.active);
-                self.render();
-            }
             KeyCode::Esc
             | KeyCode::Char('h')
             | KeyCode::Left
             | KeyCode::Backspace
             | KeyCode::Char('q') => {
                 self.focus = Focus::List;
-                if !self.preview_shown() {
+                if !self.preview_shown()
+                    && !self.selected_reader_thread().is_some_and(|t| t.stepped)
+                {
                     self.reader = None;
                 }
             }
@@ -8482,8 +8535,8 @@ pub mod tests {
         app.select(conversation);
         for resize_first in [true, false] {
             app.focus = Focus::List;
-            app.open_selected(false);
             screen(&mut app, 160, 32);
+            app.on_key(key(KeyCode::Char('[')));
             let mut batch = vec![Event::Resize(99, 32), Event::Key(key(KeyCode::Char(']')))];
             if !resize_first {
                 batch.swap(0, 1);
@@ -8493,6 +8546,133 @@ pub mod tests {
             assert_eq!(app.focus, Focus::Reader);
             assert!(screen(&mut app, 99, 32).contains("Agreed on all three"));
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_reply_stays_fixed_when_switching_panes() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let root = app
+            .items
+            .iter()
+            .position(|it| it.message.summary.subject == "Design review notes")
+            .unwrap();
+        app.select(root);
+        app.on_key(key(KeyCode::Char('v')));
+        screen(&mut app, 160, 32);
+        app.on_key(key(KeyCode::Char(']')));
+        wait_for_layout(&mut app).await;
+
+        let reply_row = |app: &mut App| {
+            let shown = screen(app, 160, 32);
+            assert!(shown.contains("Agreed on all three"), "{shown}");
+            shown
+                .lines()
+                .position(|line| line.contains("▾ leo@example.com"))
+                .expect(&shown)
+        };
+        let before = reply_row(&mut app);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Reader);
+        assert_eq!(reply_row(&mut app), before);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::List);
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Reader);
+        assert_eq!(reply_row(&mut app), before);
+        let area = app.list_hit_area.get();
+        app.on_terminal_events(vec![Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y + (app.selected - app.list_scroll.get()) as u16,
+            modifiers: KeyModifiers::NONE,
+        })]);
+        assert_eq!(app.focus, Focus::List);
+        if let Some(at) = &mut app.moved_at {
+            *at -= PREVIEW_AFTER;
+        }
+        app.on_tick();
+        assert_eq!(reply_row(&mut app), before);
+
+        // In a single pane the reader is hidden, not reset.
+        screen(&mut app, 99, 32);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Reader);
+        screen(&mut app, 99, 32);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::List);
+        app.on_key(key(KeyCode::Enter));
+        wait_for_layout(&mut app).await;
+        assert!(screen(&mut app, 99, 32).contains("Agreed on all three"));
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "Tab must not reopen the old reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_format_shortcut_follows_the_reply_in_the_list_preview() {
+        use crate::ui::tests::screen;
+
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let root = app
+            .items
+            .iter()
+            .position(|it| it.message.summary.subject == "Design review notes")
+            .unwrap();
+        let (account, folder, uid) = app.items[root + 1].key();
+        app.store
+            .save_body(
+                &app.accounts[account].id,
+                &folder,
+                uid,
+                b"From: leo@example.com\r\nMIME-Version: 1.0\r\n\
+                  Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+                  --alt\r\nContent-Type: text/plain\r\n\r\nPlain reply from Leo.\r\n\
+                  --alt\r\nContent-Type: text/html\r\n\r\n<p>HTML reply from Leo.</p>\r\n\
+                  --alt--\r\n",
+            )
+            .unwrap();
+        app.select(root);
+        app.on_key(key(KeyCode::Char('v')));
+        screen(&mut app, 160, 32);
+        app.on_key(key(KeyCode::Char(']')));
+        wait_for_layout(&mut app).await;
+        assert!(screen(&mut app, 160, 32).contains("HTML reply from Leo."));
+
+        app.on_key(key(KeyCode::Char('H')));
+        wait_for_layout(&mut app).await;
+        let shown = screen(&mut app, 160, 32);
+        assert_eq!(app.focus, Focus::List);
+        assert!(shown.lines().next().unwrap().ends_with(" Plain text ╮"));
+        assert!(shown.contains("Plain reply from Leo."), "{shown}");
+        assert!(!shown.contains("HTML reply from Leo."), "{shown}");
+
+        // H on a different row acts before its delayed preview replaces Leo.
+        let single = app
+            .rows
+            .iter()
+            .position(|row| row.members.len() == 1)
+            .unwrap();
+        app.select(single);
+        app.on_key(key(KeyCode::Char('H')));
+        wait_for_layout(&mut app).await;
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(
+            app.reader.as_ref().unwrap().key(),
+            app.selected_item().unwrap().key()
+        );
     }
 
     #[tokio::test]

@@ -128,7 +128,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | Left drag over message text, then `y` | Select the visible text and copy it to the clipboard; `Esc` clears the selection |
 | Left click on a web link | Inspect the destination and confirm before opening |
 | `o` / `A` | Reading: links (`Enter` open, `y` copy) / attachments (`Enter` open, `v` all with viewer, `s` save) |
-| `H` | Reading: HTML or plain text |
+| `H` | Switch the shown message between HTML and plain text, from the list or reader |
 | `U` | Unsubscribe from a mailing list |
 | `R` | Check for mail now |
 | `+` / `x` / `P` | Add an account / remove it (on its row) / type its password, or sign in |
@@ -138,7 +138,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 Web links are blue, without an underline, in both plain-text and HTML views. HTML links on images can be clicked on their alt text; images are never fetched. Tuimail does not emit terminal hyperlink codes. Use `o` for `mailto:` links to write the message in tuimail.
 Links split by `format=flowed` email wrapping keep their full destination on every displayed row. Literal line breaks in fixed plain text are not joined.
 
-Open a collapsed conversation to see its messages newest first, with only the newest body expanded. List actions target the newest message, not the whole conversation; actions in the reader target the message you've opened.
+Open a collapsed conversation to see its messages newest first, starting with the newest body expanded. Switching focus between the list and reader keeps the reply you chose. List actions such as starring or moving still target the newest message, not the whole conversation; in the reader they target the opened reply.
 
 To start with conversations collapsed, turn on **Collapse threads into conversations by default** in `O`. Changing the default resets individual `v` choices. The setting has no effect when threading is off or when viewing search results.
 
