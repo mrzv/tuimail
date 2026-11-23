@@ -123,7 +123,9 @@ pub enum AppEvent {
     /// The start of messages' text, for the list, made in the background.
     Previews {
         account: String,
-        previews: Vec<(String, u32, String)>,
+        folder: String,
+        uidvalidity: u32,
+        previews: Vec<(u32, String)>,
     },
     /// The setup form's login check.
     Checked {
@@ -429,6 +431,15 @@ pub struct Thread {
     pub tree: String,
     /// It answers a message with the same subject.
     pub same_subject: bool,
+    /// The Inbox copy that supplied this editable draft's place in the
+    /// thread, when the match is based on cached headers rather than Gmail's ID.
+    draft_inbox: Option<DraftInboxCopy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DraftInboxCopy {
+    uid: u32,
+    thread_id: Option<u64>,
 }
 
 impl Item {
@@ -902,6 +913,8 @@ pub struct App {
     /// All listed messages, including those hidden under a conversation row.
     pub items: Vec<Item>,
     rows: Vec<ListEntry>,
+    /// Inbox/Drafts candidates whose cached body previews can change the match.
+    draft_preview_rechecks: HashSet<(usize, Role, u32)>,
     /// Members anchoring exceptions to the thread default in this folder view.
     thread_overrides: HashSet<(usize, String, u32)>,
     pub selected: usize,
@@ -1105,6 +1118,7 @@ impl App {
             place: Place::AllInboxes,
             items: Vec::new(),
             rows: Vec::new(),
+            draft_preview_rechecks: HashSet::new(),
             thread_overrides: HashSet::new(),
             selected: 0,
             list_scroll: Cell::new(0),
@@ -1393,21 +1407,29 @@ impl App {
                 if item.account != i {
                     continue;
                 }
-                if let Some(gmail) = item.message.gmail {
+                let (thread_id, uid) = match (item.thread.draft_inbox, item.message.gmail) {
+                    (Some(copy), _) => (copy.thread_id, Some(copy.uid)),
+                    (_, Some(g)) => (Some(g.thread_id), None),
+                    _ => (
+                        None,
+                        (item.message.folder == folder).then_some(item.message.uid),
+                    ),
+                };
+                if let Some(thread_id) = thread_id {
                     if !state
                         .checked
-                        .get(&gmail.thread_id)
+                        .get(&thread_id)
                         .is_some_and(|at| at.elapsed() < CONVERSATION_REFRESH)
-                        && !thread_ids.contains(&gmail.thread_id)
+                        && !thread_ids.contains(&thread_id)
                     {
-                        thread_ids.push(gmail.thread_id);
+                        thread_ids.push(thread_id);
                     }
-                } else if item.message.folder == folder
+                } else if let Some(uid) = uid
                     && !attempted
-                        .and_then(|seen| seen.get(&(validity, item.message.uid)))
+                        .and_then(|seen| seen.get(&(validity, uid)))
                         .is_some_and(|at| at.elapsed() < CONVERSATION_REFRESH)
                 {
-                    uids.push(item.message.uid);
+                    uids.push(uid);
                 }
                 if uids.len() + thread_ids.len() == worker::CONVERSATION_BATCH {
                     break;
@@ -1872,19 +1894,54 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
-            AppEvent::Previews { account, previews } => {
+            AppEvent::Previews {
+                account,
+                folder,
+                uidvalidity,
+                previews,
+            } => {
                 let Some(i) = self.account_index(&account) else {
                     return;
                 };
-                for (folder, uid, preview) in previews {
-                    let _ = self.store.set_preview(&account, &folder, uid, &preview);
-                    if let Some(item) = self
-                        .items
-                        .iter_mut()
-                        .find(|it| it.key() == (i, folder.clone(), uid))
+                if self.uidvalidity(i, &folder) != uidvalidity {
+                    return;
+                }
+                let side = if self.draft_preview_rechecks.is_empty() {
+                    None
+                } else {
+                    self.inbox_drafts(i).and_then(|drafts| {
+                        let inbox = self.accounts[i]
+                            .folder_for(Role::Inbox)
+                            .map_or("INBOX", |f| f.name.as_str());
+                        if folder == drafts {
+                            Some(Role::Drafts)
+                        } else {
+                            (folder == inbox).then_some(Role::Inbox)
+                        }
+                    })
+                };
+                let mut reload = false;
+                for (uid, preview) in previews {
+                    if self
+                        .store
+                        .set_preview(&account, &folder, uid, &preview)
+                        .is_err()
+                        || reload
                     {
+                        continue;
+                    }
+                    if side
+                        .is_some_and(|side| self.draft_preview_rechecks.contains(&(i, side, uid)))
+                    {
+                        reload = true;
+                    } else if let Some(item) = self.items.iter_mut().find(|it| {
+                        it.account == i && it.message.folder == folder && it.message.uid == uid
+                    }) {
                         item.message.preview = text::one_line(&preview, 200);
                     }
+                }
+                if reload {
+                    self.reload();
                 }
             }
             AppEvent::Checked { result } => self.on_checked(result),
@@ -1998,7 +2055,7 @@ impl App {
                             self.agent_render(read.key, raw.clone(), read.max, read.reply);
                         }
                         let raw = Arc::new(raw);
-                        self.make_previews(i, vec![(folder.clone(), uid, raw.clone())]);
+                        self.make_previews(i, folder, vec![(uid, raw.clone())]);
                         if self.reader.as_ref().is_some_and(|r| r.key() == key) {
                             if let Some(reader) = self.reader.as_mut() {
                                 reader.raw = Some(raw.clone());
@@ -2344,22 +2401,28 @@ impl App {
     }
 
     /// Makes the list's previews of these messages in the background.
-    fn make_previews(&self, i: usize, messages: Vec<(String, u32, Arc<Vec<u8>>)>) {
+    fn make_previews(&self, i: usize, folder: String, messages: Vec<(u32, Arc<Vec<u8>>)>) {
         if messages.is_empty() {
             return;
         }
         let account = self.accounts[i].id.clone();
+        let uidvalidity = self.uidvalidity(i, &folder);
         let tx = self.tx.clone();
         mail::in_background(
             move || {
                 messages
                     .into_iter()
-                    .map(|(folder, uid, raw)| (folder, uid, mail::preview_of(&raw)))
+                    .map(|(uid, raw)| (uid, mail::preview_of(&raw)))
                     .collect::<Vec<_>>()
             },
             move |previews| {
                 if let Some(previews) = previews {
-                    let _ = tx.send(AppEvent::Previews { account, previews });
+                    let _ = tx.send(AppEvent::Previews {
+                        account,
+                        folder,
+                        uidvalidity,
+                        previews,
+                    });
                 }
             },
         );
@@ -2474,10 +2537,10 @@ impl App {
             {
                 added.push(uid);
                 summaries.push(mail::summarize(&raw));
-                previews.push(("INBOX".to_string(), uid, Arc::new(raw)));
+                previews.push((uid, Arc::new(raw)));
             }
         }
-        self.make_previews(i, previews);
+        self.make_previews(i, "INBOX".into(), previews);
         let senders: Vec<Addr> = summaries.iter().map(|s| s.from.clone()).collect();
         let _ = self.store.remember(&senders, false, now());
         let _ = self.store.pop_skip_all(&id, &popped.skipped);
@@ -2832,7 +2895,136 @@ impl App {
         found.retain(|_| keep.next().unwrap_or(false));
     }
 
+    /// A copy already listed in Inbox keeps its place in the conversation,
+    /// but the displayed row opens the draft from its actual Drafts folder.
+    fn substitute_draft_copies(
+        &mut self,
+        listed: &mut Vec<Item>,
+        drafts: Vec<Item>,
+    ) -> HashMap<usize, Item> {
+        if drafts.is_empty() {
+            return HashMap::new();
+        }
+        #[derive(Clone, Copy)]
+        enum CopyMatch {
+            Missing,
+            Headers(usize),
+            Native(usize),
+            Ambiguous,
+        }
+        fn header_key(item: &Item) -> (usize, u32, &mail::Summary) {
+            (item.account, item.message.size, &item.message.summary)
+        }
+        let mut native = HashMap::new();
+        let mut headers = HashMap::new();
+        // Link candidates with identical headers without allocating a Vec per key.
+        let mut next = vec![None; drafts.len()];
+        for (j, draft) in drafts.iter().enumerate() {
+            if let Some(g) = draft.message.gmail {
+                native.insert((draft.account, g.message_id), j);
+            }
+            if draft.message.size > 0 && !draft.message.summary.message_id.is_empty() {
+                let (first, _) = headers.entry(header_key(draft)).or_insert((None, false));
+                next[j] = first.replace(j);
+            }
+        }
+        let mut matches = vec![CopyMatch::Missing; drafts.len()];
+        for (i, item) in listed.iter().enumerate() {
+            let m = &item.message;
+            if let Some(&j) = m
+                .gmail
+                .and_then(|g| native.get(&(item.account, g.message_id)))
+            {
+                matches[j] = CopyMatch::Native(i);
+                continue;
+            }
+            if m.size == 0 || m.summary.message_id.is_empty() || m.gmail.is_some_and(|g| g.sent) {
+                continue;
+            }
+            let inbox = self.accounts[item.account]
+                .folder_for(Role::Inbox)
+                .map_or("INBOX", |f| f.name.as_str());
+            // A sent version can reuse a draft's Message-ID. Without a
+            // shared native ID, match only an unambiguous Inbox copy.
+            if m.folder != inbox {
+                continue;
+            }
+            let Some((Some(first), recheck)) = headers.get_mut(&header_key(item)) else {
+                continue;
+            };
+            let candidates = || std::iter::successors(Some(*first), |&j| next[j]);
+            // Previews can disprove a current match or resolve an ambiguity.
+            if !*recheck {
+                self.draft_preview_rechecks.extend(
+                    candidates().map(|j| (item.account, Role::Drafts, drafts[j].message.uid)),
+                );
+                *recheck = true;
+            }
+            self.draft_preview_rechecks
+                .insert((item.account, Role::Inbox, m.uid));
+            let mut eligible = candidates().filter(|&j| {
+                let draft = &drafts[j].message;
+                (m.gmail.is_none() || draft.gmail.is_none())
+                    && (m.preview.is_empty()
+                        || draft.preview.is_empty()
+                        || m.preview == draft.preview)
+            });
+            let Some(j) = eligible.next() else {
+                continue;
+            };
+            if let Some(second) = eligible.next() {
+                // This Inbox message competes for every compatible draft,
+                // even though it can't name its own unique counterpart.
+                for k in [j, second].into_iter().chain(eligible) {
+                    if !matches!(matches[k], CopyMatch::Native(_)) {
+                        matches[k] = CopyMatch::Ambiguous;
+                    }
+                }
+                continue;
+            }
+            matches[j] = match matches[j] {
+                CopyMatch::Missing => CopyMatch::Headers(i),
+                CopyMatch::Native(_) => continue,
+                _ => CopyMatch::Ambiguous,
+            };
+        }
+        let mut copies = HashMap::new();
+        for (mut draft, matched) in drafts.into_iter().zip(matches) {
+            let index = match matched {
+                CopyMatch::Native(i) => i,
+                CopyMatch::Headers(i) => {
+                    let source = &listed[i].message;
+                    // A matching short preview can't prove the rest agrees.
+                    if self
+                        .store
+                        .cached_bodies_differ(
+                            &self.accounts[draft.account].id,
+                            (&source.folder, source.uid),
+                            (&draft.message.folder, draft.message.uid),
+                        )
+                        .unwrap_or(true)
+                    {
+                        listed.push(draft);
+                        continue;
+                    }
+                    draft.thread.draft_inbox = Some(DraftInboxCopy {
+                        uid: source.uid,
+                        thread_id: source.gmail.map(|g| g.thread_id),
+                    });
+                    i
+                }
+                _ => {
+                    listed.push(draft);
+                    continue;
+                }
+            };
+            copies.insert(index, draft);
+        }
+        copies
+    }
+
     fn reload_keeping(&mut self, current: Option<&(usize, String, u32)>) {
+        self.draft_preview_rechecks.clear();
         let mut items = Vec::new();
         let mut drafts = Vec::new();
         let targets: Vec<(usize, Option<String>)> = match &self.place {
@@ -2904,30 +3096,13 @@ impl App {
                 && !found.is_empty()
                 && let Some(folder) = self.inbox_drafts(i)
             {
-                let saved = self
-                    .store
-                    .messages(id, folder, MAX_LISTED)
-                    .unwrap_or_default();
-                if !saved.is_empty() {
-                    // A sent version can reuse a draft's Message-ID. Only
-                    // suppress a known native copy that's already editable.
-                    let listed_drafts: HashSet<_> = found
-                        .iter()
-                        .filter_map(|m| {
-                            let g = m.gmail?;
-                            self.is_draft(i, m).then_some(g.message_id)
-                        })
-                        .collect();
-                    drafts.extend(
-                        saved
-                            .into_iter()
-                            .filter(|m| {
-                                m.gmail
-                                    .is_none_or(|g| !listed_drafts.contains(&g.message_id))
-                            })
-                            .map(item),
-                    );
-                }
+                drafts.extend(
+                    self.store
+                        .messages(id, folder, MAX_LISTED)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(item),
+                );
             }
             items.extend(found.into_iter().map(item));
         }
@@ -2935,9 +3110,18 @@ impl App {
             items.sort_by_key(|it| std::cmp::Reverse(it.message.summary.date));
         }
         // In conversations; what a search finds stays newest first.
+        let mut selected_draft = None;
         if self.settings.threads && self.search.is_none() {
             let listed = items.len();
-            items.extend(drafts);
+            let mut copies = self.substitute_draft_copies(&mut items, drafts);
+            // Follow the visible row but leave an open reader or a mark
+            // bound to the original folder and UID.
+            selected_draft = current.and_then(|(account, folder, uid)| {
+                copies.iter().find_map(|(&index, draft)| {
+                    (items[index].key_ref() == (*account, folder.as_str(), *uid))
+                        .then(|| draft.key())
+                })
+            });
             let summaries: Vec<&mail::Summary> =
                 items.iter().map(|it| &it.message.summary).collect();
             // Where each is (its account and folder, numbered), and its UID.
@@ -2964,22 +3148,33 @@ impl App {
                     (it.account, native)
                 })
                 .collect();
+            if self.settings.threads_complete_gmail {
+                for (&index, draft) in &copies {
+                    if groups[index].1.is_none() {
+                        groups[index].1 = draft.message.gmail.map(|g| g.thread_id);
+                    }
+                }
+            }
             let order = crate::threads::arrange_arrived(&summaries, listed, &arrived, &mut groups);
             let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
             items = order
                 .into_iter()
                 .map(|placed| {
+                    // The replacement keeps the place of its Inbox copy.
                     let mut item = slots[placed.index].take().unwrap();
-                    item.thread = Thread {
-                        tree: placed.tree,
-                        same_subject: placed.same_subject,
-                    };
+                    if !copies.is_empty()
+                        && let Some(draft) = copies.remove(&placed.index)
+                    {
+                        item = draft;
+                    }
+                    item.thread.tree = placed.tree;
+                    item.thread.same_subject = placed.same_subject;
                     item
                 })
                 .collect();
         }
         self.items = items;
-        self.rebuild_rows(current);
+        self.rebuild_rows(selected_draft.as_ref().or(current));
     }
 
     /// Rebuilds the row-to-message mapping after the list or a thread changes.
@@ -5816,7 +6011,7 @@ impl App {
             };
             let id = self.accounts[i].id.clone();
             if let Ok(uid) = self.store.add_local(&id, &folder, &sent.raw, seen, None) {
-                self.make_previews(i, vec![(folder.clone(), uid, Arc::new(sent.raw))]);
+                self.make_previews(i, folder.clone(), vec![(uid, Arc::new(sent.raw))]);
             }
             self.refresh_counts(i, &folder);
             if self.shows(i, &folder) {
@@ -5889,7 +6084,7 @@ impl App {
                 Ok(uid) => uid,
                 Err(e) => return self.error(format!("Not saved in Drafts: {e:#}")),
             };
-            self.make_previews(i, vec![(folder.clone(), uid, Arc::new(built.raw))]);
+            self.make_previews(i, folder.clone(), vec![(uid, Arc::new(built.raw))]);
             self.refresh_counts(i, &folder);
             if self.shows(i, &folder) {
                 self.reload();
@@ -9250,10 +9445,17 @@ pub mod tests {
         app.focus = Focus::List;
         app.open_selected(false);
         wait_for_layout(&mut app).await;
-        let shown = screen(&mut app, 160, 32);
-        assert!(shown.contains("▸ 3 [Draft]"), "{shown}");
-        assert!(shown.contains("▸ [Draft] me@example.org"), "{shown}");
-        assert!(shown.contains("A newer reply."), "{shown}");
+        for icons in [crate::icons::PLAIN, crate::icons::NERD] {
+            app.icons = icons;
+            let shown = screen(&mut app, 160, 32);
+            let pencil = icons.drafts;
+            assert!(shown.contains(&format!("▸ 3 {pencil}")), "{shown}");
+            assert!(
+                shown.contains(&format!("▸ {pencil} me@example.org")),
+                "{shown}"
+            );
+            assert!(shown.contains("A newer reply."), "{shown}");
+        }
         assert!(app.composer.is_none());
 
         app.on_key(key(KeyCode::Char(']')));
@@ -9293,7 +9495,10 @@ pub mod tests {
         app.on_key(key(KeyCode::Tab));
         wait_for_layout(&mut app).await;
         let shown = screen(&mut app, 160, 32);
-        assert!(shown.contains("▾ [Draft] me@example.org"), "{shown}");
+        assert!(
+            shown.contains(&format!("▾ {} me@example.org", app.icons.drafts)),
+            "{shown}"
+        );
         assert!(shown.contains("Enter edit draft"), "{shown}");
         app.on_key(key(KeyCode::Enter));
         app.wait_until(|a| a.composer.is_some()).await;
@@ -12269,6 +12474,276 @@ pub mod tests {
                 ("Drafts", 1, "└─"),
             ]
         );
+    }
+
+    #[test]
+    fn inbox_conversations_show_one_editable_copy_of_a_draft() {
+        for (inbox_id, draft_id, draft_size, same_copy) in [
+            (None, None, 100, true),
+            (Some(22), None, 100, true),
+            (None, Some(22), 100, true),
+            (Some(22), Some(22), 150, true),
+            (Some(22), Some(23), 100, false),
+            (None, None, 150, false),
+        ] {
+            let mut app = gmail_app();
+            let id = app.accounts[0].id.clone();
+            app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+            let native = |message_id| store::Gmail {
+                message_id,
+                thread_id: 3,
+                sent: false,
+            };
+            let mut original = store::tests::header(1, "Plans", 10);
+            original.summary.message_id = "plans@example.org".into();
+            original.gmail = Some(native(21));
+            let mut inbox = store::tests::header(2, "Re: Plans", 20);
+            inbox.summary.message_id = "reply@example.org".into();
+            if inbox_id.is_none() && draft_id.is_none() {
+                inbox.summary.in_reply_to = original.summary.message_id.clone();
+            }
+            let mut draft = inbox.clone();
+            draft.uid = 19;
+            draft.size = draft_size;
+            draft.gmail = draft_id.map(native);
+            inbox.gmail = inbox_id.map(native);
+            app.store
+                .add_headers(&id, "INBOX", &[original, inbox])
+                .unwrap();
+            app.store.add_headers(&id, "Drafts", &[draft]).unwrap();
+            app.settings.threads_complete_gmail = true;
+            app.settings.threads_collapsed = true;
+            app.reload();
+
+            let members: Vec<_> = app
+                .items
+                .iter()
+                .map(|it| (it.message.folder.as_str(), it.message.uid))
+                .collect();
+            let expected: &[_] = if same_copy {
+                &[("INBOX", 1), ("Drafts", 19)]
+            } else {
+                &[("INBOX", 1), ("INBOX", 2), ("Drafts", 19)]
+            };
+            assert_eq!(
+                members, expected,
+                "Inbox ID {inbox_id:?}, Drafts ID {draft_id:?}, Drafts size {draft_size}"
+            );
+            assert_eq!(app.visible_items().len(), 1, "draft remains in its thread");
+        }
+    }
+
+    #[test]
+    fn gmail_completion_uses_the_inbox_uid_for_a_displayed_draft() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+        let mut result = gmail_result();
+        result.source.truncate(1);
+        result.headers.truncate(2);
+        let mut inbox = result.headers[1].clone();
+        inbox.uid = 1;
+        inbox.summary.message_id = "current@example.org".into();
+        inbox.gmail = None;
+        let mut draft = inbox.clone();
+        draft.uid = 19;
+        app.store.add_headers(&id, "INBOX", &[inbox]).unwrap();
+        app.store.add_headers(&id, "Drafts", &[draft]).unwrap();
+        app.settings.threads_complete_gmail = true;
+        app.reload();
+        assert!(matches!(&app.items[..], [item] if item.key_ref() == (0, "Drafts", 19)));
+
+        app.demo = false;
+        app.after_draw();
+        assert!(matches!(
+            app.test_sent.borrow().last(),
+            Some((0, Request::Conversations { folder, uidvalidity: 10, uids, thread_ids, .. }))
+                if folder == "INBOX" && uids == &[1] && thread_ids.is_empty()
+        ));
+        app.on_conversations(0, "INBOX", 10, "All Mail", Ok(Some(result)));
+        assert!(matches!(
+            &app.items[..],
+            [archived, draft]
+                if archived.key_ref() == (0, "All Mail", 101) && draft.key_ref() == (0, "Drafts", 19)
+        ));
+
+        app.accounts[0].conversations.invalidate();
+        app.after_draw();
+        assert!(matches!(
+            app.test_sent.borrow().last(),
+            Some((0, Request::Conversations { uids, thread_ids, .. }))
+                if uids.is_empty() && thread_ids == &[700]
+        ));
+    }
+
+    #[test]
+    fn inbox_draft_copies_compare_full_headers_and_use_new_previews() {
+        for (first_folder, first_uid, second_folder, second_uid) in
+            [("INBOX", 2, "Drafts", 19), ("Drafts", 19, "INBOX", 2)]
+        {
+            let mut app = gmail_app();
+            let id = app.accounts[0].id.clone();
+            app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+            let mut root = store::tests::header(1, "Plans", 10);
+            root.summary.message_id = "plans@example.org".into();
+            let mut inbox = store::tests::header(2, "Re: Plans A", 20);
+            inbox.summary.message_id = "reply@example.org".into();
+            inbox.summary.in_reply_to = root.summary.message_id.clone();
+            let mut draft = inbox.clone();
+            draft.uid = 19;
+            let mut other = draft.clone();
+            other.uid = 20;
+            other.summary.subject = "Re: Plans B".into();
+            app.store.add_headers(&id, "INBOX", &[root, inbox]).unwrap();
+            app.store
+                .add_headers(&id, "Drafts", &[draft, other])
+                .unwrap();
+            app.store
+                .set_preview(&id, first_folder, first_uid, "First version")
+                .unwrap();
+            app.reload();
+            let members = |app: &App| {
+                let mut members: Vec<_> = app.items.iter().map(Item::key).collect();
+                members.sort_unstable();
+                members
+            };
+            assert_eq!(
+                members(&app),
+                [
+                    (0, "Drafts".into(), 19),
+                    (0, "Drafts".into(), 20),
+                    (0, "INBOX".into(), 1)
+                ]
+            );
+            let uidvalidity = app.uidvalidity(0, second_folder);
+            app.on_event(AppEvent::Previews {
+                account: id.clone(),
+                folder: second_folder.into(),
+                uidvalidity: uidvalidity.wrapping_add(1),
+                previews: vec![(second_uid, "Obsolete version".into())],
+            });
+            assert_eq!(
+                members(&app).len(),
+                3,
+                "an obsolete preview can't split a match"
+            );
+            app.on_event(AppEvent::Previews {
+                account: id,
+                folder: second_folder.into(),
+                uidvalidity,
+                previews: vec![(second_uid, "Other version".into())],
+            });
+            assert_eq!(
+                members(&app),
+                [
+                    (0, "Drafts".into(), 19),
+                    (0, "Drafts".into(), 20),
+                    (0, "INBOX".into(), 1),
+                    (0, "INBOX".into(), 2),
+                ],
+                "different previews distinguish the messages even with matching headers and size"
+            );
+        }
+    }
+
+    #[test]
+    fn inbox_draft_copies_stay_separate_when_cached_bodies_differ() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+        let root = store::Header {
+            summary: mail::summarize(DRAFT_CONVERSATION[0]),
+            ..store::tests::header(1, "", 0)
+        };
+        let prefix = "The same start. ".repeat(20);
+        let raw = |ending: &[u8]| [DRAFT_CONVERSATION[1], prefix.as_bytes(), ending].concat();
+        let inbox_raw = raw(b"Inbox ending\r\n");
+        let draft_raw = raw(b"Draft ending\r\n");
+        let inbox = store::Header {
+            summary: mail::summarize(&inbox_raw),
+            size: inbox_raw.len() as u32,
+            ..store::tests::header(2, "", 0)
+        };
+        let draft = store::Header {
+            uid: 19,
+            ..inbox.clone()
+        };
+        app.store.add_headers(&id, "INBOX", &[root, inbox]).unwrap();
+        app.store.add_headers(&id, "Drafts", &[draft]).unwrap();
+        app.store.save_body(&id, "Drafts", 19, &draft_raw).unwrap();
+        let preview = store::preview(&prefix);
+        app.store.set_preview(&id, "Drafts", 19, &preview).unwrap();
+        app.reload();
+        let has = |app: &App, folder: &str, uid| {
+            app.items
+                .iter()
+                .any(|it| it.message.folder == folder && it.message.uid == uid)
+        };
+        assert!(has(&app, "Drafts", 19) && !has(&app, "INBOX", 2));
+
+        app.store.save_body(&id, "INBOX", 2, &inbox_raw).unwrap();
+        app.on_event(AppEvent::Previews {
+            account: id,
+            folder: "INBOX".into(),
+            uidvalidity: 10,
+            previews: vec![(2, preview)],
+        });
+        assert!(has(&app, "Drafts", 19) && has(&app, "INBOX", 2));
+    }
+
+    #[test]
+    fn inbox_draft_previews_resolve_two_way_ambiguity() {
+        let mut app = gmail_app();
+        let id = app.accounts[0].id.clone();
+        app.store.remove(&id, "INBOX", &[1, 2]).unwrap();
+        let mut root = store::tests::header(1, "Plans", 10);
+        root.summary.message_id = "plans@example.org".into();
+        let mut first = store::tests::header(2, "Re: Plans", 20);
+        first.summary.message_id = "reply@example.org".into();
+        first.summary.in_reply_to = root.summary.message_id.clone();
+        let mut second = first.clone();
+        second.uid = 3;
+        let mut draft_a = first.clone();
+        draft_a.uid = 19;
+        let mut draft_b = first.clone();
+        draft_b.uid = 20;
+        app.store
+            .add_headers(&id, "INBOX", &[root, first, second])
+            .unwrap();
+        app.store
+            .add_headers(&id, "Drafts", &[draft_a, draft_b])
+            .unwrap();
+        for (folder, uid, preview) in [
+            ("INBOX", 2, "First version"),
+            ("Drafts", 19, "First version"),
+            ("Drafts", 20, "Second version"),
+        ] {
+            app.store.set_preview(&id, folder, uid, preview).unwrap();
+        }
+        app.reload();
+        let inbox_uids = |app: &App| {
+            let mut uids: Vec<_> = app
+                .items
+                .iter()
+                .filter_map(|it| (it.message.folder == "INBOX").then_some(it.message.uid))
+                .collect();
+            uids.sort_unstable();
+            uids
+        };
+        assert_eq!(
+            inbox_uids(&app),
+            [1, 2, 3],
+            "UID 3 could match either draft"
+        );
+
+        app.on_event(AppEvent::Previews {
+            account: id,
+            folder: "INBOX".into(),
+            uidvalidity: 10,
+            previews: vec![(3, "Second version".into())],
+        });
+        assert_eq!(inbox_uids(&app), [1]);
+        assert_eq!(app.items.len(), 3, "both drafts have distinct Inbox copies");
     }
 
     #[test]

@@ -262,12 +262,9 @@ fn row(
     };
     let tree = fit(&tree, cols(&tree).min(tree_width));
     let text_width = text_width.saturating_sub(cols(&tree));
-    let badge = if has_draft && text_width >= super::DRAFT_BADGE.len() {
-        super::DRAFT_BADGE
-    } else {
-        ""
-    };
-    let text_width = text_width - badge.len();
+    let (draft, gap, draft_width) =
+        super::draft_marker(has_draft.then_some(icons.drafts), text_width);
+    let text_width = text_width - draft_width;
     let folder_width = cols(&folder).min(text_width);
     let folder = fit(&folder, folder_width);
     // Tags after the subject, in at most a third of its room.
@@ -301,7 +298,8 @@ fn row(
         Span::styled(pad(&who, who_width), who_style),
         Span::raw(" "),
         Span::styled(tree, Style::new().fg(c.dim)),
-        Span::styled(badge, Style::new().fg(c.tag)),
+        Span::styled(draft, Style::new().fg(c.tag)),
+        Span::raw(gap),
         Span::styled(folder, Style::new().fg(c.dim)),
         Span::styled(subject, subject_style),
         Span::styled(tags, Style::new().fg(c.tag)),

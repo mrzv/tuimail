@@ -212,20 +212,16 @@ fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a>
 fn thread_header(
     item: &Item,
     active: bool,
-    draft: bool,
+    draft: Option<&'static str>,
     width: usize,
     now: i64,
     c: &Colors,
 ) -> Line<'static> {
     let m = &item.message;
     let date = mail::short_date(m.summary.date, now);
-    let badge = if draft && width >= 2 + super::DRAFT_BADGE.len() {
-        super::DRAFT_BADGE
-    } else {
-        ""
-    };
+    let (draft, gap, draft_width) = super::draft_marker(draft, width.saturating_sub(2));
     let room =
-        width.saturating_sub(2 + badge.len() + if date.is_empty() { 0 } else { cols(&date) + 2 });
+        width.saturating_sub(2 + draft_width + if date.is_empty() { 0 } else { cols(&date) + 2 });
     let subject = if m.summary.subject.is_empty() {
         "(no subject)"
     } else {
@@ -247,7 +243,8 @@ fn thread_header(
     };
     Line::from(vec![
         Span::styled(if active { "▾ " } else { "▸ " }, style),
-        Span::styled(badge, Style::new().fg(c.tag)),
+        Span::styled(draft, Style::new().fg(c.tag)),
+        Span::raw(gap),
         Span::styled(addr, style),
         Span::styled(subject, style),
         Span::styled(
@@ -477,7 +474,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 thread_header(
                     item,
                     i == active,
-                    app.is_draft(item.account, &item.message),
+                    app.is_draft(item.account, &item.message)
+                        .then_some(app.icons.drafts),
                     width,
                     now,
                     &c,

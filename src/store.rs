@@ -993,6 +993,24 @@ impl Store {
             .optional()?)
     }
 
+    /// Disproves a possible copy only when both full messages are cached.
+    pub fn cached_bodies_differ(
+        &self,
+        account: &str,
+        first: (&str, u32),
+        second: (&str, u32),
+    ) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM bodies AS a JOIN bodies AS b ON a.account = b.account
+                WHERE a.account = ?1 AND a.folder = ?2 AND a.uid = ?3
+                    AND b.folder = ?4 AND b.uid = ?5 AND a.raw <> b.raw
+            )",
+            params![account, first.0, first.1, second.0, second.1],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Keeps a downloaded message, and the start of its text for the list.
     /// Keeps a downloaded message, unless it's bigger than [`MAX_KEPT_BODY`]
     /// (then it's downloaded again to read). Its preview for the list comes

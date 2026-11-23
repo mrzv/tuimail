@@ -29,7 +29,15 @@ const NARROW: u16 = 70;
 /// From this width (beside the sidebar), the message shows beside the list.
 const WIDE: u16 = 100;
 
-const DRAFT_BADGE: &str = "[Draft] ";
+fn draft_marker(icon: Option<&'static str>, room: usize) -> (&'static str, &'static str, usize) {
+    if let Some(icon) = icon {
+        let width = cols(icon) + 1;
+        if width <= room {
+            return (icon, " ", width);
+        }
+    }
+    ("", "", 0)
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
