@@ -202,7 +202,7 @@ fn row(
             style
         }
     };
-    let who_style = strong(Style::new().fg(if unread { c.text } else { c.subtext }));
+    let who_style = strong(Style::new().fg(c.correspondent));
     let subject_style = strong(Style::new().fg(if unread { c.text } else { c.subtext }));
     // The pencil already identifies Drafts; other rows show their source.
     let outside = match &app.place {
@@ -307,10 +307,7 @@ fn row(
         Span::styled(tags, Style::new().fg(c.tag)),
         Span::styled(preview, Style::new().fg(c.dim)),
         Span::raw(" ".repeat(spare)),
-        Span::styled(
-            format!(" {:>9} ", fit(&date, 9)),
-            Style::new().fg(if unread { c.text } else { c.dim }),
-        ),
+        Span::styled(format!(" {:>9} ", fit(&date, 9)), Style::new().fg(c.date)),
     ]);
     if selected {
         line = line.style(Style::new().bg(c.selected));
@@ -343,13 +340,36 @@ mod tests {
             .expect(&shown);
         assert!(alice < bob, "newest first");
         let buffer = drawn(&mut app, 160, 30);
-        let line = shown.lines().nth(alice).unwrap();
-        let x = line.chars().take_while(|&ch| ch != 'L').count() as u16;
-        let cell = &buffer[(x, alice as u16)];
-        assert!(
-            cell.modifier.contains(ratatui::style::Modifier::BOLD),
-            "unread"
-        );
+        let right = app.list_hit_area.get().right();
+        for (y, name, subject, unread) in [
+            (alice, "Alice Rivera", "Lunch tomorrow?", true),
+            (bob, "Bob Stone", "Quarterly numbers", false),
+        ] {
+            let line = shown.lines().nth(y).unwrap();
+            let cell_for = |field: &str| {
+                let x = crate::text::cols(&line[..line.find(field).unwrap()]) as u16;
+                &buffer[(x, y as u16)]
+            };
+            let subject_cell = cell_for(subject);
+            assert_eq!(cell_for(name).fg, app.colors.correspondent);
+            let date = &buffer[(right - 3, y as u16)];
+            assert!(date.symbol().starts_with(|ch: char| ch.is_ascii_digit()));
+            assert_eq!(date.fg, app.colors.date);
+            assert_eq!(
+                subject_cell.fg,
+                if unread {
+                    app.colors.text
+                } else {
+                    app.colors.subtext
+                }
+            );
+            assert_eq!(
+                subject_cell
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD),
+                unread
+            );
+        }
         assert!(shown.contains("2 unread"), "{shown}");
     }
 

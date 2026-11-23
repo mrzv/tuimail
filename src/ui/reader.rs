@@ -179,14 +179,14 @@ fn body_line<'a>(segs: &'a [Seg], c: &Colors) -> Line<'a> {
 /// the sender chose in what room is left, quoted when it could pass for an
 /// address. A name can never push the address out of view.
 fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a> {
+    let identity = Style::new()
+        .fg(c.correspondent)
+        .add_modifier(Modifier::BOLD);
     let named = !from.name.is_empty() && from.name != from.addr;
     if !named {
         return Line::from(vec![
             label,
-            Span::styled(
-                fit_middle(&from.addr, room),
-                Style::new().fg(c.text).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(fit_middle(&from.addr, room), identity),
         ]);
     }
     let addr = format!("<{}>", fit_middle(&from.addr, room.saturating_sub(2)));
@@ -198,10 +198,7 @@ fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a>
     let name_room = room.saturating_sub(cols(&addr) + 1);
     let mut spans = vec![label];
     if name_room >= 4 {
-        spans.push(Span::styled(
-            fit(&name, name_room),
-            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(fit(&name, name_room), identity));
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(addr, Style::new().fg(c.text)));
@@ -245,7 +242,7 @@ fn thread_header(
         Span::styled(if active { "▾ " } else { "▸ " }, style),
         Span::styled(draft, Style::new().fg(c.tag)),
         Span::raw(gap),
-        Span::styled(addr, style),
+        Span::styled(addr, style.fg(c.correspondent)),
         Span::styled(subject, style),
         Span::styled(
             if date.is_empty() {
@@ -253,7 +250,7 @@ fn thread_header(
             } else {
                 format!("  {date}")
             },
-            Style::new().fg(c.dim),
+            Style::new().fg(c.date),
         ),
     ])
 }
@@ -398,7 +395,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if !date.is_empty() {
         lines.push(Line::from(vec![
             label("Date"),
-            Span::styled(date, Style::new().fg(c.text)),
+            Span::styled(date, Style::new().fg(c.date)),
         ]));
     }
     if !m.flags.tags.is_empty() {
@@ -539,7 +536,7 @@ mod tests {
     use crate::app::tests::{app, open_first, wait_for_layout, with_mail};
     use crate::app::{App, Focus};
     use crate::store::Flags;
-    use crate::ui::tests::screen;
+    use crate::ui::tests::{drawn, screen};
 
     /// The reader on a message with these headers, at 160 columns.
     async fn reading(headers: &str) -> String {
@@ -634,9 +631,23 @@ mod tests {
         );
         assert!(shown.contains("Are we still on for noon?"), "{shown}");
         assert!(shown.contains("menu.pdf"), "the attachment: {shown}");
+        let date = crate::mail::long_date(app.reader.as_ref().unwrap().message.summary.date);
         // Narrow: the reader takes the window, then Esc goes back.
         let shown = screen(&mut app, 60, 30);
         assert!(shown.contains("Are we still on"), "{shown}");
+        let buffer = drawn(&mut app, 60, 30);
+        let color_at = |field: &str| {
+            let (y, line) = shown
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(field))
+                .unwrap();
+            let x = crate::text::cols(&line[..line.find(field).unwrap()]) as u16;
+            buffer[(x, y as u16)].fg
+        };
+        assert_eq!(color_at("Alice Rivera"), app.colors.correspondent);
+        assert_eq!(color_at(&date), app.colors.date);
+        assert_eq!(color_at("Lunch tomorrow?"), app.colors.text);
     }
 
     #[tokio::test]

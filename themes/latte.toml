@@ -19,3 +19,6 @@ blue = "#1e66f5"
 purple = "#8839ef"
 pink = "#ea76cb"
 accent = "#7287fd"
+# Darker mail highlights hold up against the light selection background.
+correspondent = "#005f66"
+date = "#7c4d13"

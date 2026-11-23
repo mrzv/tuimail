@@ -1,5 +1,5 @@
-//! Sixteen-color palettes (`themes/` in the repository), mapped to what
-//! tuimail paints by role, so drawing code never names a palette color directly.
+//! Palettes (`themes/` in the repository), mapped to what tuimail paints
+//! by role, so drawing code never names a palette color directly.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -47,11 +47,15 @@ pub struct Colors {
     pub selected: Color,
     /// Borders of what doesn't have the keys.
     pub border: Color,
-    /// Key hints, placeholders, read mail's subjects.
+    /// Key hints, placeholders, previews.
     pub dim: Color,
-    /// Dates, header names, senders of read mail.
+    /// Secondary labels and read mail's subjects.
     pub subtext: Color,
     pub text: Color,
+    /// Sender or recipient in the list, and the sender in the reader.
+    pub correspondent: Color,
+    /// Message dates in the list and reader.
+    pub date: Color,
     pub red: Color,
     pub warning: Color,
     pub ok: Color,
@@ -101,6 +105,8 @@ impl Colors {
             dim: p("comment")?,
             subtext: p("subtext")?,
             text: p("fg")?,
+            correspondent: p("correspondent").or_else(|| p("cyan"))?,
+            date: p("date").or_else(|| p("yellow"))?,
             red: p("red")?,
             warning: p("yellow")?,
             ok: p("green")?,
