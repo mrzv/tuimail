@@ -18,6 +18,7 @@ use ratatui::widgets::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, PickerKind, Place, PromptKind, plural};
+use crate::file_picker::FilePicker;
 use crate::notify::Notifications;
 use crate::settings::Settings;
 use crate::text::cols;
@@ -282,7 +283,9 @@ fn hints(app: &App) -> &'static str {
         return match prompt.kind {
             PromptKind::Search => "`Enter` search · `Esc` cancel · `Ctrl-u` clear",
             PromptKind::Password(_) => "`Enter` log in · `Esc` later",
-            PromptKind::Attach => "`Enter` attach · `Esc` cancel",
+            PromptKind::Attach => {
+                "`Tab` complete · `↑↓` select · `Enter` open or attach · `Esc` cancel"
+            }
             PromptKind::Tag => "`Enter` tag · `Esc` cancel",
         };
     }
@@ -345,9 +348,9 @@ fn connection(app: &App) -> Vec<Span<'static>> {
     Vec::new()
 }
 
-/// The one-line prompt, in a box over the bottom of the window.
+/// The path picker, or a one-line prompt over the bottom of the window.
 fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
-    let c = app.colors.clone();
+    let c = &app.colors;
     let label = match app.prompt.as_ref().map(|p| p.kind) {
         Some(PromptKind::Search) => format!(" {} Search ", app.icons.search),
         Some(PromptKind::Password(i)) => format!(
@@ -357,20 +360,27 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|a| fit(&a.account.email, 50))
                 .unwrap_or_default()
         ),
-        Some(PromptKind::Attach) => " Attach a file: its full path, or drop it here ".into(),
+        Some(PromptKind::Attach) => " Attach a file ".into(),
         Some(PromptKind::Tag) => " New tag: one word, like work or receipts ".into(),
         None => return,
     };
-    let width = area.width.min(80);
-    let rect = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + area.height.saturating_sub(4),
-        width,
-        height: 3.min(area.height),
+    let rect = if matches!(
+        app.prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::Attach)
+    ) {
+        centered(area, 86, 18)
+    } else {
+        let width = area.width.min(80);
+        Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height.saturating_sub(4),
+            width,
+            height: 3.min(area.height),
+        }
     };
     frame.render_widget(Clear, rect);
     let block = bordered()
-        .border_style(border(true, &c))
+        .border_style(border(true, c))
         .title(Span::styled(
             label,
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),
@@ -385,8 +395,78 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
     prompt
         .input
         .set_cursor_style(Style::new().fg(c.bg).bg(c.accent));
-    let input_area = inner.inner(Margin::new(1, 0));
+    let inner = inner.inner(Margin::new(1, 0));
+    let input_area = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
     frame.render_widget(&prompt.input, input_area);
+    if let Some(files) = &prompt.files {
+        attachment_entries(frame, files, inner, rect, c);
+    }
+}
+
+fn attachment_entries(frame: &mut Frame, files: &FilePicker, inner: Rect, rect: Rect, c: &Colors) {
+    let width = usize::from(inner.width);
+    let mut rows = (1..inner.height).map(|i| Rect::new(inner.x, inner.y + i, inner.width, 1));
+    let Some(top) = rows.next() else {
+        return;
+    };
+    let directory = files
+        .directory
+        .as_ref()
+        .and_then(|path| path.to_str())
+        .map(|path| format!("In: {}", fit_end(path, width.saturating_sub(4))))
+        .unwrap_or_else(|| "Enter a local path".into());
+    frame.render_widget(Paragraph::new(directory).style(Style::new().fg(c.dim)), top);
+
+    let entries = files.matches();
+    let count = entries.len();
+    let notice = if let Some(error) = &files.error {
+        Some((fit(error, width), c.red))
+    } else if let Some(error) = files.listing_error() {
+        Some((fit(&format!("Can't list directory: {error}"), width), c.red))
+    } else if files.loading() {
+        Some(("Reading directory…".into(), c.dim))
+    } else if count == 0 && files.directory.is_some() {
+        Some(("No matching files or folders".into(), c.dim))
+    } else {
+        None
+    };
+    if let Some((notice, color)) = notice
+        && let Some(row) = rows.next()
+    {
+        frame.render_widget(Paragraph::new(notice).style(Style::new().fg(color)), row);
+    }
+
+    let visible = rows.len();
+    let scroll = files
+        .selected
+        .unwrap_or(0)
+        .saturating_sub(visible.saturating_sub(1));
+    for (row, (i, entry)) in rows.zip(entries.enumerate().skip(scroll)) {
+        let selected = files.selected == Some(i);
+        let suffix = if entry.directory {
+            std::path::MAIN_SEPARATOR_STR
+        } else {
+            ""
+        };
+        let style = Style::new().fg(if entry.directory { c.accent } else { c.text });
+        let style = if selected {
+            style.bg(c.selected)
+        } else {
+            style
+        };
+        let line = Line::from(vec![
+            Span::raw(if selected { "› " } else { "  " }),
+            Span::raw(fit_middle(
+                &entry.name,
+                width.saturating_sub(2 + suffix.len()),
+            )),
+            Span::raw(suffix),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(style), row);
+    }
+    if visible != 0 && count > visible {
+        scrollbar(frame, rect, count, files.selected.unwrap_or(0), c);
+    }
 }
 
 /// A list to pick from: folders, links, attachments and other choices.
@@ -773,7 +853,7 @@ const HELP: [(&str, &str); 36] = [
     ("+  /  x  /  P", "add an account / remove it / its password"),
     ("Ctrl-s", "send (writing)"),
     ("Ctrl-d", "save in Drafts and close (writing)"),
-    ("Ctrl-o", "attach a file; or drop it on the window"),
+    ("Ctrl-o", "browse attachments; Tab completes a path"),
     ("Ctrl-e", "write the text in your editor"),
     (
         "Tab  ↑↓",

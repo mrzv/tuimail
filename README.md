@@ -152,11 +152,13 @@ Writing:
 | `Tab` / `Shift-Tab`, `Enter` | The next / previous field; `Tab` takes a suggested address |
 | `Ctrl-s` | Send (asking first, unless turned off) |
 | `Ctrl-d` | Save in Drafts and close |
-| `Ctrl-o` | Attach a file (or drop it on the window) |
+| `Ctrl-o` | Browse for a file to attach (or drop it on the window) |
 | `Ctrl-e` | Write the text in your editor (`$VISUAL`, `$EDITOR`, or `editor` in the settings) |
 | `←` `→` on From | Send from another account |
 | `x` on Files | Take a file off |
 | `Esc` | Close: `y` keeps it in Drafts, `n` throws it away |
+
+The attachment picker starts in your home folder. Type or paste a path (`~/` and spaces work), use `Tab` to complete it, or use `↑`/`↓` to select an entry. `Enter` opens a folder or attaches the file; choose `..` to go up. `Ctrl-u` clears the path and `Esc` cancels.
 
 ## Accounts
 

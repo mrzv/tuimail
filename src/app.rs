@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -24,6 +24,7 @@ use crate::account::{self, Account, Contacts, PasswordFrom, Protocol};
 use crate::agent::{self, Call};
 use crate::compose::{self, Draft};
 use crate::composer::{self, Composer, Kind};
+use crate::file_picker::{self, FilePicker};
 use crate::icons::Icons;
 use crate::imap::FlagKind;
 use crate::mail::{self, Addr, Body, Parsed};
@@ -119,6 +120,10 @@ pub enum AppEvent {
         /// A batch keeps the viewer its files were grouped by.
         opener: Option<AttachmentOpener>,
         result: Result<Vec<PathBuf>, String>,
+    },
+    AttachmentDirectory {
+        /// The app has only one scan in flight; the picker remembers if it still wants it.
+        entries: std::io::Result<Vec<file_picker::Entry>>,
     },
     /// The start of messages' text, for the list, made in the background.
     Previews {
@@ -650,17 +655,26 @@ pub enum PromptKind {
 pub struct Prompt {
     pub kind: PromptKind,
     pub input: TextArea<'static>,
+    pub(crate) files: Option<FilePicker>,
 }
 
 impl Prompt {
     fn new(kind: PromptKind, text: &str) -> Self {
-        let mut input = TextArea::new(vec![text.to_string()]);
+        Self {
+            kind,
+            input: Self::field(kind, text.into()),
+            files: (kind == PromptKind::Attach).then(FilePicker::new),
+        }
+    }
+
+    fn field(kind: PromptKind, text: String) -> TextArea<'static> {
+        let mut input = TextArea::new(vec![text]);
         input.move_cursor(CursorMove::End);
         input.set_cursor_line_style(ratatui::style::Style::default());
         if matches!(kind, PromptKind::Password(_)) {
             input.set_mask_char('•');
         }
-        Self { kind, input }
+        input
     }
 
     pub fn text(&self) -> String {
@@ -950,6 +964,7 @@ pub struct App {
     pub composer: Option<Composer>,
     pub setup: Option<Setup>,
     pub prompt: Option<Prompt>,
+    reading_attachment_directory: bool,
     /// The messages a new tag being typed is for.
     tagging: Vec<Group>,
     /// The change being made, kept once the key that makes it is done.
@@ -1140,6 +1155,7 @@ impl App {
             composer: None,
             setup: None,
             prompt: None,
+            reading_attachment_directory: false,
             tagging: Vec::new(),
             change: None,
             agent_socket: None,
@@ -1894,6 +1910,20 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
+            AppEvent::AttachmentDirectory { entries } => {
+                self.reading_attachment_directory = false;
+                let complete = self.prompt.as_mut().is_some_and(|prompt| {
+                    prompt
+                        .files
+                        .as_mut()
+                        .is_some_and(|files| files.listed(entries, &prompt.input.lines()[0]))
+                });
+                if complete {
+                    self.complete_attachment_path();
+                } else {
+                    self.read_attachment_directory();
+                }
+            }
             AppEvent::Previews {
                 account,
                 folder,
@@ -5830,6 +5860,7 @@ impl App {
             }
             composer::Action::Attach => {
                 self.prompt = Some(Prompt::new(PromptKind::Attach, ""));
+                self.read_attachment_directory();
             }
             composer::Action::Edit => self.terminal_requests.push_back(TerminalRequest::Editor),
             composer::Action::SwitchAccount(by) => {
@@ -6128,33 +6159,113 @@ impl App {
         self.next_append
     }
 
-    fn attach(&mut self, path: &str) {
-        let path = unquote(path);
-        if path.is_empty() {
+    /// Keep no more than one scan in flight, even across closing the picker.
+    fn read_attachment_directory(&mut self) {
+        if self.reading_attachment_directory {
             return;
         }
-        let path = PathBuf::from(path);
-        if !path.is_absolute() || crate::config::maybe_remote(&path) {
-            return self.error("Give the file's full path (or drop it on the window)");
+        let Some(directory) = self
+            .prompt
+            .as_mut()
+            .and_then(|p| p.files.as_mut())
+            .and_then(FilePicker::scan)
+        else {
+            return;
+        };
+        self.reading_attachment_directory = true;
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let entries = file_picker::entries(&directory);
+            let _ = tx.send(AppEvent::AttachmentDirectory { entries });
+        });
+    }
+
+    fn attachment_path_changed(&mut self) {
+        if let Some(prompt) = self.prompt.as_mut()
+            && let Some(files) = prompt.files.as_mut()
+        {
+            files.change(&prompt.input.lines()[0]);
+            self.read_attachment_directory();
         }
-        match compose::Attachment::snapshot(&path) {
-            Ok(attachment) => {
-                if let Some(composer) = self.composer.as_mut() {
-                    composer.attachments.push(attachment);
-                }
-                // A path through a link says where the file really is.
-                if let Ok(real) = std::fs::canonicalize(&path)
-                    && real != path
-                {
-                    self.info(format!(
-                        "Attached {}, which is {}",
-                        crate::config::shown(&path),
-                        crate::config::shown(&real)
-                    ));
+    }
+
+    fn paste_attachment_path(&mut self, path: &str) -> bool {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return false;
+        };
+        let Some(files) = prompt.files.as_mut() else {
+            return false;
+        };
+        let room = MAX_PROMPT.saturating_sub(prompt.input.lines()[0].chars().count());
+        if path.chars().take(room + 1).count() > room || !file_picker::displayable(path) {
+            files.error = Some(format!(
+                "Path not pasted: use one line of up to {MAX_PROMPT} characters"
+            ));
+            return false;
+        }
+        prompt.input.insert_str(path);
+        self.attachment_path_changed();
+        true
+    }
+
+    fn complete_attachment_path(&mut self) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        let Some((path, quoted)) = prompt
+            .files
+            .as_mut()
+            .and_then(|files| files.complete(&prompt.input.lines()[0]))
+        else {
+            return;
+        };
+        if path.chars().count() > MAX_PROMPT {
+            return;
+        }
+        prompt.input = Prompt::field(prompt.kind, path);
+        if quoted {
+            prompt.input.move_cursor(CursorMove::Back);
+        }
+        self.attachment_path_changed();
+    }
+
+    fn choose_attachment(&mut self, mut prompt: Prompt) {
+        let files = prompt.files.as_mut().expect("attachment prompt");
+        if let Some((path, directory)) = files.chosen(&prompt.input.lines()[0]) {
+            if path.is_dir() {
+                files.enter(path);
+                prompt.input = Prompt::field(prompt.kind, String::new());
+            } else if directory {
+                files.error = Some("That folder is no longer available".into());
+            } else {
+                match self.attach(&path) {
+                    Ok(()) => return,
+                    Err(error) => files.error = Some(text::one_line(&format!("{error:#}"), 300)),
                 }
             }
-            Err(e) => self.error(format!("{e:#}")),
+        } else {
+            files.error = Some("Choose a file or type a local path".into());
         }
+        self.prompt = Some(prompt);
+        self.read_attachment_directory();
+    }
+
+    fn attach(&mut self, path: &Path) -> Result<()> {
+        let composer = self.composer.as_mut().context("No message to attach to")?;
+        composer
+            .attachments
+            .push(compose::Attachment::snapshot(path)?);
+        // A path through a link says where the file really is.
+        if let Ok(real) = std::fs::canonicalize(path)
+            && real != path
+        {
+            self.info(format!(
+                "Attached {}, which is {}",
+                crate::config::shown(path),
+                crate::config::shown(&real)
+            ));
+        }
+        Ok(())
     }
 
     // Reading.
@@ -6386,9 +6497,18 @@ impl App {
         self.batch_resize_width = None;
     }
 
+    fn is_typing(key: &KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char(_))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+
     fn dispatch_terminal_events(&mut self, events: Vec<Event>, presses: &[KeyEvent]) {
-        let repeated = presses.windows(2).all(|w| w[0].code == w[1].code);
-        if presses.len() < 2 || repeated {
+        if self.confirm.is_none() && self.prompt.as_ref().is_some_and(|p| p.files.is_some()) {
+            return self.dispatch_attachment_events(events, presses);
+        }
+        if presses.windows(2).all(|w| w[0].code == w[1].code) {
             return events.into_iter().for_each(|event| self.on_terminal(event));
         }
         // Under a question, keys answer it: nothing is written.
@@ -6408,23 +6528,17 @@ impl App {
         if !writing {
             return self.info("Pasted text goes where you write: press c, / or Tab first");
         }
-        let typed = |key: &KeyEvent| {
-            matches!(key.code, KeyCode::Char(_))
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        };
+        let (last, before) = presses.split_last().expect("two or more");
         let in_body = self
             .composer
             .as_ref()
             .is_some_and(|c| c.field == composer::Field::Body)
             && self.prompt.is_none();
-        let (last, before) = presses.split_last().expect("two or more");
-        let submit = last.code == KeyCode::Enter && before.iter().all(typed) && !in_body;
+        let submit = last.code == KeyCode::Enter && before.iter().all(Self::is_typing) && !in_body;
         let text: String = presses
             .iter()
             .filter_map(|key| match key.code {
-                KeyCode::Char(c) if typed(key) => Some(c),
+                KeyCode::Char(c) if Self::is_typing(key) => Some(c),
                 KeyCode::Enter if in_body => Some('\n'),
                 KeyCode::Enter | KeyCode::Tab => Some(' '),
                 _ => None,
@@ -6433,6 +6547,62 @@ impl App {
         self.on_terminal(Event::Paste(text));
         if submit {
             self.on_key(*last);
+        }
+    }
+
+    fn dispatch_attachment_events(&mut self, events: Vec<Event>, presses: &[KeyEvent]) {
+        // A batch can be navigation followed by activation, or a path followed by
+        // Tab/Enter. Don't drop keys from an unrecognized sequence and choose
+        // whatever filename is left.
+        let (keys, action) = match presses.split_last() {
+            Some((last, keys))
+                if last.modifiers.is_empty()
+                    && matches!(last.code, KeyCode::Tab | KeyCode::Enter | KeyCode::Esc) =>
+            {
+                (keys, Some(last.code))
+            }
+            _ => (presses, None),
+        };
+        let direct = presses.windows(2).all(|w| w[0].code == w[1].code)
+            || keys.iter().all(|key| {
+                key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            });
+        let path_keys = !direct && action != Some(KeyCode::Esc) && keys.iter().all(Self::is_typing);
+        let mut accepted = true;
+        let mut path = String::new();
+        for event in events {
+            if let Event::Key(key) = event {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if path_keys
+                    && Self::is_typing(&key)
+                    && let KeyCode::Char(c) = key.code
+                {
+                    path.push(c);
+                    continue;
+                }
+            }
+            if accepted && !path.is_empty() {
+                accepted = self.paste_attachment_path(&path);
+                path.clear();
+            }
+            match event {
+                Event::Key(key) => {
+                    if (direct || path_keys)
+                        && (accepted || key.code == KeyCode::Esc)
+                        && self.prompt.as_ref().is_some_and(|p| p.files.is_some())
+                    {
+                        self.on_key(key);
+                    }
+                }
+                Event::Paste(text) => accepted = accepted && self.paste_attachment_path(&text),
+                Event::Mouse(_) if !direct => {}
+                event => self.on_terminal(event),
+            }
+        }
+        if accepted && !path.is_empty() {
+            self.paste_attachment_path(&path);
         }
     }
 
@@ -6474,13 +6644,14 @@ impl App {
                     setup.paste(&pasted);
                 } else if let Some(composer) = self.composer.as_mut() {
                     // A file dropped on the window attaches it.
-                    let path = unquote(&pasted);
-                    let file = !path.contains('\n')
-                        && PathBuf::from(&path).is_absolute()
-                        && !crate::config::maybe_remote(std::path::Path::new(&path))
-                        && std::fs::metadata(&path).is_ok_and(|m| m.is_file());
-                    if file && composer.field != composer::Field::Body {
-                        self.attach(&path);
+                    let path = file_picker::unquote(pasted.trim_matches(' '));
+                    if composer.field != composer::Field::Body
+                        && let Some(path) = file_picker::local_path(&path, None)
+                        && path.is_file()
+                    {
+                        if let Err(error) = self.attach(&path) {
+                            self.error(format!("{error:#}"));
+                        }
                     } else {
                         composer.paste(&pasted);
                     }
@@ -6976,10 +7147,23 @@ impl App {
                 }
                 self.prompt = None;
             }
+            KeyCode::Tab if prompt.files.is_some() && key.modifiers.is_empty() => {
+                self.complete_attachment_path();
+            }
+            KeyCode::Up | KeyCode::Down if prompt.files.is_some() && key.modifiers.is_empty() => {
+                prompt
+                    .files
+                    .as_mut()
+                    .unwrap()
+                    .step(key.code == KeyCode::Down);
+            }
             KeyCode::Enter => {
                 let Some(prompt) = self.prompt.take() else {
                     return;
                 };
+                if prompt.kind == PromptKind::Attach {
+                    return self.choose_attachment(prompt);
+                }
                 let text = prompt.text();
                 match prompt.kind {
                     PromptKind::Search => self.run_search(text.trim()),
@@ -6995,7 +7179,7 @@ impl App {
                             self.prompt = Some(Prompt::new(PromptKind::Password(j), ""));
                         }
                     }
-                    PromptKind::Attach => self.attach(&text),
+                    PromptKind::Attach => unreachable!("handled above"),
                     PromptKind::Tag => {
                         let groups = std::mem::take(&mut self.tagging);
                         match tags::normalize(&text) {
@@ -7010,14 +7194,19 @@ impl App {
                 }
             }
             KeyCode::Char('u') if ctrl => {
-                prompt.input = Prompt::new(prompt.kind, "").input;
+                prompt.input = Prompt::field(prompt.kind, String::new());
+                self.attachment_path_changed();
             }
             KeyCode::Char(c)
-                if !ctrl && (text::is_hidden(c) || prompt.text().chars().count() >= MAX_PROMPT) => {
-            }
+                if !ctrl
+                    && (text::is_hidden(c)
+                        || (prompt.files.is_some() && c.is_control())
+                        || prompt.input.lines()[0].chars().count() >= MAX_PROMPT) => {}
             KeyCode::Char('m' | 'j') if ctrl => {}
             _ => {
-                prompt.input.input(key);
+                if prompt.input.input(key) {
+                    self.attachment_path_changed();
+                }
             }
         }
     }
@@ -8045,23 +8234,6 @@ fn copy_through_terminal(text: &str) -> std::io::Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     write!(out, "\x1b]52;c;{encoded}\x07")?;
     out.flush()
-}
-
-/// A path as typed or dropped on the terminal: quotes around it, `\ ` for
-/// spaces, `~` for home.
-pub fn unquote(path: &str) -> String {
-    let path = path.trim();
-    let path = path
-        .strip_prefix('\'')
-        .and_then(|p| p.strip_suffix('\''))
-        .or_else(|| path.strip_prefix('"').and_then(|p| p.strip_suffix('"')))
-        .map_or_else(|| path.replace("\\ ", " "), str::to_string);
-    match path.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
-            .map(|home| home.join(rest).to_string_lossy().into_owned())
-            .unwrap_or(path),
-        None => path,
-    }
 }
 
 /// Turns SIGHUP (the terminal window closed) and SIGTERM into a normal quit.
@@ -10899,6 +11071,111 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_picker_completes_paths_and_attaches_the_highlighted_file() {
+        let dir = tools::private_temp_dir().unwrap();
+        let reports = dir.join("Reports");
+        std::fs::create_dir(&reports).unwrap();
+        std::fs::write(reports.join("Quarter  one.txt"), b"first report").unwrap();
+        std::fs::write(reports.join("Quarter  two.txt"), b"second report").unwrap();
+
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('c')));
+        // Use a private fixture instead of listing the real home directory.
+        let mut prompt = Prompt::new(PromptKind::Attach, "");
+        prompt.files.as_mut().unwrap().enter(dir.clone());
+        app.prompt = Some(prompt);
+        app.read_attachment_directory();
+
+        let typed_then_tab = |text: &str| {
+            text.chars()
+                .map(KeyCode::Char)
+                .chain([KeyCode::Tab])
+                .map(|code| Event::Key(key(code)))
+                .collect()
+        };
+        let folder_path = format!("Reports{}", std::path::MAIN_SEPARATOR);
+        app.on_terminal_events(typed_then_tab("Re"));
+        app.wait_until(|app| {
+            !app.reading_attachment_directory
+                && app.prompt.as_ref().unwrap().input.lines()[0] == folder_path
+        })
+        .await;
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.composer.as_ref().unwrap().attachments.is_empty());
+        assert_eq!(app.prompt.as_ref().unwrap().input.lines()[0], "");
+
+        app.on_terminal_events(typed_then_tab("Qu"));
+        app.wait_until(|app| app.prompt.as_ref().unwrap().input.lines()[0] == "Quarter  ")
+            .await;
+        app.on_key(key(KeyCode::Down));
+        app.on_terminal_events(vec![
+            Event::Paste("not a\npath".into()),
+            Event::Key(key(KeyCode::Enter)),
+        ]);
+        assert!(app.composer.as_ref().unwrap().attachments.is_empty());
+        let shown = crate::ui::tests::screen(&mut app, 120, 28);
+        assert!(shown.contains("› Quarter  one.txt"), "{shown}");
+        assert!(shown.contains("Path not pasted"), "{shown}");
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Down)),
+            Event::Key(key(KeyCode::Tab)),
+        ]);
+        assert_eq!(
+            app.prompt.as_ref().unwrap().input.lines()[0],
+            "Quarter  two.txt"
+        );
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.prompt.is_none());
+        let [compose::Attachment::Data { name, bytes, .. }] =
+            app.composer.as_ref().unwrap().attachments.as_slice()
+        else {
+            panic!("the chosen file was not attached");
+        };
+        assert_eq!(name, "Quarter two.txt");
+        assert_eq!(bytes.as_slice(), b"second report");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_picker_completes_from_a_fresh_scan_after_reopening() {
+        let dir = tools::private_temp_dir().unwrap();
+        let old_path = dir.join("retired.txt");
+        std::fs::write(&old_path, b"report").unwrap();
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('c')));
+
+        let open = |app: &mut App| {
+            let mut prompt = Prompt::new(PromptKind::Attach, "");
+            prompt.files.as_mut().unwrap().enter(dir.clone());
+            app.prompt = Some(prompt);
+            app.read_attachment_directory();
+        };
+        open(&mut app);
+        // Wait for the first listing without delivering it to the picker.
+        let old = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = app.test_rx.as_mut().unwrap().recv().await.unwrap();
+                if matches!(event, AppEvent::AttachmentDirectory { .. }) {
+                    break event;
+                }
+                app.on_event(event);
+            }
+        })
+        .await
+        .unwrap();
+
+        app.on_key(key(KeyCode::Esc));
+        std::fs::rename(old_path, dir.join("replacement.txt")).unwrap();
+        open(&mut app);
+        app.on_key(key(KeyCode::Char('r')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_event(old);
+        app.wait_until(|app| app.prompt.as_ref().unwrap().input.lines()[0] == "replacement.txt")
+            .await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn pasted_keys_are_not_run_as_commands() {
         let mut app = app();
         with_mail(&mut app);
@@ -11009,8 +11286,6 @@ pub mod tests {
             link_host("https://user@shop.example:8080/x?y"),
             "shop.example:8080"
         );
-        assert_eq!(unquote("'/tmp/a b.pdf'"), "/tmp/a b.pdf");
-        assert_eq!(unquote("/tmp/a\\ b.pdf"), "/tmp/a b.pdf");
     }
     /// The selected message as the cache has it.
     fn stored_selected(app: &App) -> Message {

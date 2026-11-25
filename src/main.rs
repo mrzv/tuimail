@@ -7,6 +7,7 @@ mod config;
 mod contacts;
 mod contacts_cli;
 mod demo;
+mod file_picker;
 mod icons;
 mod imap;
 #[cfg(test)]
