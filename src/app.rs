@@ -436,8 +436,7 @@ pub struct Thread {
     pub tree: String,
     /// It answers a message with the same subject.
     pub same_subject: bool,
-    /// The Inbox copy that supplied this editable draft's place in the
-    /// thread, when the match is based on cached headers rather than Gmail's ID.
+    /// The actual Inbox copy behind this displayed Drafts message.
     draft_inbox: Option<DraftInboxCopy>,
 }
 
@@ -445,6 +444,7 @@ pub struct Thread {
 struct DraftInboxCopy {
     uid: u32,
     thread_id: Option<u64>,
+    has_message_id: bool,
 }
 
 impl Item {
@@ -818,6 +818,12 @@ pub enum Confirm {
         uids: Vec<u32>,
         uidvalidity: u32,
     },
+    /// Some replies in an IMAP conversation can't be found again by undo.
+    Archive {
+        group: Group,
+        to: String,
+        without_id: usize,
+    },
     /// Send the message, as it was when asked: `print` is the draft's
     /// digest with its account, and a `y` sends nothing else.
     Send {
@@ -990,8 +996,8 @@ pub struct App {
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
     confirm_at: Instant,
-    /// The current link question's host fit in its last rendered frame.
-    pub(crate) link_confirm_visible: bool,
+    /// The current link destination or incomplete-undo warning fit on screen.
+    pub(crate) confirm_text_visible: bool,
     /// `d`'s questions still to ask: one each account and folder.
     deletes_waiting: VecDeque<Confirm>,
     pub help: Option<HelpMenu>,
@@ -1170,7 +1176,7 @@ impl App {
             picker: None,
             confirm: None,
             confirm_at: Instant::now(),
-            link_confirm_visible: false,
+            confirm_text_visible: false,
             deletes_waiting: VecDeque::new(),
             help: None,
             status: None,
@@ -3037,10 +3043,6 @@ impl App {
                         listed.push(draft);
                         continue;
                     }
-                    draft.thread.draft_inbox = Some(DraftInboxCopy {
-                        uid: source.uid,
-                        thread_id: source.gmail.map(|g| g.thread_id),
-                    });
                     i
                 }
                 _ => {
@@ -3048,6 +3050,17 @@ impl App {
                     continue;
                 }
             };
+            let source = &listed[index].message;
+            let inbox = self.accounts[draft.account]
+                .folder_for(Role::Inbox)
+                .map_or("INBOX", |f| f.name.as_str());
+            if source.folder == inbox {
+                draft.thread.draft_inbox = Some(DraftInboxCopy {
+                    uid: source.uid,
+                    thread_id: source.gmail.map(|g| g.thread_id),
+                    has_message_id: mail::valid_id(&source.summary.message_id),
+                });
+            }
             copies.insert(index, draft);
         }
         copies
@@ -3872,6 +3885,53 @@ impl App {
             return marked;
         }
         self.selected_item().map(Item::key).into_iter().collect()
+    }
+
+    /// Archive a collapsed conversation from the current folder only.
+    /// The count of IMAP replies without a Message-ID is for the undo warning.
+    fn conversation_archive(&self) -> Option<(usize, String, Vec<u32>, usize)> {
+        let row = if self.focus == Focus::Reader
+            && let Some(reader) = &self.reader
+        {
+            let thread = reader.thread.as_ref()?;
+            self.row_for(thread.members[thread.active])
+        } else if self.marked.is_empty() {
+            self.selected
+        } else {
+            return None;
+        };
+        let row = self.rows.get(row).filter(|r| r.members.len() > 1)?;
+        let items = &self.items[row.members.clone()];
+        let account = items[0].account;
+        let folder = match &self.place {
+            Place::Folder { folder, .. } => folder.as_str(),
+            Place::AllInboxes => self.accounts[account]
+                .folder_for(Role::Inbox)
+                .map_or("INBOX", |f| f.name.as_str()),
+        };
+        // Sent, All Mail, and Drafts can contribute replies for context.
+        let imap = !self.demo && !self.accounts[account].is_pop();
+        let mut without_id = 0;
+        let uids = items
+            .iter()
+            .filter_map(|it| {
+                let (uid, has_message_id) = if it.message.folder == folder {
+                    (
+                        it.message.uid,
+                        !imap || mail::valid_id(&it.message.summary.message_id),
+                    )
+                } else {
+                    // The editable draft may stand in for a copy in the Inbox.
+                    let copy = it.thread.draft_inbox?;
+                    (copy.uid, copy.has_message_id)
+                };
+                if imap && !has_message_id {
+                    without_id += 1;
+                }
+                Some(uid)
+            })
+            .collect();
+        Some((account, folder.into(), uids, without_id))
     }
 
     /// `targets` grouped by account and folder.
@@ -5431,6 +5491,17 @@ impl App {
 
     /// Moves messages to `to` (a folder of the same account).
     fn move_messages(&mut self, account: usize, folder: &str, uids: &[u32], to: &str) {
+        self.move_messages_with_validity(account, folder, uids, to, None);
+    }
+
+    fn move_messages_with_validity(
+        &mut self,
+        account: usize,
+        folder: &str,
+        uids: &[u32],
+        to: &str,
+        approved_validity: Option<u32>,
+    ) {
         let id = self.accounts[account].id.clone();
         let mut keys: Vec<_> = uids
             .iter()
@@ -5490,7 +5561,8 @@ impl App {
                     folder: folder.to_string(),
                     uids: uids.to_vec(),
                     to: to.to_string(),
-                    uidvalidity: self.uidvalidity(account, folder),
+                    uidvalidity: approved_validity
+                        .unwrap_or_else(|| self.uidvalidity(account, folder)),
                 },
             );
         }
@@ -5625,40 +5697,92 @@ impl App {
 
     /// `e` archives, `!` moves to Junk: to the folder with `role`.
     fn move_to_role(&mut self, role: Role) {
-        let targets = self.targets();
-        for (account, folder, uids) in Self::grouped(&targets) {
-            let target = self.accounts[account]
-                .folder_for(role)
-                .or_else(|| {
-                    // Gmail archives to All Mail.
-                    (role == Role::Archive)
-                        .then(|| self.accounts[account].folder_for(Role::All))
-                        .flatten()
-                })
-                .map(|f| f.name.clone());
-            let Some(target) = target else {
-                let what = if role == Role::Junk {
-                    "junk"
-                } else {
-                    "archive"
-                };
-                self.error(format!(
-                    "{} has no {what} folder: set {what}_folder in accounts.toml",
-                    self.account_name(account)
-                ));
-                return;
-            };
-            if target == folder {
-                continue;
-            }
-            self.move_messages(account, &folder, &uids, &target);
-            let done = if role == Role::Junk {
-                "marked as junk"
-            } else {
-                "archived"
-            };
-            self.info(format!("{} {done}", plural(uids.len(), "message")));
+        if role == Role::Archive
+            && let Some((account, folder, uids, without_id)) = self.conversation_archive()
+        {
+            self.move_group_to_role(account, folder, uids, role, without_id);
+            return;
         }
+        for (account, folder, uids) in Self::grouped(&self.targets()) {
+            if !self.move_group_to_role(account, folder, uids, role, 0) {
+                break;
+            }
+        }
+    }
+
+    fn move_group_to_role(
+        &mut self,
+        account: usize,
+        folder: String,
+        uids: Vec<u32>,
+        role: Role,
+        without_id: usize,
+    ) -> bool {
+        if uids.is_empty() {
+            return true;
+        }
+        let to = self.accounts[account]
+            .folder_for(role)
+            .or_else(|| {
+                // Gmail archives to All Mail.
+                (role == Role::Archive)
+                    .then(|| self.accounts[account].folder_for(Role::All))
+                    .flatten()
+            })
+            .map(|f| f.name.clone());
+        let Some(to) = to else {
+            let what = if role == Role::Junk {
+                "junk"
+            } else {
+                "archive"
+            };
+            self.error(format!(
+                "{} has no {what} folder: set {what}_folder in accounts.toml",
+                self.account_name(account)
+            ));
+            return false;
+        };
+        if to == folder {
+            return true;
+        }
+        if without_id > 0 {
+            let uidvalidity = self.uidvalidity(account, &folder);
+            if uidvalidity == 0 {
+                self.error("Refresh the source folder with R before archiving this conversation");
+                return false;
+            }
+            self.confirm(Confirm::Archive {
+                group: Group {
+                    account,
+                    uidvalidity,
+                    folder,
+                    uids,
+                },
+                to,
+                without_id,
+            });
+        } else {
+            self.finish_role_move(account, &folder, &uids, &to, role, None);
+        }
+        true
+    }
+
+    fn finish_role_move(
+        &mut self,
+        account: usize,
+        folder: &str,
+        uids: &[u32],
+        to: &str,
+        role: Role,
+        approved_validity: Option<u32>,
+    ) {
+        self.move_messages_with_validity(account, folder, uids, to, approved_validity);
+        let done = if role == Role::Junk {
+            "marked as junk"
+        } else {
+            "archived"
+        };
+        self.info(format!("{} {done}", plural(uids.len(), "message")));
     }
 
     /// `m`: picks a folder to move to.
@@ -6614,7 +6738,7 @@ impl App {
                 self.cancel_left_draft_edit();
             }
             Event::Resize(..) => {
-                self.link_confirm_visible = false;
+                self.confirm_text_visible = false;
                 self.list_hit_area.set(Rect::ZERO);
                 self.reader_view = None;
                 if let Some(reader) = self.reader.as_mut() {
@@ -7391,7 +7515,7 @@ impl App {
     fn confirm(&mut self, confirm: Confirm) {
         self.confirm = Some(confirm);
         self.confirm_at = Instant::now();
-        self.link_confirm_visible = false;
+        self.confirm_text_visible = false;
     }
 
     /// `y` answers yes; for an unsaved message, `n` discards it; any other
@@ -7444,6 +7568,25 @@ impl App {
                     self.move_messages(account, &folder, &uids, &trash);
                 }
             }
+            confirm @ (Confirm::Archive { .. } | Confirm::OpenLink { .. })
+                if yes && !self.confirm_text_visible =>
+            {
+                self.confirm = Some(confirm);
+            }
+            Confirm::Archive { group, to, .. } if yes => {
+                if self.uidvalidity(group.account, &group.folder) == group.uidvalidity {
+                    self.finish_role_move(
+                        group.account,
+                        &group.folder,
+                        &group.uids,
+                        &to,
+                        Role::Archive,
+                        Some(group.uidvalidity),
+                    );
+                } else {
+                    self.error("The source folder changed: no messages were archived");
+                }
+            }
             Confirm::Send { print, .. } if yes => self.send_message(Some(print)),
             Confirm::CloseComposer if yes => self.save_draft(),
             Confirm::CloseComposer if no => {
@@ -7453,10 +7596,7 @@ impl App {
             Confirm::OpenAttachments { files, opener } if yes => {
                 self.extract(files, true, true, opener)
             }
-            Confirm::OpenLink { url, .. } if yes && self.link_confirm_visible => {
-                self.open_link(&url)
-            }
-            confirm @ Confirm::OpenLink { .. } if yes => self.confirm = Some(confirm),
+            Confirm::OpenLink { url, .. } if yes => self.open_link(&url),
             Confirm::RemoveAccount(i) if yes => self.remove_account(i),
             Confirm::Quit { .. } if yes => self.quit = true,
             confirm if early => self.confirm = Some(confirm),
@@ -10388,6 +10528,185 @@ pub mod tests {
             !picker.items.contains(&"Archive".to_string()),
             "not where it is"
         );
+    }
+
+    #[tokio::test]
+    async fn archive_moves_the_collapsed_conversation_as_one_change() {
+        for (source, from_reader) in [("INBOX", false), ("INBOX", true), ("Drafts", false)] {
+            let mut app = app();
+            let id = app.accounts[0].id.clone();
+            let folders = local_folders();
+            app.store.set_folders(&id, &folders).unwrap();
+            app.accounts[0].folders = folders;
+            let mut add = |folder, raw: &[u8]| {
+                app.store
+                    .add_local(&id, folder, raw, Flags::default(), None)
+                    .unwrap()
+            };
+            add(source, DRAFT_CONVERSATION[0]);
+            add(source, DRAFT_CONVERSATION[2]);
+            let copies = (source == "INBOX").then(|| {
+                (
+                    add(source, DRAFT_CONVERSATION[1]),
+                    add("Drafts", DRAFT_CONVERSATION[1]),
+                )
+            });
+            add(
+                "Sent",
+                b"From: me@example.org\r\nSubject: Re: Plans\r\n\
+                  Date: Sat, 1 Feb 2025 10:03:00 +0000\r\nMessage-ID: <sent@example.org>\r\n\
+                  In-Reply-To: <plans@example.org>\r\n\r\nSee you there.\r\n",
+            );
+            add(
+                source,
+                b"From: alice@example.org\r\nSubject: Another topic\r\n\
+                  Message-ID: <other@example.org>\r\n\r\nUnrelated mail.\r\n",
+            );
+            if from_reader && let Some((inbox, draft)) = copies {
+                let native = store::Gmail {
+                    message_id: 22,
+                    thread_id: 7,
+                    sent: false,
+                };
+                for (folder, uid) in [(source, inbox), ("Drafts", draft)] {
+                    app.store.set_gmail(&id, folder, &[(uid, native)]).unwrap();
+                }
+            }
+            app.settings.threads_collapsed = true;
+            app.settings.threads_include_sent = true;
+            app.open_place(if from_reader {
+                Place::AllInboxes
+            } else {
+                Place::Folder {
+                    account: 0,
+                    folder: source.into(),
+                }
+            });
+            app.focus = Focus::List;
+            let count = if source == "INBOX" { 4 } else { 3 };
+            let row = app
+                .visible_items()
+                .position(|(item, members)| members == count && item.message.folder == "Sent")
+                .unwrap();
+            app.select(row);
+            if from_reader {
+                app.on_key(key(KeyCode::Enter));
+                app.on_key(key(KeyCode::Char(']')));
+                wait_for_layout(&mut app).await;
+            }
+
+            let ids = |app: &App, folder| {
+                let mut ids: Vec<_> = app
+                    .store
+                    .messages(&id, folder, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| m.summary.message_id)
+                    .collect();
+                ids.sort_unstable();
+                ids
+            };
+            app.on_key(key(KeyCode::Char('e')));
+            assert_eq!(ids(&app, source), ["other@example.org"]);
+            let mut archived = vec!["plans@example.org", "update@example.org"];
+            if source == "INBOX" {
+                archived.insert(1, "unsent@example.org");
+            }
+            assert_eq!(ids(&app, "Archive"), archived);
+            if source == "INBOX" {
+                assert_eq!(ids(&app, "Drafts"), ["unsent@example.org"]);
+            }
+            assert_eq!(ids(&app, "Sent"), ["sent@example.org"]);
+
+            app.on_key(key(KeyCode::Char('z')));
+            assert!(ids(&app, "Archive").is_empty());
+            archived.insert(0, "other@example.org");
+            assert_eq!(ids(&app, source), archived);
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_asks_before_moving_a_conversation_that_cant_be_fully_undone() {
+        for source_vanishes in [false, true] {
+            let mut app = app();
+            app.demo = false;
+            let id = app.accounts[0].id.clone();
+            let folders = local_folders();
+            app.store.set_folders(&id, &folders).unwrap();
+            app.accounts[0].folders = folders;
+            let uidvalidity = 23;
+            app.store
+                .set_known(
+                    &id,
+                    "INBOX",
+                    Known {
+                        uidvalidity,
+                        ..Known::default()
+                    },
+                )
+                .unwrap();
+            let without_id: &[u8] = b"From: bob@example.org\r\nSubject: Re: Plans\r\n\
+                Date: Sat, 1 Feb 2025 10:01:00 +0000\r\nIn-Reply-To: <plans@example.org>\r\n\
+                \r\nAn older reply.\r\n";
+            let expected = [DRAFT_CONVERSATION[0], without_id, DRAFT_CONVERSATION[2]].map(|raw| {
+                app.store
+                    .add_local(&id, "INBOX", raw, Flags::default(), None)
+                    .unwrap()
+            });
+            app.settings.threads_collapsed = true;
+            app.open_place(Place::AllInboxes);
+            app.focus = Focus::List;
+            app.test_sent.borrow_mut().clear();
+
+            app.on_key(key(KeyCode::Char('e')));
+            let screen = crate::ui::tests::screen(&mut app, 50, 3);
+            assert!(
+                screen.contains("Resize to see the undo warning"),
+                "{screen}"
+            );
+            app.confirm_at = Instant::now() - CONFIRM_GRACE;
+            app.on_key(key(KeyCode::Char('y')));
+            assert!(last_sent(&app).is_none());
+
+            let screen = crate::ui::tests::screen(&mut app, 120, 40);
+            assert!(screen.contains("Archive conversation?"), "{screen}");
+            assert!(
+                screen.contains("Undo (z) can't restore 1 message"),
+                "{screen}"
+            );
+            app.on_key(key(KeyCode::Esc));
+            assert!(last_sent(&app).is_none());
+            assert_eq!(app.store.messages(&id, "INBOX", 10).unwrap().len(), 3);
+
+            app.on_key(key(KeyCode::Char('e')));
+            crate::ui::tests::screen(&mut app, 120, 40);
+            app.confirm_at = Instant::now() - CONFIRM_GRACE;
+            if source_vanishes {
+                let mut folders = local_folders();
+                folders.retain(|f| f.name != "INBOX");
+                app.store.set_folders(&id, &folders).unwrap();
+                app.on_key(key(KeyCode::Char('y')));
+                assert!(last_sent(&app).is_none());
+                continue;
+            }
+            app.on_key(key(KeyCode::Char('y')));
+            let Some((
+                0,
+                Request::Move {
+                    folder,
+                    mut uids,
+                    to,
+                    uidvalidity: sent_validity,
+                },
+            )) = last_sent(&app)
+            else {
+                panic!("{:?}", last_sent(&app));
+            };
+            uids.sort_unstable();
+            assert_eq!(uids, expected);
+            assert_eq!((folder.as_str(), to.as_str()), ("INBOX", "Archive"));
+            assert_eq!(sent_validity, uidvalidity);
+        }
     }
 
     #[tokio::test]

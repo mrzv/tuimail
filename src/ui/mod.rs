@@ -617,6 +617,7 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
         Confirm::OpenLink { url, .. } => Some(url.as_str()),
         _ => None,
     };
+    let needs_full_text = url.is_some() || matches!(confirm, Confirm::Archive { .. });
     let (title, text, hint) = match confirm {
         Confirm::Agent { id } => {
             let Some(ask) = app.agent_asks.iter().find(|a| a.id == *id) else {
@@ -650,6 +651,17 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
             " Move to Trash? ",
             format!("{} will go to Trash.", plural(uids.len(), "message")),
             " `y` move · any other key keeps them ",
+        ),
+        Confirm::Archive {
+            group, without_id, ..
+        } => (
+            " Archive conversation? ",
+            format!(
+                "{} will be archived. Undo (z) can't restore {} without a Message-ID.",
+                plural(group.uids.len(), "message"),
+                plural(*without_id, "message")
+            ),
+            " `y` archive · any other key keeps them ",
         ),
         Confirm::Send {
             subject,
@@ -765,17 +777,21 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     // Wrapped by the columns ratatui draws (an agent's name of halfwidth
     // sound marks would otherwise push its question out of the box).
     let mut wrapped = crate::text::wrap(&text, room);
-    let (height, hint) = if url.is_some() {
-        // A short terminal gets the host first, without a blank spacer.
-        // Never accept y when a resize or clipping hid the host.
-        app.link_confirm_visible =
+    let (height, hint) = if needs_full_text {
+        // Never accept y when a resize or clipping hid the destination or warning.
+        app.confirm_text_visible =
             room != 0 && !text.is_empty() && wrapped.len() + 2 <= usize::from(area.height);
-        if !app.link_confirm_visible {
-            wrapped = crate::text::wrap("Resize to see the destination", room);
+        if !app.confirm_text_visible {
+            let message = if url.is_some() {
+                "Resize to see the destination"
+            } else {
+                "Resize to see the undo warning"
+            };
+            wrapped = crate::text::wrap(message, room);
         }
         (
             (wrapped.len() as u16 + 3).min(area.height),
-            if app.link_confirm_visible {
+            if app.confirm_text_visible {
                 hint
             } else {
                 " Esc cancel "
@@ -797,7 +813,7 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let mut lines = Vec::new();
-    if url.is_none() {
+    if !needs_full_text {
         lines.push(Line::default());
     }
     lines.extend(
@@ -806,7 +822,7 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|l| Line::from(Span::styled(format!(" {l}"), Style::new().fg(c.text)))),
     );
     if let Some(url) = url
-        && app.link_confirm_visible
+        && app.confirm_text_visible
         && lines.len() < usize::from(inner.height)
     {
         lines.push(Line::from(Span::styled(
@@ -825,7 +841,7 @@ const HELP: [(&str, &str); 36] = [
     ("c", "write a message"),
     ("r  /  a  /  f", "reply  /  reply to all  /  forward"),
     ("d", "delete: to Trash; in Trash, for good"),
-    ("e  /  !", "archive  /  junk"),
+    ("e  /  !", "archive (whole collapsed conversation)  /  junk"),
     ("m", "move to a folder"),
     ("t", "tag: put a tag on or take it off; tag:work searches"),
     (
