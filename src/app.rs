@@ -663,7 +663,14 @@ impl Prompt {
         Self {
             kind,
             input: Self::field(kind, text.into()),
-            files: (kind == PromptKind::Attach).then(FilePicker::new),
+            files: None,
+        }
+    }
+
+    fn attach(last_directory: Option<&Path>) -> Self {
+        Self {
+            files: Some(FilePicker::new(last_directory)),
+            ..Self::new(PromptKind::Attach, "")
         }
     }
 
@@ -970,6 +977,8 @@ pub struct App {
     pub composer: Option<Composer>,
     pub setup: Option<Setup>,
     pub prompt: Option<Prompt>,
+    /// The containing folder of the last file attached in this session.
+    last_attachment_directory: Option<PathBuf>,
     reading_attachment_directory: bool,
     /// The messages a new tag being typed is for.
     tagging: Vec<Group>,
@@ -1161,6 +1170,7 @@ impl App {
             composer: None,
             setup: None,
             prompt: None,
+            last_attachment_directory: None,
             reading_attachment_directory: false,
             tagging: Vec::new(),
             change: None,
@@ -5983,7 +5993,7 @@ impl App {
                 }
             }
             composer::Action::Attach => {
-                self.prompt = Some(Prompt::new(PromptKind::Attach, ""));
+                self.prompt = Some(Prompt::attach(self.last_attachment_directory.as_deref()));
                 self.read_attachment_directory();
             }
             composer::Action::Edit => self.terminal_requests.push_back(TerminalRequest::Editor),
@@ -6379,6 +6389,7 @@ impl App {
         composer
             .attachments
             .push(compose::Attachment::snapshot(path)?);
+        self.last_attachment_directory = path.parent().map(Path::to_path_buf);
         // A path through a link says where the file really is.
         if let Ok(real) = std::fs::canonicalize(path)
             && real != path
@@ -11400,10 +11411,9 @@ pub mod tests {
         let mut app = app();
         app.on_key(key(KeyCode::Char('c')));
         // Use a private fixture instead of listing the real home directory.
-        let mut prompt = Prompt::new(PromptKind::Attach, "");
-        prompt.files.as_mut().unwrap().enter(dir.clone());
-        app.prompt = Some(prompt);
-        app.read_attachment_directory();
+        app.last_attachment_directory = Some(dir.clone());
+        let attach = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.on_key(attach);
 
         let typed_then_tab = |text: &str| {
             text.chars()
@@ -11452,6 +11462,19 @@ pub mod tests {
         };
         assert_eq!(name, "Quarter two.txt");
         assert_eq!(bytes.as_slice(), b"second report");
+
+        app.on_key(attach);
+        app.on_terminal_events(typed_then_tab("Quarter  o"));
+        app.wait_until(|app| app.prompt.as_ref().unwrap().input.lines()[0] == "Quarter  one.txt")
+            .await;
+        app.on_key(key(KeyCode::Enter));
+        let [_, compose::Attachment::Data { name, bytes, .. }] =
+            app.composer.as_ref().unwrap().attachments.as_slice()
+        else {
+            panic!("the second file was not attached from the same folder");
+        };
+        assert_eq!(name, "Quarter one.txt");
+        assert_eq!(bytes.as_slice(), b"first report");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -11462,14 +11485,9 @@ pub mod tests {
         std::fs::write(&old_path, b"report").unwrap();
         let mut app = app();
         app.on_key(key(KeyCode::Char('c')));
-
-        let open = |app: &mut App| {
-            let mut prompt = Prompt::new(PromptKind::Attach, "");
-            prompt.files.as_mut().unwrap().enter(dir.clone());
-            app.prompt = Some(prompt);
-            app.read_attachment_directory();
-        };
-        open(&mut app);
+        app.last_attachment_directory = Some(dir.clone());
+        let attach = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.on_key(attach);
         // Wait for the first listing without delivering it to the picker.
         let old = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -11485,7 +11503,7 @@ pub mod tests {
 
         app.on_key(key(KeyCode::Esc));
         std::fs::rename(old_path, dir.join("replacement.txt")).unwrap();
-        open(&mut app);
+        app.on_key(attach);
         app.on_key(key(KeyCode::Char('r')));
         app.on_key(key(KeyCode::Tab));
         app.on_event(old);

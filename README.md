@@ -160,7 +160,7 @@ Writing:
 | `x` on Files | Take a file off |
 | `Esc` | Close: `y` keeps it in Drafts, `n` throws it away |
 
-The attachment picker starts in your home folder. Type or paste a path (`~/` and spaces work), use `Tab` to complete it, or use `↑`/`↓` to select an entry. `Enter` opens a folder or attaches the file; choose `..` to go up. `Ctrl-u` clears the path and `Esc` cancels.
+The attachment picker starts in your home folder, then reopens in the folder of the last file you attached during this run. Type or paste a path (`~/` and spaces work), use `Tab` to complete it, or use `↑`/`↓` to select an entry. `Enter` opens a folder or attaches the file; choose `..` to go up. `Ctrl-u` clears the path and `Esc` cancels.
 
 ## Accounts
 

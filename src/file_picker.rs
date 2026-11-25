@@ -117,9 +117,11 @@ pub(crate) struct FilePicker {
 }
 
 impl FilePicker {
-    pub fn new() -> Self {
-        let base = dirs::home_dir()
+    pub fn new(last_directory: Option<&Path>) -> Self {
+        let base = last_directory
             .filter(|path| is_local(path))
+            .map(Path::to_path_buf)
+            .or_else(|| dirs::home_dir().filter(|path| is_local(path)))
             .or_else(|| std::env::current_dir().ok().filter(|path| is_local(path)));
         Self {
             directory: base.clone(),
