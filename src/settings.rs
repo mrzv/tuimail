@@ -46,6 +46,8 @@ pub struct Settings {
     pub confirm_delete: bool,
     /// Ask before sending.
     pub confirm_send: bool,
+    /// Time to cancel an approved send before it reaches SMTP (0 disables it).
+    pub undo_send_seconds: u32,
     /// How often to look for new mail where the server can't say at once
     /// (no IDLE), and in folders other than the inbox, in minutes: at least
     /// 1, at most a day.
@@ -98,6 +100,7 @@ impl Default for Settings {
             threads_complete_gmail: false,
             confirm_delete: false,
             confirm_send: true,
+            undo_send_seconds: 0,
             check_minutes: 5,
             fetch_count: 300,
             sidebar_width: 28,
@@ -112,6 +115,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub(crate) fn undo_send_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.undo_send_seconds.min(30)))
+    }
+
     /// Defaults if the file doesn't exist yet; an error if it can't be read.
     #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self> {
@@ -244,7 +251,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 22] = [
+const KNOWN: [&str; 23] = [
     "theme",
     "icons",
     "notifications",
@@ -258,6 +265,7 @@ const KNOWN: [&str; 22] = [
     "threads_complete_gmail",
     "confirm_delete",
     "confirm_send",
+    "undo_send_seconds",
     "check_minutes",
     "fetch_count",
     "sidebar_width",

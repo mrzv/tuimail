@@ -29,6 +29,7 @@ use crate::icons::Icons;
 use crate::imap::FlagKind;
 use crate::mail::{self, Addr, Body, Parsed};
 use crate::notify::{self, Notifications, Notifier};
+use crate::palette::{Command, Palette};
 use crate::secrets::{Credentials, Secret};
 use crate::settings::{AttachmentOpener, Settings};
 use crate::setup::{self, Setup};
@@ -102,6 +103,10 @@ pub enum AppEvent {
         parsed: Option<Arc<Parsed>>,
         body: Option<Body>,
     },
+    OriginalRendered {
+        generation: u64,
+        body: Option<Body>,
+    },
     /// A reply, forward or saved draft made ready for the composer, by the
     /// account's id (an index could mean another once one is removed).
     Drafted {
@@ -109,6 +114,7 @@ pub enum AppEvent {
         kind: Kind,
         draft: Option<Draft>,
         edit: Option<u64>,
+        original: Option<ReplyOriginal>,
         /// Attachments listed that couldn't be taken into the composer.
         lost: usize,
     },
@@ -138,10 +144,14 @@ pub enum AppEvent {
     },
     /// What a background task couldn't do, for the status line (keeping a
     /// new account's password in the keychain).
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
     /// A sign-in with Microsoft or Google waits for the browser: open it
     /// on `url`.
-    SignInOpened { url: String },
+    SignInOpened {
+        url: String,
+    },
     /// A sign-in finished, for the account with this id.
     SignedIn {
         account: String,
@@ -390,6 +400,83 @@ pub struct SentCopy {
     pub to: Vec<Addr>,
     pub replying: Option<Kept>,
     pub draft_of: Option<Kept>,
+}
+
+/// An approved message not yet handed to SMTP. This slot owns both copies:
+/// canceling takes them out without changing the draft or its source.
+struct PendingSend {
+    deadline: Instant,
+    account: usize,
+    message: compose::Built,
+    copy: SentCopy,
+}
+
+/// The exact message the reply was made from, independent of the live reader.
+pub(crate) struct ReplyOriginal {
+    pub(crate) parsed: Arc<Parsed>,
+    pub(crate) body: Option<Body>,
+    pub(crate) focused: bool,
+    pub(crate) width: u16,
+    pub(crate) rows: usize,
+    pub(crate) scroll: usize,
+    plain: bool,
+    rendered_width: u16,
+    pending: Option<u64>,
+}
+
+impl ReplyOriginal {
+    fn new(parsed: Parsed, plain: bool) -> Self {
+        Self {
+            parsed: Arc::new(parsed),
+            body: None,
+            focused: false,
+            width: 0,
+            rows: 0,
+            scroll: 0,
+            plain,
+            rendered_width: 0,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.width = 0;
+        self.focused = false;
+    }
+
+    pub(crate) fn loading(&self) -> bool {
+        self.pending.is_some() || self.width != self.rendered_width
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::F(2) && key.modifiers.is_empty() && self.width != 0 {
+            self.focused = !self.focused;
+            return true;
+        }
+        if !self.focused {
+            return false;
+        }
+        let page = self.rows.saturating_sub(1).max(1);
+        let max = self
+            .body
+            .as_ref()
+            .map_or(0, |body| body.lines.len().saturating_sub(self.rows));
+        self.scroll = match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll.saturating_add(page),
+            KeyCode::PageUp => self.scroll.saturating_sub(page),
+            KeyCode::Home => 0,
+            KeyCode::End => max,
+            KeyCode::Esc => {
+                self.focused = false;
+                self.scroll
+            }
+            _ => return true,
+        }
+        .min(max);
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -646,6 +733,7 @@ impl Reader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptKind {
     Search,
+    Commands,
     Password(usize),
     Attach,
     /// A new tag for [`App::tagging`].
@@ -656,6 +744,7 @@ pub struct Prompt {
     pub kind: PromptKind,
     pub input: TextArea<'static>,
     pub(crate) files: Option<FilePicker>,
+    pub(crate) palette: Option<Palette>,
 }
 
 impl Prompt {
@@ -664,6 +753,7 @@ impl Prompt {
             kind,
             input: Self::field(kind, text.into()),
             files: None,
+            palette: None,
         }
     }
 
@@ -882,11 +972,12 @@ impl HelpMenu {
     pub const THREADS_COMPLETE_GMAIL: usize = 7;
     pub const CONFIRM_DELETE: usize = 8;
     pub const CONFIRM_SEND: usize = 9;
-    pub const NOTIFICATIONS: usize = 10;
-    pub const AGENTS: usize = 11;
-    pub const CONFIRM_AGENTS: usize = 12;
-    pub const FOLDER_VISIBILITY: usize = 13;
-    pub const THEMES: usize = 14;
+    pub const UNDO_SEND: usize = 10;
+    pub const NOTIFICATIONS: usize = 11;
+    pub const AGENTS: usize = 12;
+    pub const CONFIRM_AGENTS: usize = 13;
+    pub const FOLDER_VISIBILITY: usize = 14;
+    pub const THEMES: usize = 15;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -952,6 +1043,9 @@ pub struct App {
     pub marked: HashSet<(usize, String, u32)>,
     /// The search in effect.
     pub search: Option<String>,
+    search_generation: u64,
+    /// The current folder's IMAP hits, which need not also match the cache's text.
+    search_matches: Vec<u32>,
 
     pub sidebar_selected: usize,
     pub sidebar_scroll: Cell<usize>,
@@ -1012,6 +1106,7 @@ pub struct App {
     pub help: Option<HelpMenu>,
     pub status: Option<Status>,
     pending: Option<((usize, String, u32), Pending)>,
+    pending_send: Option<PendingSend>,
     next_draft_edit: u64,
     /// Flags changed here, and when.
     local_flags: HashMap<(usize, String, u32), Instant>,
@@ -1155,6 +1250,8 @@ impl App {
             list_hit_area: Cell::new(Rect::ZERO),
             marked: HashSet::new(),
             search: None,
+            search_generation: 0,
+            search_matches: Vec::new(),
             sidebar_selected: 0,
             sidebar_scroll: Cell::new(0),
             focus: Focus::List,
@@ -1191,6 +1288,7 @@ impl App {
             help: None,
             status: None,
             pending: None,
+            pending_send: None,
             next_draft_edit: 0,
             local_flags: HashMap::new(),
             local_removed: HashMap::new(),
@@ -1389,7 +1487,34 @@ impl App {
         {
             self.render();
         }
+        self.render_reply_original();
         self.complete_visible_threads();
+    }
+
+    fn render_reply_original(&mut self) {
+        let Some(original) = self.composer.as_mut().and_then(|c| c.original.as_mut()) else {
+            return;
+        };
+        let width = original.width;
+        if width == 0 || original.rendered_width == width || original.pending.is_some() {
+            return;
+        }
+        self.renders += 1;
+        let generation = self.renders;
+        original.pending = Some(generation);
+        original.rendered_width = width;
+        let options = mail::RenderOptions {
+            prefer_plain: original.plain,
+            hide_trailing_quotes: false,
+        };
+        let parsed = Arc::clone(&original.parsed);
+        let tx = self.tx.clone();
+        mail::in_background(
+            move || mail::render(&parsed, usize::from(width), options),
+            move |body| {
+                let _ = tx.send(AppEvent::OriginalRendered { generation, body });
+            },
+        );
     }
 
     /// Discover only conversations currently on screen, not all of All Mail.
@@ -1519,6 +1644,15 @@ impl App {
     }
 
     fn on_tick(&mut self) {
+        if !self.quit
+            && self
+                .pending_send
+                .as_ref()
+                .is_some_and(|send| Instant::now() >= send.deadline)
+            && let Some(send) = self.pending_send.take()
+        {
+            self.start_send(send.account, send.message, send.copy);
+        }
         // Agents turned off in settings.toml (`agents_allowed`): stopped
         // here, once what was refused has been answered.
         if !self.settings.agents && self.agents.is_some() {
@@ -1862,18 +1996,34 @@ impl App {
                     }
                 }
             }
+            AppEvent::OriginalRendered { generation, body } => {
+                if let Some(original) = self.composer.as_mut().and_then(|c| c.original.as_mut())
+                    && original.pending == Some(generation)
+                {
+                    original.pending = None;
+                    original.body = body;
+                }
+            }
             AppEvent::Drafted {
                 source,
                 kind,
                 draft,
                 edit,
+                original,
                 lost,
             } => match (draft, self.account_index(&source.account)) {
                 _ if edit.is_some_and(|id| !self.finish_draft_edit(id, &source)) => {}
-                // A reply made ready late never takes the place of a
-                // message being written, or of the one a question is about.
-                (Some(_), _) if self.composer.is_some() || self.confirm.is_some() => {
-                    self.info("A message is open: finish it, then start the reply again")
+                // A background reply must not replace whatever the user
+                // has open now, including a command waiting to be chosen.
+                (Some(_), _)
+                    if self.composer.is_some()
+                        || self.confirm.is_some()
+                        || self.prompt.is_some()
+                        || self.picker.is_some()
+                        || self.help.is_some()
+                        || self.setup.is_some() =>
+                {
+                    self.info("Finish what's open, then start the reply again");
                 }
                 (Some(draft), Some(account)) => {
                     let kept_too = if kind == Kind::Draft {
@@ -1882,6 +2032,7 @@ impl App {
                         ""
                     };
                     let mut composer = Composer::new(account, kind, draft);
+                    composer.original = original;
                     composer.complete_from(&self.accounts[account].id, &self.store);
                     match composer.kind {
                         Kind::Reply => composer.replying = Some(source),
@@ -2061,6 +2212,7 @@ impl App {
                         account: i,
                         folder: inbox,
                     };
+                    self.clear_search();
                 }
                 self.sync_thread_folders(i);
                 self.reload();
@@ -2138,19 +2290,50 @@ impl App {
             }
             E::Searched {
                 folder,
-                query,
-                headers,
+                generation,
+                uidvalidity,
+                mut headers,
             } => {
-                let id = self.accounts[i].id.clone();
-                let _ = self.store.add_headers(&id, &folder, &headers);
-                if self.search.as_deref() == Some(query.as_str()) {
-                    self.reload();
-                    self.info(format!(
-                        "The server found {} in {}",
-                        plural(headers.len(), "message"),
-                        self.folder_name(i, &folder)
-                    ));
+                if self.search.is_none()
+                    || generation != self.search_generation
+                    || !self.is_place(i, &folder)
+                {
+                    return;
                 }
+                if uidvalidity == 0 || self.uidvalidity(i, &folder) != uidvalidity {
+                    return self.error("The folder changed. Refresh with R, then search again.");
+                }
+                let mut key = (i, folder.clone(), 0);
+                let id = &self.accounts[i].id;
+                headers.retain_mut(|header| {
+                    key.2 = header.uid;
+                    if self
+                        .local_removed
+                        .get(&key)
+                        .is_some_and(|at| at.elapsed() < LOCAL_FLAGS_WIN)
+                    {
+                        return false;
+                    }
+                    if self
+                        .local_flags
+                        .get(&key)
+                        .is_some_and(|at| at.elapsed() < LOCAL_FLAGS_WIN)
+                        && let Ok(Some(current)) = self.store.message(id, &folder, header.uid)
+                    {
+                        header.flags = current.flags;
+                    }
+                    true
+                });
+                if let Err(e) = self.store.add_headers(id, &folder, &headers) {
+                    return self.error(format!("Couldn't keep search results: {e:#}"));
+                }
+                self.search_matches = headers.iter().map(|h| h.uid).collect();
+                self.reload();
+                self.info(format!(
+                    "The server found {} in {}",
+                    plural(headers.len(), "message"),
+                    self.folder_name(i, &folder)
+                ));
             }
             E::Done { folder } => self.folder_changed(i, &folder),
             E::Moved {
@@ -2404,6 +2587,9 @@ impl App {
 
     /// A new UIDVALIDITY invalidates every UI reference to this folder's UIDs.
     fn forget_folder_uids(&mut self, i: usize, folder: &str) {
+        if self.is_place(i, folder) {
+            self.search_matches.clear();
+        }
         let stale = |key: &(usize, String, u32)| key.0 == i && key.1 == folder;
         if self.reader.as_ref().is_some_and(|r| stale(&r.key())) {
             self.reader = None;
@@ -3098,7 +3284,16 @@ impl App {
                 (Some(query), Some(folder)) => {
                     self.store.search(id, Some(folder), query, MAX_LISTED)
                 }
-                (Some(query), None) => self.store.search(id, None, query, MAX_LISTED),
+                (Some(query), None) => {
+                    let server_matches = match &self.place {
+                        Place::Folder { folder, .. } if !self.search_matches.is_empty() => {
+                            Some((folder.as_str(), self.search_matches.as_slice()))
+                        }
+                        _ => None,
+                    };
+                    self.store
+                        .search_including(id, None, query, MAX_LISTED, server_matches)
+                }
                 (None, Some(folder)) => self.store.messages(id, folder, MAX_LISTED),
                 (None, None) => Ok(Vec::new()),
             };
@@ -3234,6 +3429,9 @@ impl App {
     fn rebuild_rows(&mut self, current: Option<&(usize, String, u32)>) {
         // Until the next frame, screen rows still refer to the old mapping.
         self.list_hit_area.set(Rect::ZERO);
+        if let Some(palette) = self.prompt.as_mut().and_then(|p| p.palette.as_mut()) {
+            palette.list_changed = true;
+        }
         self.rows.clear();
         let overrides: HashSet<_> = self
             .thread_overrides
@@ -3359,7 +3557,7 @@ impl App {
     pub fn open_place(&mut self, place: Place) {
         let same = self.place == place;
         self.place = place.clone();
-        self.search = None;
+        self.clear_search();
         if !same {
             self.selected = 0;
             self.list_scroll.set(0);
@@ -4228,6 +4426,15 @@ impl App {
                     },
                 );
             }
+        }
+        if count != 0
+            && self.search.as_deref().is_some_and(|query| {
+                crate::search::terms(query).any(
+                    |term| matches!(term, crate::search::Term::Tag { name, .. } if name == tag),
+                )
+            })
+        {
+            self.reload();
         }
         count
     }
@@ -5927,6 +6134,12 @@ impl App {
     fn draft_from(&mut self, key: (usize, String, u32), raw: Arc<Vec<u8>>, pending: Pending) {
         let account = self.accounts[key.0].account.clone();
         let source = self.kept(&key);
+        let plain = self
+            .reader
+            .as_ref()
+            .filter(|r| r.key() == key)
+            .and_then(|r| r.plain)
+            .unwrap_or(self.settings.prefer_plain);
         let tx = self.tx.clone();
         let edit = match pending {
             Pending::EditDraft(id) => Some(id),
@@ -5937,32 +6150,39 @@ impl App {
                 Some(match pending {
                     Pending::Reply { all } => {
                         let parsed = mail::parse(&raw)?;
-                        (Kind::Reply, compose::reply(&parsed, &account, all), 0)
+                        let draft = compose::reply(&parsed, &account, all);
+                        (
+                            Kind::Reply,
+                            draft,
+                            Some(ReplyOriginal::new(parsed, plain)),
+                            0,
+                        )
                     }
                     Pending::Forward => {
                         let (parsed, contents) = mail::parse_with_contents(&raw)?;
                         let lost = contents.lost();
                         let draft = compose::forward(&parsed, contents.files, &account);
-                        (Kind::Forward, draft, lost)
+                        (Kind::Forward, draft, None, lost)
                     }
                     Pending::EditDraft(_) => {
                         let (parsed, contents) = mail::parse_with_contents(&raw)?;
                         let lost = contents.lost();
                         let draft = compose::from_saved(&parsed, contents);
-                        (Kind::Draft, draft, lost)
+                        (Kind::Draft, draft, None, lost)
                     }
                 })
             },
             move |result| {
-                let (kind, draft, lost) = match result.flatten() {
-                    Some((kind, draft, lost)) => (kind, Some(draft), lost),
-                    None => (Kind::New, None, 0),
+                let (kind, draft, original, lost) = match result.flatten() {
+                    Some((kind, draft, original, lost)) => (kind, Some(draft), original, lost),
+                    None => (Kind::New, None, None, 0),
                 };
                 let _ = tx.send(AppEvent::Drafted {
                     source,
                     kind,
                     draft,
                     edit,
+                    original,
                     lost,
                 });
             },
@@ -5981,6 +6201,16 @@ impl App {
         let Some(composer) = self.composer.as_mut() else {
             return;
         };
+        if !composer.sending {
+            if let Some(original) = composer.original.as_mut()
+                && original.on_key(key)
+            {
+                return;
+            }
+            if key.code == KeyCode::F(4) && key.modifiers.is_empty() {
+                return self.toggle_markdown();
+            }
+        }
         match composer.on_key(key, &self.store) {
             composer::Action::None => {}
             composer::Action::Send => self.send_message(None),
@@ -5992,10 +6222,7 @@ impl App {
                     self.composer = None;
                 }
             }
-            composer::Action::Attach => {
-                self.prompt = Some(Prompt::attach(self.last_attachment_directory.as_deref()));
-                self.read_attachment_directory();
-            }
+            composer::Action::Attach => self.pick_attachment_path(),
             composer::Action::Edit => self.terminal_requests.push_back(TerminalRequest::Editor),
             composer::Action::SwitchAccount(by) => {
                 let n = self.accounts.len() as isize;
@@ -6004,6 +6231,17 @@ impl App {
                     composer.complete_from(&self.accounts[composer.account].id, &self.store);
                 }
             }
+        }
+    }
+
+    fn pick_attachment_path(&mut self) {
+        self.prompt = Some(Prompt::attach(self.last_attachment_directory.as_deref()));
+        self.read_attachment_directory();
+    }
+
+    fn toggle_markdown(&mut self) {
+        if let Some(composer) = self.composer.as_mut() {
+            composer.markdown = !composer.markdown;
         }
     }
 
@@ -6053,33 +6291,22 @@ impl App {
         let Some(composer) = self.composer.as_ref() else {
             return;
         };
-        let i = composer.account;
-        let account = self.accounts[i].account.clone();
-        let draft = composer.draft();
-        let message_id = match compose::new_message_id(&account.email) {
-            Ok(id) => id,
-            Err(e) => return self.error(format!("Not sent: {e:#}")),
-        };
-        let date = now();
-        let built = compose::build(&draft, &account, &message_id, date, false).and_then(|sent| {
-            Ok((
-                sent,
-                compose::build(&draft, &account, &message_id, date, true)?,
-            ))
-        });
-        let (sent, copy) = match built {
-            Ok(both) => both,
-            Err(e) => return self.error(format!("{e:#}")),
-        };
-        if sent.rcpts.is_empty() {
-            return self.error("Who is it to? Write an address in To");
+        if composer.sending {
+            return;
         }
+        let i = composer.account;
+        let draft = composer.draft();
         let print = draft.print() ^ (i as u64).rotate_left(32);
         // What a yes was for may not be what's in the composer now (a
         // paste, or another message in its place): then ask about this one.
         let changed = confirmed.is_some_and(|asked| asked != print);
         let unasked = confirmed != Some(print);
         if unasked && (self.settings.confirm_send || draft.subject.trim().is_empty() || changed) {
+            let recipients = match compose::recipients(&draft) {
+                Ok(recipients) if !recipients.is_empty() => recipients,
+                Ok(_) => return self.error("Who is it to? Write an address in To"),
+                Err(e) => return self.error(format!("{e:#}")),
+            };
             // Sent without a subject only after a yes, always.
             if changed {
                 self.info("The message changed: check it again");
@@ -6087,22 +6314,64 @@ impl App {
             return self.confirm(Confirm::Send {
                 print,
                 subject: draft.subject.trim().to_string(),
-                recipients: sent.rcpts.clone(),
+                recipients,
                 attachments: draft.attachments.iter().map(|a| a.name()).collect(),
             });
         }
-        let replying = composer.replying.clone();
-        let draft_of = composer.draft_of.clone();
-        let copy = SentCopy {
-            raw: copy.raw,
-            to: sent.to.clone(),
-            replying,
-            draft_of,
+        if !self.demo && self.accounts[i].worker.is_none() {
+            return self.error("This account can't send: see the error at start");
+        }
+        let account = &self.accounts[i].account;
+        let message_id = match compose::new_message_id(&account.email) {
+            Ok(id) => id,
+            Err(e) => return self.error(format!("Not sent: {e:#}")),
         };
-        let account_id = self.accounts[i].id.clone();
+        let (message, raw) = match compose::build_for_send(&draft, account, &message_id, now()) {
+            Ok((message, raw)) if !message.rcpts.is_empty() => (message, raw),
+            Ok(_) => return self.error("Who is it to? Write an address in To"),
+            Err(e) => return self.error(format!("{e:#}")),
+        };
+        let copy = SentCopy {
+            raw,
+            to: message.to.clone(),
+            replying: composer.replying.clone(),
+            draft_of: composer.draft_of.clone(),
+        };
         if let Some(composer) = self.composer.as_mut() {
             composer.sending = true;
         }
+        let delay = self.settings.undo_send_delay();
+        if !delay.is_zero() {
+            self.pending_send = Some(PendingSend {
+                deadline: Instant::now() + delay,
+                account: i,
+                message,
+                copy,
+            });
+        } else {
+            self.start_send(i, message, copy);
+        }
+    }
+
+    pub(crate) fn undo_send_remaining(&self) -> Option<u64> {
+        let remaining = self
+            .pending_send
+            .as_ref()?
+            .deadline
+            .saturating_duration_since(Instant::now());
+        Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0))
+    }
+
+    fn cancel_send(&mut self) {
+        self.pending_send = None;
+        if let Some(composer) = self.composer.as_mut() {
+            composer.sending = false;
+        }
+        self.info("Send canceled. Keep writing or save the draft.");
+    }
+
+    fn start_send(&mut self, i: usize, sent: compose::Built, copy: SentCopy) {
+        let account_id = self.accounts[i].id.clone();
         if self.demo {
             let _ = self.tx.send(AppEvent::Sent {
                 account: account_id,
@@ -6640,8 +6909,46 @@ impl App {
     }
 
     fn dispatch_terminal_events(&mut self, events: Vec<Event>, presses: &[KeyEvent]) {
+        if self.pending_send.is_some() {
+            // A batch that cancels a send must not spill its remaining keys
+            // or pasted text into the composer that becomes editable again.
+            for event in events {
+                match event {
+                    Event::Key(key) if self.pending_send.is_some() => self.on_key(key),
+                    Event::Resize(..) | Event::FocusLost => self.on_terminal(event),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if self.confirm.is_none() && self.prompt.as_ref().is_some_and(|p| p.files.is_some()) {
             return self.dispatch_attachment_events(events, presses);
+        }
+        let commands = self
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.kind == PromptKind::Commands);
+        if commands
+            && self.confirm.is_none()
+            && (presses.windows(2).all(|w| w[0].code == w[1].code)
+                || presses.iter().enumerate().all(|(i, key)| {
+                    key.modifiers.is_empty()
+                        && (matches!(key.code, KeyCode::Up | KeyCode::Down)
+                            || i + 1 == presses.len()
+                                && matches!(key.code, KeyCode::Enter | KeyCode::Esc))
+                }))
+        {
+            for event in events {
+                match event {
+                    Event::Key(_) | Event::Paste(_)
+                        if !self
+                            .prompt
+                            .as_ref()
+                            .is_some_and(|p| p.kind == PromptKind::Commands) => {}
+                    event => self.on_terminal(event),
+                }
+            }
+            return;
         }
         if presses.windows(2).all(|w| w[0].code == w[1].code) {
             return events.into_iter().for_each(|event| self.on_terminal(event));
@@ -6669,7 +6976,10 @@ impl App {
             .as_ref()
             .is_some_and(|c| c.field == composer::Field::Body)
             && self.prompt.is_none();
-        let submit = last.code == KeyCode::Enter && before.iter().all(Self::is_typing) && !in_body;
+        let submit = !commands
+            && !in_body
+            && last.code == KeyCode::Enter
+            && before.iter().all(Self::is_typing);
         let text: String = presses
             .iter()
             .filter_map(|key| match key.code {
@@ -6748,12 +7058,20 @@ impl App {
                 self.on_mouse(mouse);
                 self.cancel_left_draft_edit();
             }
-            Event::Resize(..) => {
+            Event::Resize(width, height) => {
                 self.confirm_text_visible = false;
                 self.list_hit_area.set(Rect::ZERO);
                 self.reader_view = None;
                 if let Some(reader) = self.reader.as_mut() {
                     reader.selection = None;
+                }
+                if !crate::ui::reply_original_fits(width, height)
+                    && let Some(original) = self.composer.as_mut().and_then(|c| c.original.as_mut())
+                {
+                    original.hide();
+                }
+                if let Some(palette) = self.prompt.as_mut().and_then(|p| p.palette.as_mut()) {
+                    palette.selection_visible = false;
                 }
             }
             Event::FocusLost => self.finish_body_drag(),
@@ -6765,19 +7083,36 @@ impl App {
                 let pasted = text::first_chars(&pasted, 4 << 20).to_string();
                 if let Some(prompt) = self.prompt.as_mut() {
                     let room = MAX_PROMPT.saturating_sub(prompt.text().chars().count());
+                    if let Some(palette) = prompt.palette.as_mut() {
+                        palette.selected = 0;
+                        palette.selection_visible = false;
+                    }
                     let line = if matches!(prompt.kind, PromptKind::Password(_)) {
                         pasted
                             .trim_matches(['\r', '\n'])
                             .chars()
                             .take(room)
                             .collect()
+                    } else if prompt.kind == PromptKind::Search {
+                        pasted
+                            .chars()
+                            .filter(|&c| !text::is_hidden(c))
+                            .map(|c| if c.is_control() { ' ' } else { c })
+                            .take(room)
+                            .collect()
                     } else {
                         text::one_line(&pasted, room)
                     };
-                    prompt.input.insert_str(line);
+                    if !line.is_empty() {
+                        prompt.input.insert_str(line);
+                    }
                 } else if let Some(setup) = self.setup.as_mut() {
                     setup.paste(&pasted);
-                } else if let Some(composer) = self.composer.as_mut() {
+                } else if let Some(composer) = self
+                    .composer
+                    .as_mut()
+                    .filter(|c| !c.sending && !c.original.as_ref().is_some_and(|o| o.focused))
+                {
                     // A file dropped on the window attaches it.
                     let path = file_picker::unquote(pasted.trim_matches(' '));
                     if composer.field != composer::Field::Body
@@ -6899,6 +7234,12 @@ impl App {
         }
         self.finish_body_drag();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.pending_send.is_some() {
+            if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+                self.cancel_send();
+            }
+            return;
+        }
         if ctrl
             && key.code == KeyCode::Char('c')
             && self.composer.is_none()
@@ -6922,6 +7263,16 @@ impl App {
         if self.setup.is_some() {
             return self.on_setup_key(key);
         }
+        if key.code == KeyCode::F(3) && key.modifiers.is_empty() {
+            if !self.composer.as_ref().is_some_and(|c| c.sending) {
+                self.pending_g = false;
+                self.prompt = Some(Prompt {
+                    palette: Some(Palette::new(|command| self.command_available(command))),
+                    ..Prompt::new(PromptKind::Commands, "")
+                });
+            }
+            return;
+        }
         if self.composer.is_some() {
             if ctrl && key.code == KeyCode::Char('c') {
                 return self.on_composer_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -6939,23 +7290,8 @@ impl App {
                 KeyCode::Char('?') => return self.help = Some(HelpMenu::new(HelpTab::Keys)),
                 KeyCode::Char('O') => return self.help = Some(HelpMenu::new(HelpTab::Settings)),
                 KeyCode::Char('c') => return self.compose_new(),
-                KeyCode::Char('/') => {
-                    let text = self.search.clone().unwrap_or_default();
-                    self.prompt = Some(Prompt::new(PromptKind::Search, &text));
-                    return;
-                }
-                KeyCode::Char('R') => {
-                    for i in 0..self.accounts.len() {
-                        if let Some(worker) = &self.accounts[i].worker {
-                            worker.creds.retry();
-                        }
-                        self.check(i, true);
-                    }
-                    if !self.demo {
-                        self.info("Checking for mail…");
-                    }
-                    return;
-                }
+                KeyCode::Char('/') => return self.prompt_search(),
+                KeyCode::Char('R') => return self.refresh_mail(),
                 KeyCode::Char('+') => {
                     self.setup = Some(Setup::default());
                     return;
@@ -6988,6 +7324,112 @@ impl App {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::List => self.on_list_key(key),
             Focus::Reader => self.on_reader_key(key),
+        }
+    }
+
+    fn prompt_search(&mut self) {
+        let text = self.search.as_deref().unwrap_or_default();
+        self.prompt = Some(Prompt::new(PromptKind::Search, text));
+    }
+
+    fn refresh_mail(&mut self) {
+        for i in 0..self.accounts.len() {
+            if let Some(worker) = &self.accounts[i].worker {
+                worker.creds.retry();
+            }
+            self.check(i, true);
+        }
+        if !self.demo {
+            self.info("Checking for mail…");
+        }
+    }
+
+    fn command_available(&self, command: Command) -> bool {
+        use Command::*;
+        if let Some(composer) = &self.composer {
+            if composer.sending {
+                return false;
+            }
+            let reference_focused = composer.original.as_ref().is_some_and(|o| o.focused);
+            return match command {
+                Original => composer.original.as_ref().is_some_and(|o| o.width != 0),
+                Attach | Editor | SaveDraft | Markdown => !reference_focused,
+                _ => false,
+            };
+        }
+        let list = self.focus == Focus::List && self.selected_item().is_some();
+        let reader = self.reader.as_ref().filter(|_| self.focus == Focus::Reader);
+        let targets =
+            list || reader.is_some() || self.focus == Focus::List && !self.marked.is_empty();
+        match command {
+            Compose => !self.accounts.is_empty(),
+            Search | Refresh | Undo | Changes | Settings | Help => true,
+            Open => list || (reader.is_some() && self.reader_is_draft()),
+            Reply | ReplyAll | Forward => reader.is_some() || list && self.marked.len() <= 1,
+            Archive | Junk | Move | Tag | Star | Read | Delete => targets,
+            Conversation => list && self.settings.threads && self.search.is_none(),
+            Format => list || reader.is_some(),
+            Links => reader
+                .and_then(Reader::selectable_body)
+                .is_some_and(|body| !body.links.is_empty()),
+            Attachments => reader
+                .and_then(|r| r.parsed.as_ref())
+                .is_some_and(|p| !p.attachments.is_empty()),
+            Unsubscribe => reader
+                .and_then(|r| r.parsed.as_ref())
+                .is_some_and(|p| p.unsubscribe.is_some()),
+            Attach | Editor | SaveDraft | Markdown | Original => false,
+        }
+    }
+
+    fn choose_command(&mut self, prompt: Prompt) {
+        let Some(palette) = prompt.palette else {
+            return;
+        };
+        let Some((command, _, _)) = palette
+            .matching(&prompt.input.lines()[0])
+            .nth(palette.selected)
+        else {
+            return;
+        };
+        if (palette.list_changed && command.targets_mail()) || !self.command_available(command) {
+            return self.info("The view changed. Reopen commands to choose again.");
+        }
+        use Command::*;
+        match command {
+            Compose => self.compose_new(),
+            Search => self.prompt_search(),
+            Refresh => self.refresh_mail(),
+            Settings => self.help = Some(HelpMenu::new(HelpTab::Settings)),
+            Help => self.help = Some(HelpMenu::new(HelpTab::Keys)),
+            Undo => self.undo_last(),
+            Changes => self.pick_change(),
+            Open if self.focus == Focus::Reader => self.edit_reader_draft(),
+            Open => self.open_selected(true),
+            Reply => self.reply(Pending::Reply { all: false }),
+            ReplyAll => self.reply(Pending::Reply { all: true }),
+            Forward => self.reply(Pending::Forward),
+            Archive => self.move_to_role(Role::Archive),
+            Junk => self.move_to_role(Role::Junk),
+            Move => self.pick_folder(),
+            Tag => self.pick_tag(),
+            Star => self.toggle_flag(FlagKind::Flagged),
+            Read => self.toggle_flag(FlagKind::Seen),
+            Delete => self.delete(),
+            Conversation => self.toggle_conversation(),
+            Format => self.toggle_format(),
+            Links => self.pick_link(),
+            Attachments => self.pick_attachment(),
+            Unsubscribe => self.unsubscribe(),
+            Attach => self.pick_attachment_path(),
+            Editor => self.terminal_requests.push_back(TerminalRequest::Editor),
+            SaveDraft => self.save_draft(),
+            Markdown => self.toggle_markdown(),
+            Original => {
+                if let Some(original) = self.composer.as_mut().and_then(|c| c.original.as_mut()) {
+                    original.focused = !original.focused;
+                }
+            }
         }
     }
 
@@ -7052,7 +7494,7 @@ impl App {
             }
             KeyCode::Esc if !self.marked.is_empty() => self.marked.clear(),
             KeyCode::Esc if self.search.is_some() => {
-                self.search = None;
+                self.clear_search();
                 self.reload();
             }
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
@@ -7282,6 +7724,22 @@ impl App {
                 }
                 self.prompt = None;
             }
+            KeyCode::F(3) if prompt.palette.is_some() && key.modifiers.is_empty() => {
+                self.prompt = None;
+            }
+            KeyCode::Up | KeyCode::Down if prompt.palette.is_some() && key.modifiers.is_empty() => {
+                let palette = prompt.palette.as_mut().unwrap();
+                let count = palette.matching(&prompt.input.lines()[0]).count();
+                let selected = if key.code == KeyCode::Down {
+                    (palette.selected + 1).min(count.saturating_sub(1))
+                } else {
+                    palette.selected.saturating_sub(1)
+                };
+                if selected != palette.selected {
+                    palette.selected = selected;
+                    palette.selection_visible = false;
+                }
+            }
             KeyCode::Tab if prompt.files.is_some() && key.modifiers.is_empty() => {
                 self.complete_attachment_path();
             }
@@ -7292,12 +7750,20 @@ impl App {
                     .unwrap()
                     .step(key.code == KeyCode::Down);
             }
+            KeyCode::Enter
+                if prompt
+                    .palette
+                    .as_ref()
+                    .is_some_and(|p| !p.selection_visible) => {}
             KeyCode::Enter => {
                 let Some(prompt) = self.prompt.take() else {
                     return;
                 };
                 if prompt.kind == PromptKind::Attach {
                     return self.choose_attachment(prompt);
+                }
+                if prompt.kind == PromptKind::Commands {
+                    return self.choose_command(prompt);
                 }
                 let text = prompt.text();
                 match prompt.kind {
@@ -7314,7 +7780,7 @@ impl App {
                             self.prompt = Some(Prompt::new(PromptKind::Password(j), ""));
                         }
                     }
-                    PromptKind::Attach => unreachable!("handled above"),
+                    PromptKind::Attach | PromptKind::Commands => unreachable!("handled above"),
                     PromptKind::Tag => {
                         let groups = std::mem::take(&mut self.tagging);
                         match tags::normalize(&text) {
@@ -7330,6 +7796,10 @@ impl App {
             }
             KeyCode::Char('u') if ctrl => {
                 prompt.input = Prompt::field(prompt.kind, String::new());
+                if let Some(palette) = prompt.palette.as_mut() {
+                    palette.selected = 0;
+                    palette.selection_visible = false;
+                }
                 self.attachment_path_changed();
             }
             KeyCode::Char(c)
@@ -7340,6 +7810,10 @@ impl App {
             KeyCode::Char('m' | 'j') if ctrl => {}
             _ => {
                 if prompt.input.input(key) {
+                    if let Some(palette) = prompt.palette.as_mut() {
+                        palette.selected = 0;
+                        palette.selection_visible = false;
+                    }
                     self.attachment_path_changed();
                 }
             }
@@ -7360,13 +7834,23 @@ impl App {
         self.check(i, true);
     }
 
+    fn is_place(&self, i: usize, name: &str) -> bool {
+        matches!(&self.place, Place::Folder { account, folder } if *account == i && folder == name)
+    }
+
+    fn clear_search(&mut self) {
+        self.search = None;
+        self.search_matches.clear();
+    }
+
     fn run_search(&mut self, query: &str) {
+        self.clear_search();
         if query.is_empty() {
-            self.search = None;
             self.reload();
             return;
         }
         self.search = Some(query.to_string());
+        self.search_generation += 1;
         self.selected = 0;
         self.list_scroll.set(0);
         self.reload();
@@ -7380,6 +7864,7 @@ impl App {
                 Request::Search {
                     folder,
                     query: query.to_string(),
+                    generation: self.search_generation,
                 },
             );
         }
@@ -7652,6 +8137,7 @@ impl App {
         self.local_removed.clear();
         self.picker = None;
         self.prompt = None;
+        self.clear_search();
         match self.composer.as_mut() {
             Some(c) if c.account == i => self.composer = None,
             Some(c) if c.account > i => c.account -= 1,
@@ -7761,6 +8247,14 @@ impl App {
             }
             HelpMenu::CONFIRM_SEND => {
                 self.save_setting("confirm_send", flip(self.settings.confirm_send))
+            }
+            HelpMenu::UNDO_SEND => {
+                let seconds = if self.settings.undo_send_delay().is_zero() {
+                    5
+                } else {
+                    0
+                };
+                self.save_setting("undo_send_seconds", toml::Value::Integer(seconds));
             }
             HelpMenu::AGENTS => {
                 self.save_setting("agents", flip(self.settings.agents));
@@ -10737,6 +11231,106 @@ pub mod tests {
         assert_eq!(app.items.len(), before);
     }
 
+    #[test]
+    fn search_keeps_server_only_matches_from_the_current_folder_generation() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.demo = false;
+        let id = app.accounts[0].id.clone();
+        app.store
+            .set_known(
+                &id,
+                "INBOX",
+                Known {
+                    uidvalidity: 17,
+                    ..Known::default()
+                },
+            )
+            .unwrap();
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "INBOX".into(),
+        });
+        let query = r#"from:bob@example.org tag:work tag:today "not in the cached preview""#;
+        app.run_search(query);
+        let old = app.search_generation;
+        app.run_search(query);
+        let current = app.search_generation;
+        let result = |generation, uidvalidity, uid| worker::Event::Searched {
+            folder: "INBOX".into(),
+            generation,
+            uidvalidity,
+            headers: vec![store::Header {
+                uid,
+                summary: mail::summarize(b"From: bob@example.org\r\nSubject: Server match\r\n\r\n"),
+                flags: Flags {
+                    tags: vec!["today".into(), "work".into()],
+                    ..Flags::default()
+                },
+                size: 180,
+                gmail: None,
+            }],
+        };
+        app.on_worker(0, result(old, 17, 40));
+        app.on_worker(0, result(current, 16, 41));
+        assert!(app.items.is_empty());
+        for uid in [40, 41] {
+            assert!(app.store.message(&id, "INBOX", uid).unwrap().is_none());
+        }
+        app.on_worker(0, result(current, 17, 42));
+        assert_eq!(subjects(&app), ["Server match"]);
+        app.focus = Focus::List;
+        pick_tag(&mut app, Some("work"));
+        assert!(app.items.is_empty());
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(subjects(&app), ["Server match"]);
+        app.open_place(Place::AllInboxes);
+        app.run_search(query);
+        assert!(app.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_palette_archives_only_after_the_choice_has_been_shown() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let before = subjects(&app);
+        app.on_key(key(KeyCode::F(3)));
+        app.on_terminal_events(vec![
+            Event::Paste("archive".into()),
+            Event::Key(key(KeyCode::Enter)),
+        ]);
+        assert_eq!(subjects(&app), before);
+        let shown = crate::ui::tests::screen(&mut app, 140, 25);
+        assert!(shown.contains("› Archive mail"), "{shown}");
+        app.on_key(key(KeyCode::Enter));
+        assert!(!subjects(&app).contains(&before[0]));
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(subjects(&app), before);
+    }
+
+    #[tokio::test]
+    async fn a_reply_accepts_paste_batched_with_the_resize_that_hides_the_original() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        app.on_key(key(KeyCode::Char('r')));
+        app.wait_until(|app| app.composer.is_some()).await;
+
+        let shown = crate::ui::tests::screen(&mut app, 160, 26);
+        assert!(shown.contains("Original message"), "{shown}");
+        app.on_key(key(KeyCode::F(2)));
+        app.on_terminal_events(vec![Event::Paste("not in the reply".into())]);
+        app.on_terminal_events(vec![
+            Event::Resize(160, 10),
+            Event::Paste("Agreed on noon.".into()),
+        ]);
+
+        let draft = app.composer.as_ref().unwrap().draft();
+        assert!(draft.body.contains("Agreed on noon."), "{}", draft.body);
+        assert!(!draft.body.contains("not in the reply"), "{}", draft.body);
+    }
+
     #[tokio::test]
     async fn a_reply_is_written_and_sent_in_the_demo() {
         let mut app = app();
@@ -10995,6 +11589,59 @@ pub mod tests {
     fn sent_subjects(app: &App) -> Vec<String> {
         let sent = app.store.messages(&app.accounts[0].id, "Sent", 20).unwrap();
         sent.iter().map(|m| m.summary.subject.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn undo_send_keeps_a_reply_editable_and_defers_the_sent_copy() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.change_setting(HelpMenu::UNDO_SEND);
+        open_first(&mut app).await;
+        let uid = app.items[0].message.uid;
+        let id = app.accounts[0].id.clone();
+        let before = sent_subjects(&app);
+        app.on_key(key(KeyCode::Char('r')));
+        app.wait_until(|app| app.composer.is_some()).await;
+        let draft = app.composer.as_ref().unwrap().draft();
+        let approve = |app: &mut App| {
+            app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            assert!(matches!(app.confirm, Some(Confirm::Send { .. })));
+            app.confirm_at = Instant::now() - CONFIRM_GRACE;
+            app.on_key(key(KeyCode::Char('y')));
+        };
+        let answered = |app: &App| {
+            app.store
+                .message(&id, "INBOX", uid)
+                .unwrap()
+                .unwrap()
+                .flags
+                .answered
+        };
+
+        approve(&mut app);
+        app.on_tick();
+        app.drain_for_tests();
+        let shown = crate::ui::tests::screen(&mut app, 160, 26);
+        assert!(shown.contains("Esc undo send"), "{shown}");
+        assert_eq!(sent_subjects(&app), before);
+        app.on_terminal_events(vec![
+            Event::Key(key(KeyCode::Esc)),
+            Event::Paste("not typed into the draft".into()),
+        ]);
+        assert_eq!(
+            app.composer.as_ref().unwrap().draft().print(),
+            draft.print()
+        );
+        assert!(!answered(&app));
+
+        approve(&mut app);
+        app.pending_send.as_mut().unwrap().deadline = Instant::now();
+        app.on_tick();
+        app.wait_until(|app| app.composer.is_none()).await;
+        let after = sent_subjects(&app);
+        assert_eq!(after.len(), before.len() + 1);
+        assert!(after.contains(&draft.subject));
+        assert!(answered(&app));
     }
 
     #[tokio::test]

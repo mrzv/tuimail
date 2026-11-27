@@ -129,6 +129,7 @@ pub enum Request {
     Search {
         folder: String,
         query: String,
+        generation: u64,
     },
     /// POP3: download new mail (ids not in `seen`) and delete `remove`
     /// from the server. A `first_check` takes only the newest `count`.
@@ -248,7 +249,8 @@ pub enum Event {
     },
     Searched {
         folder: String,
-        query: String,
+        generation: u64,
+        uidvalidity: u32,
         headers: Vec<Header>,
     },
     /// The server did what was asked (a move).
@@ -860,18 +862,23 @@ async fn handle_imap(
                 result: Ok(result),
             });
         }
-        Request::Search { folder, query } => {
+        Request::Search {
+            folder,
+            query,
+            generation,
+        } => {
             let Some(criteria) = imap::search_criteria(&query) else {
                 return Ok(());
             };
-            imap::select(s, &folder).await?;
+            let selected = imap::select(s, &folder).await?;
             let uids = imap::search(s, &criteria).await?;
             // The newest matches.
             let keep = uids.len().saturating_sub(200);
             let headers = imap::headers(s, &uids[keep..]).await?;
             sink(Event::Searched {
                 folder,
-                query,
+                generation,
+                uidvalidity: selected.uidvalidity,
                 headers,
             });
         }

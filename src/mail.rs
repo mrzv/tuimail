@@ -108,6 +108,7 @@ pub struct Parsed {
     last_literal_quote: Option<usize>,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
+    invitations: Vec<crate::calendar::Invitation>,
     /// List-Unsubscribe's https or mailto link, if any.
     pub unsubscribe: Option<String>,
 }
@@ -264,6 +265,8 @@ pub struct Contents {
     /// message says what its sender wrote there, so it's read for this
     /// alone.
     pub bcc: Vec<Addr>,
+    /// Tuimail's editor format on its saved text/plain draft source.
+    pub markdown: bool,
 }
 
 impl Contents {
@@ -281,6 +284,10 @@ pub fn parse_with_contents(raw: &[u8]) -> Option<(Parsed, Contents)> {
 fn parse_message(raw: &[u8], contents: bool) -> Option<(Parsed, Option<Contents>)> {
     let both = read(raw, |message| {
         let body = bodies(message);
+        let markdown = contents
+            && matches!(&body[0][..], [part] if part.is_content_type("text", "plain")
+                && part.content_type().and_then(|ct| ct.attribute("x-tuimail-format"))
+                    == Some("markdown"));
         let listed: Vec<MessagePart> = attachment_parts(message, &body).collect();
         let contents = contents.then(|| {
             let files = listed
@@ -292,9 +299,10 @@ fn parse_message(raw: &[u8], contents: bool) -> Option<(Parsed, Option<Contents>
                 files,
                 left: listed.len().saturating_sub(MAX_LISTED),
                 bcc: addrs(message.bcc()),
+                markdown,
             }
         });
-        (parsed(message, &body, &listed), contents)
+        (parsed(message, &body, &listed, markdown), contents)
     })?;
     match both {
         Some(both) => Some(both),
@@ -318,6 +326,7 @@ fn parsed(
     message: &mail_parser::Message,
     body: &[Vec<MessagePart>; 2],
     listed: &[MessagePart],
+    keep_empty_plain: bool,
 ) -> Parsed {
     let join = |parts: Vec<Cow<str>>| -> Option<String> {
         let joined = parts.join("\n\n");
@@ -367,12 +376,54 @@ fn parsed(
         reply_to: addrs(message.reply_to()),
         to: addrs(message.to()),
         cc: addrs(message.cc()),
-        text: (!plain.trim().is_empty()).then_some(plain),
+        text: (keep_empty_plain || !plain.trim().is_empty()).then_some(plain),
         last_literal_quote,
         html: join(htmls),
         attachments,
+        invitations: calendar_invitations(listed),
         unsubscribe: unsubscribe_link(message),
     }
+}
+
+fn is_calendar(part: &MessagePart) -> bool {
+    is_type(part, "calendar")
+        || part.attachment_name().is_some_and(|name| {
+            name.as_bytes()
+                .get(name.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".ics"))
+        })
+}
+
+fn calendar_invitations(listed: &[MessagePart]) -> Vec<crate::calendar::Invitation> {
+    use crate::calendar::{MAX_INVITATIONS, MAX_PART_BYTES, invitations};
+    const MAX_CALENDAR_PARTS: usize = 8;
+
+    let mut out = Vec::new();
+    let mut remaining = 2 * MAX_PART_BYTES;
+    for part in listed
+        .iter()
+        .take(MAX_LISTED)
+        .filter(|p| is_calendar(p))
+        .take(MAX_CALENDAR_PARTS)
+    {
+        // Bound the decoder's input too, even for an encoding that can
+        // consume many bytes while producing none.
+        if part.raw_body().len() > 2 * MAX_PART_BYTES {
+            continue;
+        }
+        if let Some((bytes, problems)) = contained(|| part.decoded_checked())
+            && problems.is_empty()
+            && bytes.len() <= MAX_PART_BYTES
+            && bytes.len() <= remaining
+        {
+            remaining -= bytes.len();
+            contained(|| invitations(&bytes, &mut out));
+            if out.len() == MAX_INVITATIONS || remaining == 0 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The parts read as the message's text and as its HTML. mail-parser makes
@@ -384,16 +435,21 @@ fn parsed(
 /// HTML.)
 fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
     [false, true].map(|html| {
-        let of_kind = |p: &MessagePart| match p.kind() {
-            // mail-parser reads a message/rfc822 with no headers as Text:
-            // never the body of this one.
-            PartKind::Text => {
-                !html
-                    && p.content_type()
-                        .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+        let of_kind = |p: &MessagePart| {
+            if is_calendar(p) {
+                return false;
             }
-            PartKind::Html => html,
-            _ => false,
+            match p.kind() {
+                // mail-parser reads a message/rfc822 with no headers as Text:
+                // never the body of this one.
+                PartKind::Text => {
+                    !html
+                        && p.content_type()
+                            .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+                }
+                PartKind::Html => html,
+                _ => false,
+            }
         };
         let listed: Vec<MessagePart<'m>> = if html {
             message.html_body().filter(|p| of_kind(p)).collect()
@@ -827,7 +883,20 @@ pub fn render(parsed: &Parsed, width: usize, options: RenderOptions) -> Body {
         .all(|l| l.iter().all(|s| s.text.trim().is_empty()))
     {
         body.lines.clear();
-        body.note("(no text)");
+        if parsed.invitations.is_empty() {
+            body.note("(no text)");
+        }
+    }
+    for invite in &parsed.invitations {
+        if !body.lines.is_empty() {
+            body.lines.push(Vec::new());
+        }
+        body.note("Calendar event");
+        for (label, value) in invite.fields() {
+            for line in text::wrap(&format!("{label}: {value}"), width) {
+                body.note(line);
+            }
+        }
     }
     body
 }
@@ -2174,7 +2243,91 @@ Another paragraph \r\nstarts here.\r\n--m--\r\n";
             assert_eq!(parsed.html.as_deref(), Some("<p>html version</p>"));
             assert_eq!(parsed.attachments.len(), 1, "{:?}", parsed.attachments);
             assert_eq!(parsed.attachments[0].mime, "text/calendar");
+            assert!(parsed.invitations.is_empty());
         }
+    }
+
+    #[test]
+    fn calendar_details_are_inline_in_both_views_but_not_quoted_or_linked() {
+        let calendar = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\nUID:demo@example.org\r\nDTSTAMP:20261001T120000Z\r\n\
+SUMMARY:Review\\, part two\r\nDTSTART:20261011T120000Z\r\n\
+DTEND:20261011T123000Z\r\nORGANIZER;CN=\"Not: the address\":mailto:host@example.org\r\n\
+LOCATION:https://calendar.example/\u{202e}room\x1b\\nUpstairs\r\n\
+END:VEVENT\r\nEND:VCALENDAR";
+        let raw = format!(
+            "From: a@b.c\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=mixed\r\n\r\n\
+--mixed\r\nContent-Type: multipart/alternative; boundary=both\r\n\r\n\
+--both\r\nContent-Type: text/plain\r\n\r\nplain version\r\n\
+--both\r\nContent-Type: text/html\r\n\r\n<p>html version</p>\r\n\
+--both\r\nContent-Type: text/calendar; method=REQUEST\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n{calendar}\r\n--both--\r\n\
+--mixed\r\nContent-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=event.ICS\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n{calendar}\r\n--mixed--\r\n"
+        );
+        let raw = raw.as_bytes();
+        let parsed = parse(raw).unwrap();
+        assert_eq!(plain_text(&parsed), "plain version");
+        assert_eq!(preview_of(raw), "plain version");
+        assert_eq!(parsed.attachments.len(), 2);
+        let listed: Vec<_> = parsed
+            .attachments
+            .iter()
+            .map(|p| (p.index, p.name.clone()))
+            .collect();
+        let files = attachments(raw, &listed, |name, bytes| {
+            assert_eq!(bytes, calendar.as_bytes());
+            Ok(name.to_owned())
+        })
+        .unwrap();
+        assert_eq!(files[1], "event.ICS");
+        for prefer_plain in [false, true] {
+            let options = RenderOptions {
+                prefer_plain,
+                ..RenderOptions::default()
+            };
+            let body = render(&parsed, 80, options);
+            assert_eq!(body.from_html, !prefer_plain);
+            let lines: Vec<_> = (0..body.lines.len()).map(|i| body.line(i)).collect();
+            let i = lines
+                .iter()
+                .position(|line| line == "Calendar event")
+                .unwrap();
+            assert_eq!(
+                lines[i..],
+                [
+                    "Calendar event",
+                    "Summary: Review, part two",
+                    "Start: 2026-10-11 12:00:00 UTC",
+                    "End: 2026-10-11 12:30:00 UTC",
+                    "Organizer: host@example.org",
+                    "Location: https://calendar.example/room Upstairs",
+                ]
+            );
+            assert!(body.links.is_empty());
+            let narrow = render(&parsed, 20, options);
+            assert!((0..narrow.lines.len()).all(|i| text::cols(&narrow.line(i)) <= 20));
+        }
+    }
+
+    #[test]
+    fn an_ics_attachment_with_a_generic_mime_type_is_decoded() {
+        let raw = b"From: a@b.c\r\nMIME-Version: 1.0\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=event.ics\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+SUMMARY:Soir=C3=A9e\r\nDTSTART:20261011T120000\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let parsed = parse(raw).unwrap();
+        assert_eq!(parsed.attachments[0].name, "event.ics");
+        assert_eq!(plain_text(&parsed), "");
+        let body = render(&parsed, 80, RenderOptions::default());
+        assert_eq!(body.line(0), "Calendar event");
+        assert_eq!(body.line(1), "Summary: Soirée");
+        assert_eq!(body.line(2), "Start: 2026-10-11 12:00:00 (floating)");
     }
 
     #[test]

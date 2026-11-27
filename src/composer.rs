@@ -60,6 +60,7 @@ pub struct Composer {
     pub bcc: TextArea<'static>,
     pub subject: TextArea<'static>,
     pub body: TextArea<'static>,
+    pub markdown: bool,
     pub field: Field,
     pub attachments: Vec<Attachment>,
     /// The attachment the cursor is on, in the Files row.
@@ -69,6 +70,8 @@ pub struct Composer {
     /// The message replied to: (account, folder, UID), marked answered once
     /// this is sent.
     pub replying: Option<crate::app::Kept>,
+    /// The original available to quote or attach to a reply.
+    pub(crate) original: Option<crate::app::ReplyOriginal>,
     /// The saved draft this one replaces: (folder, UID), deleted once this
     /// is sent or saved again.
     pub draft_of: Option<crate::app::Kept>,
@@ -127,12 +130,14 @@ impl Composer {
             bcc: line(&draft.bcc),
             subject: line(&draft.subject),
             body,
+            markdown: draft.markdown,
             field,
             attachments: draft.attachments.clone(),
             attachment: 0,
             in_reply_to: draft.in_reply_to.clone(),
             references: draft.references.clone(),
             replying: None,
+            original: None,
             draft_of: None,
             suggestions: Vec::new(),
             suggestion: 0,
@@ -152,6 +157,7 @@ impl Composer {
             bcc: value(&self.bcc),
             subject: value(&self.subject),
             body: value(&self.body),
+            markdown: self.markdown,
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             attachments: self.attachments.clone(),
@@ -535,6 +541,21 @@ mod tests {
         c.field = Field::Body;
         c.paste("a\r\nb");
         assert!(value(&c.body).contains("a\nb"));
+    }
+
+    #[test]
+    fn markdown_is_restored_and_changing_format_changes_the_draft() {
+        let draft = Draft {
+            markdown: true,
+            ..Draft::default()
+        };
+        let mut c = Composer::new(0, Kind::Draft, draft);
+        assert!(c.markdown && c.draft().markdown);
+        assert!(!c.changed());
+        let print = c.draft().print();
+        c.markdown = false;
+        assert!(c.changed());
+        assert_ne!(c.draft().print(), print);
     }
 
     #[test]

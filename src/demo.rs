@@ -322,13 +322,29 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
             answered.clone(),
         ),
         (
-            with_files(
+            message(
                 "Calendar <calendar@example.org>",
                 me,
                 "Invitation: Sprint planning, Mon 10:00",
                 22 * DAY,
-                "Maya Chen invites you to Sprint planning, Monday 10:00 to 11:00.",
-                &[("invite.ics", "text/calendar", 2_048)],
+                concat!(
+                    "--demo\nContent-Type: text/plain; charset=utf-8\n\n",
+                    "Maya Chen invites you to Sprint planning, Monday 10:00 to 11:00.\n",
+                    "--demo\nContent-Type: text/calendar; method=REQUEST\n",
+                    "Content-Disposition: attachment; filename=\"invite.ics\"\n\n",
+                    "BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:REQUEST\n",
+                    "BEGIN:VEVENT\nUID:sprint-demo@example.org\n",
+                    "DTSTART;TZID=America/Los_Angeles:20270104T100000\n",
+                    "DTEND;TZID=America/Los_Angeles:20270104T110000\n",
+                    "SUMMARY:Sprint planning\nLOCATION:Studio 2\n",
+                    "ORGANIZER;CN=Maya Chen:mailto:maya@example.org\n",
+                    "END:VEVENT\nEND:VCALENDAR\n--demo--\n",
+                ),
+            )
+            .replacen(
+                "Content-Type: text/plain; charset=utf-8",
+                "Content-Type: multipart/mixed; boundary=\"demo\"",
+                1,
             ),
             read.clone(),
         ),

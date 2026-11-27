@@ -20,6 +20,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, PickerKind, Place, PromptKind, plural};
 use crate::file_picker::FilePicker;
 use crate::notify::Notifications;
+use crate::palette::Palette;
 use crate::settings::Settings;
 use crate::text::cols;
 use crate::theme::{self, Colors};
@@ -76,6 +77,12 @@ pub(crate) fn pane_widths(settings: &Settings, width: u16) -> (u16, bool) {
     }
     let side = settings.sidebar_width().min(width / 3);
     (side, width - side >= WIDE)
+}
+
+/// Whether a terminal has room for the reply's reference pane,
+/// including the row reserved for status.
+pub(crate) fn reply_original_fits(width: u16, height: u16) -> bool {
+    width >= 112 && height >= 11
 }
 
 /// The sidebar, the list and the reader, as many as fit.
@@ -253,6 +260,17 @@ pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// shown is doing.
 fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
+    if let Some(seconds) = app.undo_send_remaining() {
+        frame.render_widget(
+            Paragraph::new(Line::from(hint_spans(
+                &format!(" `Esc` undo send · Sending in {seconds}s "),
+                c,
+            )))
+            .style(Style::new().bg(c.bg).fg(c.warning)),
+            area,
+        );
+        return;
+    }
     let width = area.width as usize;
     let right = connection(app);
     let right_width = right.iter().map(|s| cols(&s.content)).sum::<usize>();
@@ -281,7 +299,10 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
 fn hints(app: &App) -> &'static str {
     if let Some(prompt) = &app.prompt {
         return match prompt.kind {
-            PromptKind::Search => "`Enter` search · `Esc` cancel · `Ctrl-u` clear",
+            PromptKind::Search => {
+                "`Enter` search · `Esc` cancel · from: to: subject: tag: since: before:"
+            }
+            PromptKind::Commands => "`↑↓` select · `Enter` run · `Esc` cancel",
             PromptKind::Password(_) => "`Enter` log in · `Esc` later",
             PromptKind::Attach => {
                 "`Tab` complete · `↑↓` select · `Enter` open or attach · `Esc` cancel"
@@ -295,12 +316,15 @@ fn hints(app: &App) -> &'static str {
     if app.setup.is_some() {
         return "`Tab` next · `Ctrl-s` check and save · `Esc` cancel";
     }
-    if app.composer.is_some() {
-        return "`Tab` next field · `Ctrl-s` send · `Ctrl-d` save draft · `Ctrl-o` attach · `Ctrl-e` editor · `Esc` close";
+    if let Some(composer) = &app.composer {
+        if composer.original.as_ref().is_some_and(|o| o.focused) {
+            return "`F2` return to reply · `↑↓` scroll · `PgUp PgDn` page · `F3` commands";
+        }
+        return "`Tab` next field · `Ctrl-s` send · `Ctrl-d` save draft · `Ctrl-o` attach · `Ctrl-e` editor · `F4` Markdown · `F3` commands";
     }
     match app.focus {
         Focus::Sidebar => {
-            "`Enter` open · `j k` move · `Tab` messages · `c` write · `+` add account · `?` help"
+            "`Enter` open · `j k` move · `Tab` messages · `c` write · `+` add account · `F3` commands · `?` help"
         }
         Focus::List if !app.marked.is_empty() => {
             "`Space` mark · `d` delete · `e` archive · `m` move · `t` tag · `u` read/unread · `s` star · `Esc` unmark"
@@ -309,10 +333,10 @@ fn hints(app: &App) -> &'static str {
             "`Enter` open · `H` html/text · `Esc` end search · `/` search again · `r` reply · `d` delete · `?` help"
         }
         Focus::List => {
-            "`Enter` open · `H` html/text · `v` conversation · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `t` tag · `/` search · `?` help"
+            "`Enter` open · `F3` commands · `/` search · `v` conversation · `c` write · `r` reply · `d` delete · `e` archive · `s` star · `H` html/text · `?` help"
         }
         Focus::Reader => {
-            "`j k` scroll · `J K` next/previous · `r` reply · `a` all · `f` forward · `o` links · `A` files · `H` html/text · `Esc` back"
+            "`j k` scroll · `J K` next/previous · `F3` commands · `r` reply · `a` all · `f` forward · `o` links · `A` files · `H` html/text · `Esc` back"
         }
     }
 }
@@ -353,6 +377,7 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = &app.colors;
     let label = match app.prompt.as_ref().map(|p| p.kind) {
         Some(PromptKind::Search) => format!(" {} Search ", app.icons.search),
+        Some(PromptKind::Commands) => " Command palette ".into(),
         Some(PromptKind::Password(i)) => format!(
             " Password for {} ",
             app.accounts
@@ -366,7 +391,7 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let rect = if matches!(
         app.prompt.as_ref().map(|p| p.kind),
-        Some(PromptKind::Attach)
+        Some(PromptKind::Attach | PromptKind::Commands)
     ) {
         centered(area, 86, 18)
     } else {
@@ -400,6 +425,8 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(&prompt.input, input_area);
     if let Some(files) = &prompt.files {
         attachment_entries(frame, files, inner, rect, c);
+    } else if let Some(palette) = &mut prompt.palette {
+        command_entries(frame, palette, &prompt.input.lines()[0], inner, rect, c);
     }
 }
 
@@ -467,6 +494,62 @@ fn attachment_entries(frame: &mut Frame, files: &FilePicker, inner: Rect, rect: 
     if visible != 0 && count > visible {
         scrollbar(frame, rect, count, files.selected.unwrap_or(0), c);
     }
+}
+
+fn command_entries(
+    frame: &mut Frame,
+    palette: &mut Palette,
+    query: &str,
+    inner: Rect,
+    rect: Rect,
+    c: &Colors,
+) {
+    palette.selection_visible = false;
+    let height = inner.height.saturating_sub(1);
+    let rows = usize::from(height);
+    if rows == 0 {
+        return;
+    }
+    let area = Rect::new(inner.x, inner.y + 1, inner.width, height);
+    let width = usize::from(inner.width);
+    let count = palette.matching(query).count();
+    if count == 0 {
+        frame.render_widget(
+            Paragraph::new("No matching commands").style(Style::new().fg(c.dim)),
+            area,
+        );
+        return;
+    }
+    let scroll = palette.selected.saturating_sub(rows - 1);
+    let mut visible = false;
+    let lines: Vec<_> = palette
+        .matching(query)
+        .enumerate()
+        .skip(scroll)
+        .take(rows)
+        .map(|(i, (_, label, key))| {
+            let selected = i == palette.selected;
+            let room = width.saturating_sub(cols(key) + 4);
+            visible |= selected && cols(label) <= room;
+            let style = if selected {
+                Style::new().bg(c.selected)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::new().fg(c.accent),
+                ),
+                Span::styled(pad(label, room), Style::new().fg(c.text)),
+                Span::styled(format!("  {key}"), Style::new().fg(c.dim)),
+            ])
+            .style(style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    palette.selection_visible = visible;
+    scrollbar(frame, rect, count.saturating_sub(rows), scroll, c);
 }
 
 /// A list to pick from: folders, links, attachments and other choices.
@@ -833,10 +916,11 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 36] = [
+const HELP: &[(&str, &str)] = &[
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Enter", "open a draft in the composer (list or reader)"),
     ("Tab", "folders → messages → message"),
+    ("F3", "search commands for the current view"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
     ("c", "write a message"),
     ("r  /  a  /  f", "reply  /  reply to all  /  forward"),
@@ -853,7 +937,10 @@ const HELP: [(&str, &str); 36] = [
         "Space  /  *",
         "mark a message  /  all; actions take the marked",
     ),
-    ("/", "search: here, and the server's folder"),
+    (
+        "/",
+        "search: from:, to:, subject:, tag:, since:, before:, \"a phrase\"",
+    ),
     ("Esc", "clear selection, end search, unmark, back"),
     ("v", "collapse or expand the conversation (list)"),
     ("J  K", "next, previous list row (reading)"),
@@ -871,6 +958,8 @@ const HELP: [(&str, &str); 36] = [
     ("Ctrl-d", "save in Drafts and close (writing)"),
     ("Ctrl-o", "browse attachments; Tab completes a path"),
     ("Ctrl-e", "write the text in your editor"),
+    ("F2", "focus the original beside a reply in a wide window"),
+    ("F4", "compose this message in Markdown or plain text"),
     (
         "Tab  ↑↓",
         "the next field (writing); Tab takes a suggestion",
@@ -1059,6 +1148,20 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         HelpMenu::CONFIRM_SEND,
         check(settings.confirm_send),
         "Before sending",
+    );
+    let seconds = settings.undo_send_delay().as_secs();
+    add(
+        &mut lines,
+        HelpMenu::UNDO_SEND,
+        check(seconds != 0),
+        &format!(
+            "Undo send ({}; Enter toggles 5s)",
+            if seconds == 0 {
+                "off".into()
+            } else {
+                format!("{seconds}s")
+            }
+        ),
     );
     lines.push(Line::default());
     lines.push(heading(" New mail"));

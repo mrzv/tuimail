@@ -1,6 +1,7 @@
 mod account;
 mod agent;
 mod app;
+mod calendar;
 mod compose;
 mod composer;
 mod config;
@@ -17,7 +18,9 @@ mod mcp;
 mod net;
 mod notify;
 mod oauth;
+mod palette;
 mod pop3;
+mod search;
 mod secrets;
 mod settings;
 mod setup;

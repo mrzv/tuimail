@@ -2,6 +2,7 @@
 //! in, listing folders, and the handful of commands tuimail sends. Every
 //! command has a time limit; a connection that misses one is dropped.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,11 +10,13 @@ use async_imap::imap_proto::{
     AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
 };
 use async_imap::types::{Fetch, Flag, NameAttribute};
+use chrono::Datelike as _;
 use futures::TryStreamExt;
 
 use crate::account::{Account, Auth, Security};
 use crate::mail;
 use crate::net::{self, Conn, Endpoint};
+use crate::search::{self, Field, Term};
 use crate::store::{Flags, Folder, Gmail, Header, Role};
 use crate::{tags, text, utf7};
 
@@ -1199,35 +1202,74 @@ pub async fn create(session: &mut Session, folder: &str) -> Result<()> {
     timed(TIMEOUT, "CREATE", session.create(folder)).await
 }
 
-/// SEARCH criteria for messages whose headers or text have every word of
-/// `query`, and the tag of every `tag:` word. Words are quoted; CHARSET
-/// UTF-8 is asked for when needed.
+/// ANDed SEARCH keys. Only text values are quoted; names and operators
+/// come from the parsed terms, never directly from the query.
 pub fn search_criteria(query: &str) -> Option<String> {
-    let words: Vec<String> = query
-        .split_whitespace()
-        .take(8)
-        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
-        .filter(|w| !w.is_empty())
-        .map(|w| {
-            let keywords = tags::searched(&w).map_or_else(Vec::new, |tag| tags::keywords(&tag));
-            match keywords.split_first() {
-                // Any spelling of the tag (`OR` takes two at a time).
-                Some((first, rest)) => rest.iter().fold(format!("KEYWORD {first}"), |all, k| {
-                    format!("OR {all} KEYWORD {k}")
-                }),
-                None => format!("TEXT \"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"")),
+    let mut criteria = String::new();
+    for term in search::terms(query) {
+        if !criteria.is_empty() {
+            criteria.push(' ');
+        }
+        match term {
+            Term::Text(field, word) => push_search_text(&mut criteria, field, &word),
+            Term::Tag { name, raw } => {
+                let keywords = tags::keywords(&name);
+                if let Some((first, rest)) = keywords.split_first() {
+                    // Any spelling of the tag (`OR` takes two at a time).
+                    for _ in rest {
+                        criteria.push_str("OR ");
+                    }
+                    write!(criteria, "KEYWORD {first}").unwrap();
+                    for keyword in rest {
+                        write!(criteria, " KEYWORD {keyword}").unwrap();
+                    }
+                } else {
+                    push_search_text(&mut criteria, Field::Any, raw);
+                }
             }
-        })
-        .collect();
-    if words.is_empty() {
+            Term::Since(date) | Term::Before(date) => {
+                let key = if matches!(term, Term::Since(_)) {
+                    "SENTSINCE"
+                } else {
+                    "SENTBEFORE"
+                };
+                let month = [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ][date.month0() as usize];
+                write!(criteria, "{key} {}-{month}-{:04}", date.day(), date.year()).unwrap();
+            }
+        }
+    }
+    if criteria.is_empty() {
         return None;
     }
-    let charset = if query.is_ascii() {
-        ""
-    } else {
-        "CHARSET UTF-8 "
-    };
-    Some(format!("{charset}{}", words.join(" ")))
+    if !criteria.is_ascii() {
+        criteria.insert_str(0, "CHARSET UTF-8 ");
+    }
+    Some(criteria)
+}
+
+fn push_search_text(criteria: &mut String, field: Field, word: &str) {
+    let mut chars = word.chars().filter(|c| !c.is_control()).peekable();
+    if chars.peek().is_none() {
+        // Neither omit a term nor send an empty string that matches all mail.
+        criteria.push_str("NOT ALL");
+        return;
+    }
+    criteria.push_str(match field {
+        Field::Any => "TEXT \"",
+        Field::From => "FROM \"",
+        Field::To => "TO \"",
+        Field::Subject => "SUBJECT \"",
+    });
+    for c in chars {
+        if matches!(c, '\\' | '"') {
+            criteria.push('\\');
+        }
+        criteria.push(c);
+    }
+    criteria.push('"');
 }
 
 /// Waits on a connection of its own for the inbox to change (IDLE), and
@@ -1477,6 +1519,25 @@ pub(crate) mod tests {
                 .contains('\n')
         );
         assert_eq!(search_criteria("   "), None);
+    }
+
+    #[test]
+    fn structured_search_uses_only_fixed_keys_and_valid_sent_dates() {
+        assert_eq!(
+            search_criteria(
+                r#"FROM:"Zoë \"Z\"" to:me subject:"C:\\temp" "past due" since:2024-02-29 before:2024-03-01"#,
+            )
+            .unwrap(),
+            r#"CHARSET UTF-8 FROM "Zoë \"Z\"" TO "me" SUBJECT "C:\\temp" TEXT "past due" SENTSINCE 29-Feb-2024 SENTBEFORE 1-Mar-2024"#
+        );
+        assert_eq!(
+            search_criteria(r#"since:2023-02-29 HEADER:"x y" from: subject:"unclosed"#).unwrap(),
+            r#"TEXT "since:2023-02-29" TEXT "HEADER:\"x y\"" TEXT "from:" TEXT "subject:\"unclosed""#
+        );
+        assert_eq!(
+            search_criteria("subject:\"x\r\nINBOX\" \0").unwrap(),
+            r#"SUBJECT "xINBOX" NOT ALL"#
+        );
     }
 
     #[test]

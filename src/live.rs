@@ -271,6 +271,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
         .send(Request::Search {
             folder: "INBOX".into(),
             query: "tag:work".into(),
+            generation: 1,
         })
         .unwrap();
     let found = next(&mut events, |e| match e {
@@ -295,6 +296,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
         .send(Request::Search {
             folder: "INBOX".into(),
             query: subject.clone(),
+            generation: 2,
         })
         .unwrap();
     let found = next(&mut events, |e| match e {
@@ -367,6 +369,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
         .send(Request::Search {
             folder: "INBOX".into(),
             query: subject.clone(),
+            generation: 3,
         })
         .unwrap();
     let back = next(&mut events, |e| match e {

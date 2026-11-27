@@ -4,6 +4,7 @@
 //! itself. It never leaves this computer.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::config;
 use crate::mail::{self, Addr, Summary};
+use crate::search::{Field, MAX_TERMS, Term, terms};
 use crate::{tags, text};
 
 #[path = "store_contacts.rs"]
@@ -651,9 +653,8 @@ impl Store {
             .optional()?)
     }
 
-    /// The account's messages whose sender, recipients, subject or text
-    /// contain every word of `query` (and that have the tag of every
-    /// `tag:` word), newest first; in `folder` only if given.
+    /// The account's cached messages matching every search term, newest
+    /// first. Date bounds use the cached timestamp at UTC midnight.
     pub fn search(
         &self,
         account: &str,
@@ -661,45 +662,113 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<Message>> {
-        let mut tagged = Vec::new();
-        let mut words = Vec::new();
-        for w in query.split_whitespace().take(8) {
-            if let Some(tag) = tags::searched(w) {
-                tagged.push(tag);
-                continue;
-            }
-            let escaped = w
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            words.push(format!("%{escaped}%"));
-        }
-        if words.is_empty() && tagged.is_empty() {
+        self.search_including(account, folder, query, limit, None)
+    }
+
+    /// Include verified server hits even when they match uncached text or
+    /// headers. Tag predicates always use the current cached flags.
+    pub(crate) fn search_including(
+        &self,
+        account: &str,
+        folder: Option<&str>,
+        query: &str,
+        limit: usize,
+        server_matches: Option<(&str, &[u32])>,
+    ) -> Result<Vec<Message>> {
+        let mut terms = terms(query).peekable();
+        if terms.peek().is_none() {
             return Ok(Vec::new());
         }
         let mut sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE account = ?1");
         let mut values: Vec<rusqlite::types::Value> = vec![account.to_string().into()];
         if let Some(folder) = folder {
             values.push(folder.to_string().into());
-            sql.push_str(&format!(" AND folder = ?{}", values.len()));
+            write!(sql, " AND folder = ?{}", values.len()).unwrap();
         }
-        for tag in tagged {
-            values.push(tag.into());
-            let n = values.len();
-            sql.push_str(&format!(
+        sql.push_str(" AND ((1");
+        let mut tag_binds = [0; MAX_TERMS];
+        let mut tag_count = 0;
+        for term in terms {
+            let n = values.len() + 1;
+            match term {
+                Term::Tag { name, .. } => {
+                    values.push(name.into());
+                    tag_binds[tag_count] = n;
+                    tag_count += 1;
+                }
+                Term::Since(date) | Term::Before(date) => {
+                    let midnight = date.and_time(chrono::NaiveTime::MIN).and_utc().timestamp();
+                    values.push(midnight.into());
+                    let op = if matches!(term, Term::Since(_)) {
+                        ">="
+                    } else {
+                        "<"
+                    };
+                    // Zero is the cache's sentinel for an unknown date.
+                    write!(sql, " AND date != 0 AND date {op} ?{n}").unwrap();
+                }
+                Term::Text(field, word) => {
+                    // SQLite's LIKE treats NUL as the end of the pattern.
+                    // No cached text can match a literal NUL.
+                    if word.contains('\0') {
+                        return Ok(Vec::new());
+                    }
+                    let mut pattern = String::with_capacity(word.len() + 2);
+                    pattern.push('%');
+                    for c in word.chars() {
+                        if matches!(c, '\\' | '%' | '_') {
+                            pattern.push('\\');
+                        }
+                        pattern.push(c);
+                    }
+                    pattern.push('%');
+                    values.push(pattern.into());
+                    let columns: &[&str] = match field {
+                        Field::Any => &[
+                            "subject",
+                            "from_name",
+                            "from_addr",
+                            "to_list",
+                            "cc_list",
+                            "preview",
+                        ],
+                        Field::From => &["from_name", "from_addr"],
+                        Field::To => &["to_list"],
+                        Field::Subject => &["subject"],
+                    };
+                    sql.push_str(" AND (");
+                    for (i, column) in columns.iter().enumerate() {
+                        if i != 0 {
+                            sql.push_str(" OR ");
+                        }
+                        write!(sql, "{column} LIKE ?{n} ESCAPE '\\'").unwrap();
+                    }
+                    sql.push(')');
+                }
+            }
+        }
+        sql.push(')');
+        if let Some((folder, uids)) = server_matches.filter(|(_, uids)| !uids.is_empty()) {
+            values.push(folder.to_string().into());
+            write!(sql, " OR (folder = ?{} AND uid IN (", values.len()).unwrap();
+            for (i, &uid) in uids.iter().enumerate() {
+                if i != 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                values.push(uid.into());
+            }
+            sql.push_str("))");
+        }
+        sql.push(')');
+        for &n in &tag_binds[..tag_count] {
+            write!(
+                sql,
                 " AND instr(' ' || tags || ' ', ' ' || ?{n} || ' ') > 0"
-            ));
+            )
+            .unwrap();
         }
-        for word in words {
-            values.push(word.into());
-            let n = values.len();
-            sql.push_str(&format!(
-                " AND (subject LIKE ?{n} ESCAPE '\\' OR from_name LIKE ?{n} ESCAPE '\\'
-                   OR from_addr LIKE ?{n} ESCAPE '\\' OR to_list LIKE ?{n} ESCAPE '\\'
-                   OR cc_list LIKE ?{n} ESCAPE '\\' OR preview LIKE ?{n} ESCAPE '\\')"
-            ));
-        }
-        sql.push_str(&format!(" ORDER BY date DESC, uid DESC LIMIT {limit}"));
+        write!(sql, " ORDER BY date DESC, uid DESC LIMIT {limit}").unwrap();
         let mut stmt = self.db.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -2224,6 +2293,78 @@ Hi,\r\n\r\nthe numbers are in.\r\n> old quote\r\n-- \r\nAlice\r\n";
             store.search("a", None, "%", 10).unwrap().is_empty(),
             "% is a letter"
         );
+    }
+
+    #[test]
+    fn structured_search_matches_only_the_named_header_and_escapes_patterns() {
+        let mut store = Store::in_memory();
+        let mut exact = header(1, r#"Don't "quote" C:\path_50% from:"#, 1);
+        exact.summary.cc = "copied@example.net".into();
+        let mut broad = header(2, r#"Don't "quote" C:\pathX50X alice@example.com"#, 2);
+        broad.summary.from = Addr {
+            name: "Bob".into(),
+            addr: "bob@example.com".into(),
+        };
+        store.add_headers("a", "INBOX", &[exact, broad]).unwrap();
+        let found = |q| {
+            store
+                .search("a", Some("INBOX"), q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.uid)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found(r#"FrOm:Alice to:me@example.org SUBJECT:"Don't \"quote\" C:\\path_50%""#),
+            [1]
+        );
+        assert_eq!(found(r#"subject:"C:\\path_50%""#), [1]);
+        assert_eq!(found(r#""Don't \"quote\"""#), [2, 1]);
+        assert_eq!(found("copied@example.net"), [1]);
+        assert_eq!(found("from:alice@example.com"), [1]);
+        assert!(found("to:copied@example.net").is_empty());
+        assert!(found("subject:me@example.org").is_empty());
+        assert_eq!(found("subject:alice@example.com"), [2]);
+        assert!(found(r#"subject:"' OR 1=1 --""#).is_empty());
+        assert_eq!(found("from:"), [1]);
+    }
+
+    #[test]
+    fn structured_search_date_bounds_are_utc_inclusive_and_exclusive() {
+        let mut store = Store::in_memory();
+        let midnight = |month, day| {
+            chrono::NaiveDate::from_ymd_opt(2024, month, day)
+                .unwrap()
+                .and_time(chrono::NaiveTime::MIN)
+                .and_utc()
+                .timestamp()
+        };
+        let start = midnight(2, 29);
+        let end = midnight(3, 1);
+        store
+            .add_headers(
+                "a",
+                "INBOX",
+                &[
+                    header(1, "Unknown", 0),
+                    header(2, "Previous day", start - 1),
+                    header(3, "Midnight", start),
+                    header(4, "Last second", end - 1),
+                    header(5, "Following midnight", end),
+                ],
+            )
+            .unwrap();
+        let found = |q| {
+            store
+                .search("a", None, q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.uid)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found("since:2024-02-29 before:2024-03-01"), [4, 3]);
+        assert_eq!(found("before:2024-02-29"), [2]);
+        assert!(found("since:2023-02-29").is_empty());
     }
 
     #[test]

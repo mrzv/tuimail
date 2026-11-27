@@ -2,12 +2,12 @@
 //! to send, then the text; addresses offered under the field being typed.
 
 use ratatui::Frame;
-use ratatui::layout::{Margin, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use super::{bordered, fit, hint_spans};
+use super::{border, bordered, fit, hint_spans, reader, reply_original_fits};
 use crate::app::App;
 use crate::composer::{Field, Kind};
 use crate::mail;
@@ -17,6 +17,19 @@ use crate::text::cols;
 const LABEL: u16 = 9;
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    let mut area = area;
+    if let Some(original) = app.composer.as_mut().and_then(|c| c.original.as_mut()) {
+        let terminal = frame.area();
+        if reply_original_fits(terminal.width, terminal.height) {
+            let [reply, reference] =
+                Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+                    .areas(area);
+            reader::original(frame, original, reference, &app.colors);
+            area = reply;
+        } else {
+            original.hide();
+        }
+    }
     let c = app.colors.clone();
     let Some(composer) = app.composer.as_ref() else {
         return;
@@ -27,19 +40,31 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         Kind::Forward => " Forward ",
         Kind::Draft => " Draft ",
     };
-    let hint = if composer.sending {
-        " Sending… ".to_string()
+    let reference_focused = composer.original.as_ref().is_some_and(|o| o.focused);
+    let hint = if app.undo_send_remaining().is_some() {
+        " `Esc` undo send "
+    } else if composer.sending {
+        " Sending… "
+    } else if reference_focused {
+        " `F2` or `Esc` return to reply "
+    } else if composer.original.as_ref().is_some_and(|o| o.width != 0) {
+        " `F2` original · `F3` commands · `Ctrl-s` send "
     } else {
-        " `Ctrl-s` send · `Ctrl-d` save draft · `Ctrl-o` attach · `Ctrl-e` editor · `Esc` close "
-            .to_string()
+        " `F3` commands · `Ctrl-s` send · `Esc` close "
+    };
+    let format = if composer.markdown {
+        " Markdown "
+    } else {
+        " Plain text "
     };
     let block = bordered()
-        .border_style(Style::new().fg(c.accent))
+        .border_style(border(!reference_focused, &c))
         .title(Span::styled(
             format!(" {} {}", app.icons.compose, title.trim_start()),
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),
         ))
-        .title_bottom(Line::from(hint_spans(&hint, &c)).right_aligned());
+        .title_top(Line::from(Span::styled(format, Style::new().fg(c.subtext))).right_aligned())
+        .title_bottom(Line::from(hint_spans(hint, &c)).right_aligned());
     let inner = block.inner(area).inner(Margin::new(1, 0));
     frame.render_widget(block, area);
     let account = app
@@ -64,7 +89,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             width: inner.width,
             height: 1,
         };
-        let focused = composer.field == field;
+        let focused = !reference_focused && composer.field == field;
         let label_style = if focused {
             Style::new().fg(c.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -182,7 +207,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width,
         height: bottom.saturating_sub(y),
     };
-    let focused = composer.field == Field::Body;
+    let focused = !reference_focused && composer.field == Field::Body;
     composer.body.set_style(Style::new().fg(c.text).bg(c.bg));
     composer
         .body
@@ -195,7 +220,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(&composer.body, body);
     }
     // Suggestions under the address being typed.
-    if !composer.suggestions.is_empty()
+    if !reference_focused
+        && !composer.sending
+        && !composer.suggestions.is_empty()
         && let Some((_, rect)) = field_rows.iter().find(|(f, _)| *f == composer.field)
     {
         let widest = composer

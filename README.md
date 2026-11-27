@@ -123,6 +123,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `Space` / `*` | Mark a message / all of them; the keys above act on the marked |
 | `v` | Collapse / expand the selected conversation in the message list |
 | `/` | Search; `Esc` ends it |
+| `F3` | Search commands for the current pane or composer |
 | `J` / `K` | Reading: next / previous list row |
 | `[` / `]` | Open the newer / older message in a collapsed conversation, from the list or reader |
 | `Space` / `b` | Reading: a page down / up |
@@ -136,8 +137,14 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `?` / `O` | Every key / the settings and themes |
 | `q` | Quit |
 
+Search combines the first eight terms with AND. Use double quotes for phrases, including after a qualifier: `from:alice to:me@example.com subject:"quarterly results" tag:work since:2026-01-01 before:2026-04-01`. The date bounds are inclusive for `since:` and exclusive for `before:`. Cached dates use UTC (the receipt date may stand in for a missing Date header); IMAP searches sent dates in the open server folder. Unqualified text searches cached headers and previews and, on IMAP, server text. From All inboxes, search uses the cached inboxes.
+
+`F3` lists commands available where you are. Type words from a command's name or its shortcut, select with `↑`/`↓`, and press `Enter` to run it. Existing confirmations still apply.
+
 Web links are blue, without an underline, in both plain-text and HTML views. HTML links on images can be clicked on their alt text; images are never fetched. Tuimail does not emit terminal hyperlink codes. Use `o` for `mailto:` links to write the message in tuimail.
 Links split by `format=flowed` email wrapping keep their full destination on every displayed row. Literal line breaks in fixed plain text are not joined.
+
+Calendar invitations show their title, dates, time zone, location and organizer inline when present. Tuimail doesn't fetch calendar data or send RSVPs. The original `.ics` remains an attachment.
 
 Open a collapsed conversation to see its messages newest first, starting with the newest body expanded. Switching focus between the list and reader keeps the reply you chose. Switching formats with `H` keeps a visible reply header on the same line.
 
@@ -156,11 +163,19 @@ Writing:
 | `Ctrl-d` | Save in Drafts and close |
 | `Ctrl-o` | Browse for a file to attach (or drop it on the window) |
 | `Ctrl-e` | Write the text in your editor (`$VISUAL`, `$EDITOR`, or `editor` in the settings) |
+| `F2` | Focus the read-only original beside a reply in a wide terminal; `F2` or `Esc` returns to writing |
+| `F4` | Toggle Markdown for this message |
 | `←` `→` on From | Send from another account |
 | `x` on Files | Take a file off |
 | `Esc` | Close: `y` keeps it in Drafts, `n` throws it away |
 
 The attachment picker starts in your home folder, then reopens in the folder of the last file you attached during this run. Type or paste a path (`~/` and spaces work), use `Tab` to complete it, or use `↑`/`↓` to select an entry. `Enter` opens a folder or attaches the file; choose `..` to go up. `Ctrl-u` clears the path and `Esc` cancels.
+
+In a wide terminal, replies show the original beside the composer. Press `F2` to scroll the reference with arrows or Page Up/Down without editing the reply.
+
+New messages start in plain text. Markdown sends formatted HTML alongside a plain-text alternative and keeps the editable source in Drafts. It supports CommonMark and strikethrough. Raw HTML stays literal, images become their alt text, and only web and email links are emitted. It never reads files or fetches images. If sharing a file, attach it explicitly.
+
+Turn on **Undo send** in `O` for five seconds to press `Esc` after approving a send. Canceling returns to the same editable draft. Nothing reaches SMTP until the window ends; this cannot recall a sent email.
 
 ## Accounts
 
@@ -307,6 +322,7 @@ threads_include_sent = false # include related cached Sent messages (requires th
 threads_complete_gmail = false # complete on-screen threads from Gmail All Mail (requires threads)
 confirm_delete = false   # ask before moving mail to Trash
 confirm_send = true      # ask before sending (a message without a subject always asks)
+undo_send_seconds = 0    # grace period before SMTP (0–30 seconds; 0 disables)
 check_minutes = 5        # how often to check where the server can't say at once, and folders other than the inbox (1 to 1440)
 fetch_count = 300        # how many of a folder's newest messages to fetch at first (20 to 5000); older ones as you scroll
 sidebar_width = 28       # in columns (16 to 50)

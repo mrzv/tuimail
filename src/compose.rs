@@ -2,14 +2,18 @@
 //! MIME message to send (mail-builder), and the starting text of a reply
 //! or a forward.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use mail_builder::MessageBuilder;
+use mail_builder::headers::Header;
 use mail_builder::headers::address::Address as BuilderAddress;
 use mail_builder::headers::content_type::ContentType;
-use mail_builder::mime::MimePart;
+use mail_builder::mime::{BodyPart, MimePart};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd, html};
 
 use crate::account::{self, Account};
 use crate::mail::{self, Addr, Parsed};
@@ -18,6 +22,12 @@ use crate::text;
 /// The biggest attachment, and all of a message's together.
 pub const MAX_ATTACHMENT: u64 = 40 << 20;
 pub const MAX_TOTAL: u64 = 60 << 20;
+
+// The parser builds a tree before yielding events; reference links can
+// expand well beyond the source even with a small tree.
+const MAX_MARKDOWN: usize = 256 << 10;
+const MAX_MARKDOWN_HTML: usize = 2 << 20;
+const MAX_MARKDOWN_DEPTH: usize = 128;
 
 /// A file to send with the message.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,9 +107,9 @@ impl Attachment {
         }
     }
 
-    /// Its type, its name and its bytes.
-    fn read(&self) -> Result<(String, String, Vec<u8>)> {
-        match self {
+    /// The MIME part and the number of bytes before transfer encoding.
+    fn part(&self) -> Result<(MimePart<'_>, usize)> {
+        let (mime, name, bytes) = match self {
             Attachment::File(path) => {
                 let shown = crate::config::shown(path);
                 let meta =
@@ -115,12 +125,23 @@ impl Attachment {
                 }
                 let bytes = std::fs::read(path).with_context(|| format!("cannot read {shown}"))?;
                 let name = self.name();
-                Ok((mime_of(&name).to_string(), name, bytes))
+                (
+                    Cow::Borrowed(mime_of(&name)),
+                    Cow::Owned(name),
+                    Cow::Owned(bytes),
+                )
             }
-            Attachment::Data { name, mime, bytes } => {
-                Ok((mime.clone(), name.clone(), bytes.as_ref().clone()))
-            }
-        }
+            Attachment::Data { name, mime, bytes } => (
+                Cow::Borrowed(mime.as_str()),
+                Cow::Borrowed(name.as_str()),
+                Cow::Borrowed(bytes.as_slice()),
+            ),
+        };
+        let len = bytes.len();
+        Ok((
+            MimePart::new(ContentType::new(mime), BodyPart::Binary(bytes)).attachment(name),
+            len,
+        ))
     }
 }
 
@@ -169,6 +190,7 @@ pub struct Draft {
     pub bcc: String,
     pub subject: String,
     pub body: String,
+    pub markdown: bool,
     pub in_reply_to: String,
     /// Ids separated by spaces.
     pub references: String,
@@ -192,6 +214,7 @@ impl Draft {
         ] {
             field.hash(&mut h);
         }
+        self.markdown.hash(&mut h);
         for a in &self.attachments {
             match a {
                 Attachment::File(path) => path.hash(&mut h),
@@ -295,14 +318,14 @@ fn unquote_name(name: &str) -> String {
     out.trim().to_string()
 }
 
-fn builder_list(addrs: &[Addr]) -> BuilderAddress<'static> {
-    let list: Vec<BuilderAddress<'static>> = addrs
+fn builder_list(addrs: &[Addr]) -> BuilderAddress<'_> {
+    let list = addrs
         .iter()
         .map(|a| {
             if a.name.is_empty() {
-                BuilderAddress::from(a.addr.clone())
+                BuilderAddress::from(a.addr.as_str())
             } else {
-                BuilderAddress::from((a.name.clone(), a.addr.clone()))
+                BuilderAddress::from((a.name.as_str(), a.addr.as_str()))
             }
         })
         .collect();
@@ -332,6 +355,56 @@ fn random_hex() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+struct Recipients {
+    to: Vec<Addr>,
+    cc: Vec<Addr>,
+    bcc: Vec<Addr>,
+}
+
+impl Recipients {
+    fn parse(draft: &Draft) -> Result<Self> {
+        let field = |input: &str, what: &str| {
+            parse_addresses(input)
+                .map_err(|bad| anyhow::anyhow!("{what}: “{bad}” isn't an email address"))
+        };
+        Ok(Self {
+            to: field(&draft.to, "To")?,
+            cc: field(&draft.cc, "Cc")?,
+            bcc: field(&draft.bcc, "Bcc")?,
+        })
+    }
+
+    fn envelope(&self) -> Vec<String> {
+        let mut rcpts: Vec<_> = self
+            .to
+            .iter()
+            .chain(&self.cc)
+            .chain(&self.bcc)
+            .map(|a| (a.addr.to_lowercase(), &a.addr))
+            .collect();
+        rcpts.sort_by(|(a, _), (b, _)| a.cmp(b));
+        rcpts.dedup_by(|(a, _), (b, _)| a == b);
+        rcpts
+            .into_iter()
+            .map(|(_, address)| address.clone())
+            .collect()
+    }
+
+    fn built(self, account: &Account, raw: Vec<u8>) -> Built {
+        Built {
+            raw,
+            from: account.email.trim().to_owned(),
+            rcpts: self.envelope(),
+            to: self.to.into_iter().chain(self.cc).chain(self.bcc).collect(),
+        }
+    }
+}
+
+/// Validates the addresses and returns the deduplicated envelope recipients.
+pub fn recipients(draft: &Draft) -> Result<Vec<String>> {
+    Ok(Recipients::parse(draft)?.envelope())
+}
+
 /// Builds the message `draft` describes, from `account`, dated `date`. With
 /// `keep_bcc` the Bcc header stays (the copy in Sent or Drafts); the one
 /// sent never has it.
@@ -342,18 +415,45 @@ pub fn build(
     date: i64,
     keep_bcc: bool,
 ) -> Result<Built> {
-    let field = |input: &str, what: &str| {
-        parse_addresses(input)
-            .map_err(|bad| anyhow::anyhow!("{what}: “{bad}” isn't an email address"))
-    };
-    let to = field(&draft.to, "To")?;
-    let cc = field(&draft.cc, "Cc")?;
-    let bcc = field(&draft.bcc, "Bcc")?;
-    let from_addr = account.email.trim().to_string();
+    let recipients = Recipients::parse(draft)?;
+    let raw = build_message(draft, account, message_id, date, &recipients, keep_bcc)?;
+    Ok(recipients.built(account, raw))
+}
+
+/// Builds the wire message and its Sent copy, serializing the body once.
+pub fn build_for_send(
+    draft: &Draft,
+    account: &Account,
+    message_id: &str,
+    date: i64,
+) -> Result<(Built, Vec<u8>)> {
+    let recipients = Recipients::parse(draft)?;
+    let raw = build_message(draft, account, message_id, date, &recipients, false)?;
+    let mut saved = Vec::new();
+    if !recipients.bcc.is_empty() {
+        const PREFIX: &[u8] = b"Bcc: ";
+        saved.extend_from_slice(PREFIX);
+        builder_list(&recipients.bcc).write_header(&mut saved, PREFIX.len());
+    }
+    saved.reserve_exact(raw.len());
+    saved.extend_from_slice(&raw);
+    Ok((recipients.built(account, raw), saved))
+}
+
+fn build_message(
+    draft: &Draft,
+    account: &Account,
+    message_id: &str,
+    date: i64,
+    recipients: &Recipients,
+    keep_bcc: bool,
+) -> Result<Vec<u8>> {
+    let Recipients { to, cc, bcc } = recipients;
+    let from_addr = account.email.trim();
     let from_name = text::one_line(&account.display_name, mail::MAX_NAME);
     let subject = text::one_line(&draft.subject, mail::MAX_SUBJECT);
     let mut builder = MessageBuilder::new()
-        .message_id(message_id.to_string())
+        .message_id(message_id)
         .date(date)
         .subject(subject)
         .header(
@@ -361,75 +461,189 @@ pub fn build(
             mail_builder::headers::raw::Raw::new("tuimail"),
         );
     builder = if from_name.is_empty() {
-        builder.from(BuilderAddress::from(from_addr.clone()))
+        builder.from(BuilderAddress::from(from_addr))
     } else {
-        builder.from(BuilderAddress::from((from_name, from_addr.clone())))
+        builder.from(BuilderAddress::new_address(Some(from_name), from_addr))
     };
     if !to.is_empty() {
-        builder = builder.to(builder_list(&to));
+        builder = builder.to(builder_list(to));
     }
     if !cc.is_empty() {
-        builder = builder.cc(builder_list(&cc));
+        builder = builder.cc(builder_list(cc));
     }
     if keep_bcc && !bcc.is_empty() {
-        builder = builder.bcc(builder_list(&bcc));
+        builder = builder.bcc(builder_list(bcc));
     }
     if !draft.in_reply_to.is_empty() {
-        builder = builder.in_reply_to(draft.in_reply_to.clone());
+        builder = builder.in_reply_to(draft.in_reply_to.as_str());
     }
-    let references: Vec<String> = draft
-        .references
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
+    let references: Vec<&str> = draft.references.split_whitespace().collect();
     if !references.is_empty() {
         builder = builder.references(references);
     }
-    // Lines end in CRLF, and the text in a line break.
-    let mut body = text::clean(&draft.body)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    if !body.ends_with('\n') {
+    builder
+        .body(message_body(draft)?)
+        .write_to_vec()
+        .context("cannot build the message")
+}
+
+fn message_body(draft: &Draft) -> Result<MimePart<'_>> {
+    if draft.markdown && draft.body.len() > MAX_MARKDOWN {
+        bail!("Markdown source is too large (over 256 KiB)");
+    }
+    let mut body = text::clean(&draft.body);
+    // Keep the Markdown source as written; multipart adds its own line
+    // break before the next boundary. Plain mail still ends with a break.
+    if !draft.markdown && !body.ends_with('\n') {
         body.push('\n');
     }
-    let text = MimePart::new("text/plain", body.replace('\n', "\r\n"));
-    let mut parts = vec![text];
+    let body = if draft.markdown {
+        let rendered = markdown_html(&body)?;
+        let plain = ContentType::new("text/plain")
+            .attribute("charset", "utf-8")
+            .attribute("x-tuimail-format", "markdown");
+        multipart(
+            "multipart/alternative",
+            vec![
+                MimePart::new(plain, body.replace('\n', "\r\n")),
+                MimePart::new("text/html", rendered),
+            ],
+        )?
+    } else {
+        MimePart::new("text/plain", body.replace('\n', "\r\n"))
+    };
+    if draft.attachments.is_empty() {
+        return Ok(body);
+    }
+    let mut parts = Vec::with_capacity(draft.attachments.len() + 1);
+    parts.push(body);
     let mut total = 0;
     for attachment in &draft.attachments {
-        let (mime, name, bytes) = attachment.read()?;
-        total += bytes.len() as u64;
+        let (part, len) = attachment.part()?;
+        total += len as u64;
         if total > MAX_TOTAL {
             bail!(
                 "the attachments are too big together (over {})",
                 mail::size(MAX_TOTAL as usize)
             );
         }
-        parts.push(MimePart::new(mime, bytes).attachment(name));
+        parts.push(part);
     }
-    builder = if parts.len() == 1 {
-        builder.body(parts.remove(0))
-    } else {
-        // The boundary is random, as the Message-ID: mail-builder's own is
-        // made of the time and a number kept for the whole process, which
-        // would tie together everything sent in one run, from any account.
-        let mixed = ContentType::new("multipart/mixed").attribute("boundary", random_hex()?);
-        builder.body(MimePart::new(mixed, parts))
-    };
-    let raw = builder.write_to_vec().context("cannot build the message")?;
-    let mut rcpts: Vec<String> = to
-        .iter()
-        .chain(&cc)
-        .chain(&bcc)
-        .map(|a| a.addr.clone())
-        .collect();
-    rcpts.sort_by_key(|a| a.to_lowercase());
-    rcpts.dedup_by_key(|a| a.to_lowercase());
-    Ok(Built {
-        raw,
-        from: from_addr,
-        rcpts,
-        to: to.into_iter().chain(cc).chain(bcc).collect(),
-    })
+    multipart("multipart/mixed", parts)
+}
+
+fn multipart<'a>(kind: &'static str, parts: Vec<MimePart<'a>>) -> Result<MimePart<'a>> {
+    // Mail-builder's own boundaries can tie together messages sent by
+    // the same process, so use our own random boundary for each multipart.
+    let mime = ContentType::new(kind).attribute("boundary", random_hex()?);
+    Ok(MimePart::new(mime, parts))
+}
+
+fn markdown_html(source: &str) -> Result<String> {
+    let mut depth = 0;
+    let mut image_depth = 0;
+    let mut blocked_link = false;
+    let events = Parser::new_ext(source, Options::ENABLE_STRIKETHROUGH)
+        .take_while(|event| {
+            match event {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth -= 1,
+                _ => {}
+            }
+            depth <= MAX_MARKDOWN_DEPTH
+        })
+        .filter_map(|event| match event {
+            Event::Start(Tag::Image { .. }) => {
+                image_depth += 1;
+                None
+            }
+            Event::End(TagEnd::Image) => {
+                image_depth -= 1;
+                None
+            }
+            event if image_depth != 0 => match event {
+                Event::Html(text)
+                | Event::InlineHtml(text)
+                | Event::Code(text)
+                | Event::Text(text) => Some(Event::Text(text)),
+                Event::SoftBreak | Event::HardBreak => Some(Event::Text(" ".into())),
+                _ => None,
+            },
+            Event::Start(Tag::HtmlBlock) => {
+                Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)))
+            }
+            Event::End(TagEnd::HtmlBlock) => Some(Event::End(TagEnd::CodeBlock)),
+            Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+            Event::Start(Tag::Link {
+                link_type,
+                mut dest_url,
+                title,
+                id,
+            }) => {
+                let email = link_type == LinkType::Email;
+                blocked_link = if email {
+                    !account::valid_address(&dest_url)
+                } else {
+                    !mail::usable_link(&dest_url)
+                };
+                if blocked_link {
+                    return None;
+                }
+                if email {
+                    // The renderer adds `mailto:`; the destination is a
+                    // literal mailbox, not an already-encoded URI.
+                    let escape = |b: u8| !b.is_ascii_alphanumeric() && !b"-._~@".contains(&b);
+                    let escapes = dest_url.bytes().filter(|&b| escape(b)).count();
+                    if escapes != 0 {
+                        let mut encoded = String::with_capacity(dest_url.len() + 2 * escapes);
+                        for b in dest_url.bytes() {
+                            if escape(b) {
+                                write!(encoded, "%{b:02X}").unwrap();
+                            } else {
+                                encoded.push(char::from(b));
+                            }
+                        }
+                        dest_url = encoded.into();
+                    }
+                }
+                Some(Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }))
+            }
+            Event::End(TagEnd::Link) if std::mem::take(&mut blocked_link) => None,
+            _ => Some(event),
+        });
+    let mut html = HtmlOutput(String::new());
+    html::write_html_fmt(&mut html, events)
+        .map_err(|_| anyhow::anyhow!("formatted Markdown is too large (over 2 MiB)"))?;
+    if depth > MAX_MARKDOWN_DEPTH {
+        bail!("Markdown is nested too deeply");
+    }
+    Ok(html.0)
+}
+
+struct HtmlOutput(String);
+
+impl std::fmt::Write for HtmlOutput {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        // CommonMark entities can decode to controls after source cleaning.
+        for part in value.split_inclusive(|c| c == '\n' || text::is_hidden(c)) {
+            let (text, newline) = match part.chars().next_back() {
+                Some('\n') => (&part[..part.len() - 1], "\r\n"),
+                Some(c) if text::is_hidden(c) => (&part[..part.len() - c.len_utf8()], ""),
+                _ => (part, ""),
+            };
+            if self.0.len() + text.len() + newline.len() > MAX_MARKDOWN_HTML {
+                return Err(std::fmt::Error);
+            }
+            self.0.push_str(text);
+            self.0.push_str(newline);
+        }
+        Ok(())
+    }
 }
 
 /// "Re: subject", without piling up Re:s.
@@ -559,15 +773,7 @@ pub fn forward(parsed: &Parsed, files: Vec<Option<mail::File>>, account: &Accoun
     if !s.cc.is_empty() {
         header.push_str(&format!("Cc: {}\n", s.cc));
     }
-    let attachments = files
-        .into_iter()
-        .flatten()
-        .map(|file| Attachment::Data {
-            name: file.name,
-            mime: file.mime,
-            bytes: Arc::new(file.bytes),
-        })
-        .collect();
+    let attachments = loaded_files(files);
     Draft {
         subject: forward_subject(&s.subject),
         body: start_with(
@@ -579,28 +785,35 @@ pub fn forward(parsed: &Parsed, files: Vec<Option<mail::File>>, account: &Accoun
     }
 }
 
+fn loaded_files(files: Vec<Option<mail::File>>) -> Vec<Attachment> {
+    files
+        .into_iter()
+        .flatten()
+        .map(|file| Attachment::Data {
+            name: file.name,
+            mime: file.mime,
+            bytes: Arc::new(file.bytes),
+        })
+        .collect()
+}
+
 /// A draft saved earlier, to write on: its fields, text and attachments.
 pub fn from_saved(parsed: &Parsed, contents: mail::Contents) -> Draft {
-    let joined = |list: &[Addr]| {
-        list.iter()
-            .map(Addr::display)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut draft = forward(parsed, contents.files, &Account::default());
-    draft.to = joined(&parsed.to);
-    draft.cc = joined(&parsed.cc);
-    draft.bcc = joined(&contents.bcc);
-    draft.subject = parsed.summary.subject.clone();
-    // Its text, or what its HTML says (a draft written as HTML only, by
-    // another program, would otherwise lose all of it when saved again).
-    draft.body = match &parsed.text {
-        Some(t) => text::clean(t),
-        None => mail::plain_text(parsed),
-    };
-    draft.in_reply_to = parsed.summary.in_reply_to.clone();
-    draft.references = parsed.summary.references.clone();
-    draft
+    Draft {
+        to: joined(&parsed.to),
+        cc: joined(&parsed.cc),
+        bcc: joined(&contents.bcc),
+        subject: parsed.summary.subject.clone(),
+        // A draft written as HTML only would otherwise lose its text.
+        body: match &parsed.text {
+            Some(t) => text::clean(t),
+            None => mail::plain_text(parsed),
+        },
+        markdown: contents.markdown,
+        in_reply_to: parsed.summary.in_reply_to.clone(),
+        references: parsed.summary.references.clone(),
+        attachments: loaded_files(contents.files),
+    }
 }
 
 #[cfg(test)]
@@ -802,6 +1015,7 @@ mod tests {
             bcc: "boss@example.org".into(),
             subject: "Lunch? 🍜".into(),
             body: "Hi Alice,\n\nnoon?\n".into(),
+            markdown: false,
             in_reply_to: "abc@example.com".into(),
             references: "first@x.y abc@example.com".into(),
             attachments: vec![Attachment::Data {
@@ -840,6 +1054,147 @@ mod tests {
             ..Draft::default()
         };
         assert!(build(&bad, &me(), &id, 0, false).is_err());
+    }
+
+    #[test]
+    fn markdown_is_opt_in_and_only_safe_markup_is_rendered() {
+        let mut draft = Draft {
+            body: [
+                "# Plans",
+                "",
+                "**Bold**, _emphasis_, ~~gone~~, and <b>literal</b>.",
+                "",
+                "> A quote with `code`",
+                "",
+                "- A list",
+                "",
+                r#"<script>alert("not HTML")</script>"#,
+                "",
+                "[Web](https://example.org/?a=1&b=2) and <alice@example.org>.",
+                "<sales%2Bops?#&+@example.org>.",
+                "",
+                "[script](jav&#x61;script:bad), [local](file:///tmp/secret),",
+                "[relative](/tmp/secret), and [data](data:text/html,evil).",
+                "",
+                "![*local picture*](file:///tmp/secret) and ![remote `picture`](https://example.org/tracking).",
+                "",
+                "Escaped controls: a&#13;b&#27;c&#x202e;d.",
+            ]
+            .join("\n"),
+            ..Draft::default()
+        };
+        let build = |draft: &Draft| build(draft, &me(), "id@example.org", 0, false).unwrap();
+        let plain = build(&draft);
+        let (parsed, contents) = mail::parse_with_contents(&plain.raw).unwrap();
+        assert!(parsed.html.is_none());
+        assert!(!contents.markdown);
+        draft.markdown = true;
+        let formatted = build(&draft);
+        let (parsed, contents) = mail::parse_with_contents(&formatted.raw).unwrap();
+        assert!(contents.markdown);
+        let html = parsed.html.as_ref().unwrap();
+        for rendered in [
+            "<h1>Plans</h1>",
+            "<strong>Bold</strong>",
+            "<em>emphasis</em>",
+            "<del>gone</del>",
+            "<blockquote>",
+            "<code>code</code>",
+            "<li>A list</li>",
+            "&lt;b",
+            "&lt;script",
+            "href=\"https://example.org/?a=1&amp;b=2\"",
+            "href=\"mailto:alice@example.org\"",
+            "href=\"mailto:sales%252Bops%3F%23%26%2B@example.org\">sales%2Bops?#&amp;+@example.org</a>",
+            "local picture and remote picture",
+            "Escaped controls: abcd.",
+        ] {
+            assert!(html.contains(rendered), "{rendered} missing from {html}");
+        }
+        for excluded in [
+            "<b>",
+            "<script",
+            "javascript:",
+            "file:",
+            "data:",
+            "/tmp/",
+            "<img",
+            "/tracking",
+        ] {
+            assert!(!html.contains(excluded), "{excluded} found in {html}");
+        }
+        assert_eq!(from_saved(&parsed, contents).body, draft.body);
+    }
+
+    #[test]
+    fn markdown_attachments_and_bcc_round_trip_through_the_right_copies() {
+        let draft = Draft {
+            to: "Alice <alice@example.com>".into(),
+            cc: "ALICE@example.com".into(),
+            bcc: "\"Doe, Jane\" <jane@example.org>".into(),
+            body: "**Table for two?** 🍜  \n\n> Soon.".into(),
+            markdown: true,
+            attachments: vec![Attachment::Data {
+                name: "menu.txt".into(),
+                mime: "text/plain".into(),
+                bytes: Arc::new(b"soup".to_vec()),
+            }],
+            ..Draft::default()
+        };
+        let (sent, copy) = build_for_send(&draft, &me(), "id@example.org", 0).unwrap();
+        assert!(
+            copy.ends_with(&sent.raw),
+            "the wire message and Sent copy share their MIME"
+        );
+        assert_eq!(recipients(&draft).unwrap(), sent.rcpts);
+        assert_eq!(sent.rcpts, ["alice@example.com", "jane@example.org"]);
+        let (parsed, contents) = mail::parse_with_contents(&sent.raw).unwrap();
+        assert!(contents.bcc.is_empty());
+        assert!(
+            parsed
+                .html
+                .unwrap()
+                .contains("<strong>Table for two?</strong>")
+        );
+        for raw in [
+            copy,
+            build(&draft, &me(), "id@example.org", 0, true).unwrap().raw,
+        ] {
+            let encoded = String::from_utf8(raw).unwrap();
+            assert!(encoded.contains("multipart/mixed"));
+            assert!(encoded.contains("multipart/alternative"));
+            assert_eq!(encoded.matches("boundary=\"").count(), 2);
+            let (parsed, contents) = mail::parse_with_contents(encoded.as_bytes()).unwrap();
+            assert_eq!(from_saved(&parsed, contents), draft);
+        }
+    }
+
+    #[test]
+    fn oversized_and_deeply_nested_markdown_is_not_silently_truncated() {
+        let draft = Draft {
+            body: "x".repeat(MAX_MARKDOWN + 1),
+            markdown: true,
+            ..Draft::default()
+        };
+        let Err(error) = build(&draft, &me(), "id@example.org", 0, true) else {
+            panic!("oversized Markdown accepted");
+        };
+        assert!(error.to_string().contains("source is too large"));
+        let quotes = format!("{}quote", "> ".repeat(MAX_MARKDOWN_DEPTH + 1));
+        assert!(
+            markdown_html(&quotes)
+                .unwrap_err()
+                .to_string()
+                .contains("nested")
+        );
+        // Each empty block quote renders more than eight times its source length.
+        let repeats = ">\n\n".repeat(MAX_MARKDOWN / 3);
+        assert!(
+            markdown_html(&repeats)
+                .unwrap_err()
+                .to_string()
+                .contains("formatted Markdown is too large")
+        );
     }
 
     #[test]

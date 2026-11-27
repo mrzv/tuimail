@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{border, bordered, fit, fit_middle, hint_spans, scrollbar};
-use crate::app::{App, Focus, Item};
+use crate::app::{App, Focus, Item, ReplyOriginal};
 use crate::mail::{self, Addr, Body, Role, Seg};
 use crate::text::{cols, wrap};
 use crate::theme::Colors;
@@ -203,6 +203,68 @@ fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a>
     }
     spans.push(Span::styled(addr, Style::new().fg(c.text)));
     Line::from(spans)
+}
+
+/// A reply's original isn't an active reader: it has no hit targets or actions.
+pub(super) fn original(frame: &mut Frame, original: &mut ReplyOriginal, area: Rect, c: &Colors) {
+    let block = bordered()
+        .border_style(border(original.focused, c))
+        .title(" Original message ")
+        .title_bottom(Line::from(hint_spans(" `F2` switch pane ", c)).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = usize::from(inner.width.saturating_sub(2));
+    let summary = &original.parsed.summary;
+    let parsed = &original.parsed;
+    let from = parsed.from.first().unwrap_or(&summary.from);
+    let date = mail::short_date(summary.date, crate::app::now());
+    let subject = if summary.subject.is_empty() {
+        "(no subject)"
+    } else {
+        &summary.subject
+    };
+    let header = [
+        Line::styled(fit(subject, width), Style::new().fg(c.text).bold()),
+        sender(
+            Span::styled("From: ", Style::new().fg(c.dim)),
+            from,
+            width.saturating_sub(6),
+            c,
+        ),
+        Line::styled(date, Style::new().fg(c.date)),
+        Line::default(),
+    ];
+    let rows = usize::from(inner.height);
+    let text_area = Rect::new(inner.x + 1, inner.y, width as u16, inner.height);
+    original.width = text_area.width.saturating_sub(1).max(20);
+    original.rows = rows.saturating_sub(header.len());
+    let (lines, max) = if let Some(body) = original.body.as_ref().filter(|_| !original.loading()) {
+        let max = body.lines.len().saturating_sub(original.rows);
+        original.scroll = original.scroll.min(max);
+        let visible = body.lines.iter().skip(original.scroll).take(original.rows);
+        (
+            header
+                .into_iter()
+                .chain(visible.map(|line| body_line(line, c)))
+                .collect(),
+            max,
+        )
+    } else {
+        let notice = if original.loading() {
+            "Laying out the original…"
+        } else {
+            "Couldn't lay out the original."
+        };
+        (
+            header
+                .into_iter()
+                .chain([Line::styled(notice, Style::new().fg(c.dim))])
+                .collect::<Vec<_>>(),
+            0,
+        )
+    };
+    frame.render_widget(Paragraph::new(lines), text_area);
+    scrollbar(frame, area, max, original.scroll, c);
 }
 
 /// One line per member; the active message's body follows its header.
