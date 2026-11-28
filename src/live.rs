@@ -171,6 +171,10 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
             uidvalidity: synced.uidvalidity,
             folder: "INBOX".into(),
             uid: header.uid,
+            size: header.size,
+            partial: false,
+            urgent: true,
+            queued: None,
         })
         .unwrap();
     let raw = next(&mut events, |e| match e {
@@ -180,6 +184,9 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
     .await
     .unwrap()
     .expect("the message is there");
+    let crate::worker::Download::Full(raw) = raw else {
+        panic!("expected a complete message");
+    };
     let parsed = crate::mail::parse(&raw).unwrap();
     assert!(
         parsed

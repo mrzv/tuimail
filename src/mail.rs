@@ -6,10 +6,13 @@
 //! (`text::clean`) and capped before it's shown or stored.
 
 use std::borrow::Cow;
+use std::slice;
+use std::sync::Arc;
 
 use mail_parser::{
     AddressList, HeaderName, MessageParser, MessagePart, PartId, PartKind, PartRole, TextList,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::text;
 
@@ -113,16 +116,223 @@ pub struct Parsed {
     pub unsubscribe: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
     /// Its place among the message's attachments ([`attachment_parts`]).
     pub index: u32,
     /// A file name safe to save under.
     pub name: String,
     pub mime: String,
-    /// Decoded, measured without decoding it: a malformed encoding can
-    /// make it a little off.
+    /// Decoded size (estimated for malformed encodings), or the server's
+    /// encoded size if the attachment has not been downloaded yet.
     pub size: usize,
+    pub remote: Option<PartRef>,
+}
+
+pub(crate) const MAX_PARTIAL_PARTS: usize = 64;
+pub(crate) const MAX_PARTIAL_DEPTH: usize = 8;
+pub(crate) const MAX_PARTIAL_HEADER: usize = 32 << 10;
+pub(crate) const MAX_PARTIAL_BODY: usize = 8 << 20;
+pub(crate) const MAX_PARTIAL_RAW: usize =
+    MAX_PARTIAL_BODY + MAX_PARTIAL_PARTS * (MAX_PARTIAL_HEADER + 160);
+
+/// An IMAP leaf, tied to the exact MIME headers used to show it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartRef {
+    pub section: Vec<u32>,
+    pub octets: u32,
+    pub downloaded: bool,
+    pub mime_sha256: [u8; 32],
+}
+
+impl PartRef {
+    pub(crate) fn valid(&self) -> bool {
+        !self.section.is_empty()
+            && self.section.len() <= MAX_PARTIAL_DEPTH
+            && self
+                .section
+                .iter()
+                .all(|&number| (1..=MAX_PARTIAL_PARTS as u32).contains(&number))
+            && (self.downloaded || self.octets != 0)
+    }
+}
+
+/// A compact multipart message with some attachment bodies left empty.
+/// Every leaf's header offset, in document order, identifies its IMAP part.
+/// This is never the downloaded message, even when it has all reader text.
+#[derive(Clone, Debug)]
+pub struct Partial {
+    pub raw: Vec<u8>,
+    pub parts: Vec<(u32, PartRef)>,
+    pub parsed: Arc<Parsed>,
+}
+
+impl Partial {
+    pub fn new(raw: Vec<u8>, parts: Vec<(u32, PartRef)>) -> Option<Self> {
+        if raw.len() > MAX_PARTIAL_RAW
+            || parts.len() >= MAX_PARTIAL_PARTS
+            || parts.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return None;
+        }
+        let parsed = read(&raw, |message| {
+            let root = message.root_part();
+            if !root.is_multipart() {
+                return None;
+            }
+            let mut refs = parts.iter();
+            let mut nodes = 0;
+            let mut eager_bytes = 0;
+            check_projection(
+                root,
+                &mut Vec::new(),
+                &mut refs,
+                &mut nodes,
+                &mut eager_bytes,
+            )?;
+            if refs.next().is_some() {
+                return None;
+            }
+            let by_offset = |part: &MessagePart| {
+                parts
+                    .binary_search_by_key(&part.offset_header(), |&(offset, _)| offset)
+                    .ok()
+                    .map(|i| &parts[i].1)
+            };
+            let body = bodies(message);
+            if !body
+                .iter()
+                .flatten()
+                .all(|p| by_offset(p).is_some_and(|reference| reference.downloaded))
+            {
+                return None;
+            }
+            let listed: Vec<_> = attachment_parts(message, &body).collect();
+            let mut parsed = parsed(message, &body, &listed, false);
+            let mut omitted = 0;
+            for (attachment, part) in parsed.attachments.iter_mut().zip(listed) {
+                let reference = by_offset(&part)?;
+                if !reference.downloaded {
+                    // A small calendar part, including an .ics file with an
+                    // opaque MIME type, may contribute invitation details.
+                    if is_calendar(&part)
+                        && reference.octets as usize <= 2 * crate::calendar::MAX_PART_BYTES
+                    {
+                        return None;
+                    }
+                    omitted += 1;
+                    attachment.size = reference.octets as usize;
+                }
+                attachment.remote = Some(reference.clone());
+            }
+            // Every hole must be somewhere the user can download it.
+            (omitted > 0 && omitted == parts.iter().filter(|(_, p)| !p.downloaded).count())
+                .then_some(parsed)
+        })
+        .flatten()??;
+        Some(Self {
+            raw,
+            parts,
+            parsed: Arc::new(parsed),
+        })
+    }
+}
+
+fn check_projection(
+    part: MessagePart<'_>,
+    section: &mut Vec<u32>,
+    refs: &mut slice::Iter<'_, (u32, PartRef)>,
+    nodes: &mut usize,
+    eager_bytes: &mut usize,
+) -> Option<()> {
+    *nodes += 1;
+    if *nodes > MAX_PARTIAL_PARTS
+        || part.has_problems()
+        || part.raw_headers().len() > MAX_PARTIAL_HEADER
+    {
+        return None;
+    }
+    let content = part.content_type();
+    if part.is_multipart() {
+        let boundary = part.boundary()?;
+        if section.len() >= MAX_PARTIAL_DEPTH
+            || !supported_multipart(content?.subtype()?)
+            || !valid_boundary(boundary)
+            || part.children().len() == 0
+        {
+            return None;
+        }
+        for (i, child) in part.children().enumerate() {
+            section.push(i as u32 + 1);
+            check_projection(child, section, refs, nodes, eager_bytes)?;
+            section.pop();
+        }
+    } else {
+        let (offset, reference) = refs.next()?;
+        let expected_length = if reference.downloaded {
+            reference.octets as usize
+        } else {
+            0
+        };
+        if !reference.valid()
+            || *offset != part.offset_header()
+            || reference.section.as_slice() != section.as_slice()
+            || part.is_message()
+            || content.is_some_and(|ct| {
+                ct.ctype().eq_ignore_ascii_case("message")
+                    || ct.ctype().eq_ignore_ascii_case("multipart")
+            })
+            || reference.mime_sha256 != mime_digest(part.raw_headers())
+            || part.raw_body().len() != expected_length
+        {
+            return None;
+        }
+        if reference.downloaded {
+            *eager_bytes += reference.octets as usize;
+            if *eager_bytes > MAX_PARTIAL_BODY {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+pub(crate) fn supported_multipart(subtype: &str) -> bool {
+    ["mixed", "alternative", "related"]
+        .iter()
+        .any(|known| subtype.eq_ignore_ascii_case(known))
+}
+
+/// RFC 2046's bchars; a boundary cannot introduce a new header or line.
+pub(crate) fn valid_boundary(boundary: &str) -> bool {
+    !boundary.is_empty()
+        && boundary.len() <= 70
+        && !boundary.ends_with(' ')
+        && boundary
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(&b))
+}
+
+pub(crate) fn mime_digest(raw: &[u8]) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, raw)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 is 32 bytes")
+}
+
+/// Interpret a fetched HEADER or .MIME as a header block, not a message
+/// body. Header fields and their decoding come from the normal parser.
+pub(crate) fn part_header<T>(raw: &[u8], f: impl FnOnce(MessagePart<'_>) -> T) -> Option<T> {
+    if raw.len() > MAX_PARTIAL_HEADER || !(raw.ends_with(b"\r\n\r\n") || raw.ends_with(b"\n\n")) {
+        return None;
+    }
+    read_headers(raw, |message| {
+        let part = message.root_part();
+        (!part.has_problems() && part.raw_headers() == raw).then(|| f(part))
+    })
+    .flatten()
+    .flatten()
 }
 
 fn addrs(address: Option<AddressList>) -> Vec<Addr> {
@@ -246,6 +456,7 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
 }
 
 /// An attachment taken out of its message, as it's listed.
+#[derive(Clone, Debug)]
 pub struct File {
     pub name: String,
     pub mime: String,
@@ -367,6 +578,7 @@ fn parsed(
                 name: part_name(part, &mime),
                 mime: text::one_line(&mime, 100),
                 size: part.decoded_len(),
+                remote: None,
             }
         })
         .collect();
@@ -661,6 +873,24 @@ fn part_name(part: &MessagePart, mime: &str) -> String {
     safe_file_name(&name)
 }
 
+pub(crate) fn attachment_header(
+    raw: &[u8],
+    reference: &PartRef,
+    name: &str,
+) -> Option<(String, mail_parser::Encoding)> {
+    if mime_digest(raw) != reference.mime_sha256 {
+        return None;
+    }
+    part_header(raw, |part| {
+        let mime = mime_of(&part);
+        (!mime.starts_with("multipart/")
+            && !mime.starts_with("message/")
+            && part_name(&part, &mime) == name)
+            .then(|| (text::one_line(&mime, 100), part.encoding()))
+    })
+    .flatten()
+}
+
 /// An attachment as listed ([`parsed`] names it the same way), saved and
 /// opened.
 fn extract(part: &MessagePart) -> File {
@@ -675,22 +905,22 @@ fn extract(part: &MessagePart) -> File {
 /// Takes the listed attachments in message order from one parse, checking
 /// each name before decoding it. `take` saves or copies one file at a time,
 /// so opening a batch needn't hold every decoded file in memory.
-pub fn attachments<T>(
+pub fn attachments<'a, T>(
     raw: &[u8],
-    listed: &[(u32, String)],
+    listed: impl IntoIterator<Item = (u32, &'a str)>,
     mut take: impl FnMut(&str, &[u8]) -> Result<T, String>,
 ) -> Result<Vec<T>, String> {
     read(raw, |message| {
         let body = bodies(message);
         let mut parts = attachment_parts(message, &body).enumerate();
         listed
-            .iter()
+            .into_iter()
             .map(|(index, listed)| {
                 let (_, part) = parts
-                    .find(|(i, _)| *i == *index as usize)
+                    .find(|(i, _)| *i == index as usize)
                     .ok_or("That attachment can't be read")?;
                 let name = part_name(&part, &mime_of(&part));
-                if name != *listed {
+                if name != listed {
                     return Err(
                         "The message changed since its files were listed: open it again".into(),
                     );
@@ -1846,7 +2076,7 @@ see https://example.com/menu. Thanks!\r\n\
 --b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\nPGh0bWw+PC9odG1sPg==\r\n--b--\r\n";
         let listed = parse(raw).unwrap().attachments[0].name.clone();
         assert_eq!(listed, "image.png");
-        attachments(raw, &[(0, listed)], |name, bytes| {
+        attachments(raw, [(0, listed.as_str())], |name, bytes| {
             assert_eq!(name, "image.png");
             assert_eq!(bytes, b"<html></html>");
             Ok(())
@@ -1991,7 +2221,7 @@ Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\naGVs
         assert_eq!(a.name, "invoicefdp.exe");
         assert_eq!(a.mime, "application/pdf");
         assert_eq!(a.size, 5);
-        attachments(raw, &[(0, a.name.clone())], |name, bytes| {
+        attachments(raw, [(0, a.name.as_str())], |name, bytes| {
             assert_eq!((name, bytes), ("invoicefdp.exe", &b"hello"[..]));
             Ok(())
         })
@@ -2272,12 +2502,11 @@ Content-Transfer-Encoding: 8bit\r\n\r\n{calendar}\r\n--mixed--\r\n"
         assert_eq!(plain_text(&parsed), "plain version");
         assert_eq!(preview_of(raw), "plain version");
         assert_eq!(parsed.attachments.len(), 2);
-        let listed: Vec<_> = parsed
+        let listed = parsed
             .attachments
             .iter()
-            .map(|p| (p.index, p.name.clone()))
-            .collect();
-        let files = attachments(raw, &listed, |name, bytes| {
+            .map(|p| (p.index, p.name.as_str()));
+        let files = attachments(raw, listed, |name, bytes| {
             assert_eq!(bytes, calendar.as_bytes());
             Ok(name.to_owned())
         })
@@ -2471,7 +2700,7 @@ Content-Disposition: attachment; filename=\"print.html\"\r\n\r\n<p>print</p>\r\n
         assert_eq!(parsed.attachments[0].mime, "text/html");
         attachments(
             raw,
-            &[(0, parsed.attachments[0].name.clone())],
+            [(0, parsed.attachments[0].name.as_str())],
             |_, bytes| {
                 assert_eq!(bytes, b"<p>two</p>");
                 Ok(())
@@ -2636,7 +2865,7 @@ Content-Type: multipart/alternative; boundary=x\r\n\r\n\
             if let Some(Some(last)) = all.get(parsed.attachments.len().wrapping_sub(1)) {
                 let index = parsed.attachments.len() as u32 - 1;
                 assert_eq!(
-                    attachments(raw, &[(index, last.name.clone())], |name, bytes| {
+                    attachments(raw, [(index, last.name.as_str())], |name, bytes| {
                         Ok((name.to_owned(), bytes.to_vec()))
                     }),
                     Ok(vec![(last.name.clone(), last.bytes.clone())])

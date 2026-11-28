@@ -11,6 +11,8 @@ mod demo;
 mod file_picker;
 mod icons;
 mod imap;
+mod imap_mime;
+mod imap_timing;
 #[cfg(test)]
 mod live;
 mod mail;
@@ -330,6 +332,8 @@ or printed by a command of yours: see the README).
 Environment:
   TM_DATA_DIR     keep both in this folder instead (a full path)
   XDG_CONFIG_HOME use this base for Unix config and macOS data (default ~/.config)
+  TM_IMAP_TIMINGS=1
+                log IMAP latency and byte counts to redirected stderr
   TM_ICONS      which icons: auto, nerd (Nerd Font) or plain
                 (also `icons` in settings.toml)
 ",

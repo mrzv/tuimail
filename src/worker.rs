@@ -1,6 +1,6 @@
-//! One background task per account: it holds the connection, runs what
-//! the app asks for in order, and reports back as events. The app keeps the
-//! cache; a worker never touches it. For IMAP accounts whose server can, a
+//! One background task per account: it holds the connection, runs changes
+//! in order, and gives explicit opens priority over background reads. The
+//! app keeps the cache; a worker never touches it. For IMAP accounts whose server can, a
 //! second connection waits on the inbox (IDLE) so new mail shows at once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,8 +16,8 @@ use crate::account::{Account, Protocol};
 use crate::imap::{self, Caps, FlagKind, Session};
 use crate::net::Endpoint;
 use crate::secrets::{Credentials, NeedPassword};
-use crate::store::{Flags, Folder, Gmail, Header, Known};
-use crate::{pop3, smtp, tags, text};
+use crate::store::{Flags, Folder, Gmail, Header, Known, Role};
+use crate::{imap_mime, imap_timing, mail, pop3, smtp, tags, text};
 
 /// After a failed connection, requests fail at once for this long instead
 /// of each waiting to time out.
@@ -26,6 +26,8 @@ const OFFLINE_FOR: Duration = Duration::from_secs(20);
 const IDLE_FOR: Duration = Duration::from_secs(25 * 60);
 /// The most folders whose counts are asked for.
 const MAX_STATUS: usize = 200;
+/// Only probe the part tree when skipping attachment bytes could matter.
+const PARTIAL_MIN: u32 = 512 << 10;
 /// The most new POP3 messages downloaded in one check.
 const POP_BATCH: usize = 300;
 /// The biggest POP3 message downloaded.
@@ -39,7 +41,7 @@ pub const CONVERSATION_BATCH: usize = 32;
 /// What the app asks an account's worker to do.
 #[derive(Clone, Debug)]
 pub enum Request {
-    /// List the folders and their counts.
+    /// List the folders, then collect counts after syncing the inbox.
     Folders,
     /// Fetch what's new in a folder, and its flags since `known`.
     Sync {
@@ -61,6 +63,23 @@ pub enum Request {
         folder: String,
         uid: u32,
         uidvalidity: u32,
+        size: u32,
+        partial: bool,
+        urgent: bool,
+        queued: Option<Instant>,
+    },
+    /// Promote an existing download, without asking for it a second time.
+    PrioritizeBody {
+        folder: String,
+        uid: u32,
+        uidvalidity: u32,
+    },
+    Files {
+        id: u64,
+        folder: String,
+        uid: u32,
+        uidvalidity: u32,
+        files: Vec<(String, mail::PartRef)>,
     },
     Flag {
         folder: String,
@@ -162,7 +181,8 @@ impl Request {
             Request::Folders => "listing folders",
             Request::Sync { .. } => "checking for mail",
             Request::Older { .. } => "fetching older mail",
-            Request::Body { .. } => "downloading the message",
+            Request::Body { .. } | Request::PrioritizeBody { .. } => "downloading the message",
+            Request::Files { .. } => "downloading attachments",
             Request::Flag { .. } => "changing flags",
             Request::Tag { .. } => "tagging",
             Request::Move { .. } | Request::MoveBack { .. } => "moving mail",
@@ -231,11 +251,23 @@ pub struct Conversations {
     pub thread_ids: Vec<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub enum Download {
+    Full(Vec<u8>),
+    Partial(mail::Partial),
+}
+
 /// What a worker tells the app.
 #[derive(Clone, Debug)]
 pub enum Event {
     State(State),
     Folders(Vec<Folder>),
+    FoldersRefused(String),
+    Counts {
+        folder: String,
+        unread: u32,
+        total: u32,
+    },
     Synced(Synced),
     Older {
         folder: String,
@@ -245,7 +277,13 @@ pub enum Event {
     Body {
         folder: String,
         uid: u32,
-        result: Result<Option<Vec<u8>>, String>,
+        uidvalidity: u32,
+        partial: bool,
+        result: Result<Option<Download>, String>,
+    },
+    Files {
+        id: u64,
+        result: Result<Vec<mail::File>, String>,
     },
     Searched {
         folder: String,
@@ -383,20 +421,26 @@ fn login_failed(error: &anyhow::Error) -> State {
 
 /// Logs in with the account's password; a refused one is forgotten.
 async fn imap_login(creds: &Credentials, endpoint: &Endpoint) -> Result<(Session, Caps)> {
-    let secret = creds.get().await?;
-    let account = creds.account();
-    match imap::connect(endpoint, account.username(), secret.expose(), account.auth).await {
-        Ok(session) => {
-            let _ = creds.remember(&secret).await;
-            Ok(session)
-        }
-        Err(e) => {
-            if e.downcast_ref::<imap::Refused>().is_some() {
-                creds.refused(&secret).await;
+    let start = imap_timing::start();
+    let connected = async {
+        let secret = creds.get().await?;
+        let account = creds.account();
+        match imap::connect(endpoint, account.username(), secret.expose(), account.auth).await {
+            Ok(session) => {
+                let _ = creds.remember(&secret).await;
+                Ok(session)
             }
-            Err(e)
+            Err(e) => {
+                if e.downcast_ref::<imap::Refused>().is_some() {
+                    creds.refused(&secret).await;
+                }
+                Err(e)
+            }
         }
     }
+    .await;
+    imap_timing::finish(start, "connect", None);
+    connected
 }
 
 /// How many times a held change may break a connection that was up before
@@ -405,48 +449,143 @@ async fn imap_login(creds: &Credentials, endpoint: &Endpoint) -> Result<(Session
 /// hold every later change, and the account, offline until tuimail quits.
 const MAX_TRIES: u32 = 3;
 
-/// Requests waiting together, with repeats of the same check dropped
-/// (the last one's `known` wins).
-fn batch(first: Request, rx: &mut UnboundedReceiver<Request>) -> VecDeque<Request> {
-    let mut all = vec![first];
+/// Requests waiting together, so POP3 runs only the last check of a batch.
+fn pop_batch(first: Request, rx: &mut UnboundedReceiver<Request>) -> VecDeque<Request> {
+    let mut out = VecDeque::new();
+    enqueue(&mut out, first);
     while let Ok(next) = rx.try_recv() {
-        all.push(next);
-    }
-    let mut out: VecDeque<Request> = VecDeque::new();
-    for request in all {
-        // A download already asked for answers everyone waiting for it.
-        let downloading = out.iter().any(|r| match (r, &request) {
-            (
-                Request::Body {
-                    folder: a,
-                    uid: x,
-                    uidvalidity: v,
-                },
-                Request::Body {
-                    folder: b,
-                    uid: y,
-                    uidvalidity: w,
-                },
-            ) => a == b && x == y && v == w,
-            _ => false,
-        });
-        if downloading {
-            continue;
-        }
-        let duplicate = out.iter().position(|r| match (r, &request) {
-            (Request::Folders, Request::Folders) => true,
-            (Request::Sync { folder: a, .. }, Request::Sync { folder: b, .. }) => a == b,
-            (Request::Pop { .. }, Request::Pop { .. }) => true,
-            _ => false,
-        });
-        // The later one goes last, so a change asked for in between (a
-        // flag set) is made before the check reads the flags back.
-        if let Some(i) = duplicate {
-            out.remove(i);
-        }
-        out.push_back(request);
+        enqueue(&mut out, next);
     }
     out
+}
+
+fn enqueue(out: &mut VecDeque<Request>, request: Request) {
+    if let Request::PrioritizeBody {
+        folder,
+        uid,
+        uidvalidity,
+    } = request
+    {
+        let mut i = 0;
+        for _ in 0..out.len() {
+            if matches!(&out[i], Request::Body {
+                folder: name, uid: u, uidvalidity: v, urgent: false, ..
+            } if *name == folder && *u == uid && *v == uidvalidity)
+            {
+                let mut body = out.remove(i).unwrap();
+                if let Request::Body { urgent, .. } = &mut body {
+                    *urgent = true;
+                }
+                // A promotion belongs at the moment the user opened the
+                // mail: it cannot jump a mutation queued before that.
+                out.push_back(body);
+            } else {
+                i += 1;
+            }
+        }
+        return;
+    }
+    if let Request::Body {
+        folder,
+        uid,
+        uidvalidity,
+        partial,
+        size,
+        urgent,
+        ..
+    } = &request
+        && let Some(i) = out.iter().position(|r| {
+            matches!(r, Request::Body {
+                folder: name, uid: u, uidvalidity: v, partial: p, ..
+            } if name == folder && u == uid && v == uidvalidity && p == partial)
+        })
+    {
+        if let Request::Body {
+            size: known,
+            urgent: pending,
+            ..
+        } = &mut out[i]
+        {
+            if *known == 0 {
+                *known = *size;
+            }
+            if *urgent && !*pending {
+                *pending = true;
+                let body = out.remove(i).unwrap();
+                out.push_back(body);
+            }
+        }
+        return;
+    }
+    let duplicate = out.iter().position(|r| match (r, &request) {
+        (Request::Folders, Request::Folders) => true,
+        (Request::Sync { folder: a, .. }, Request::Sync { folder: b, .. }) => a == b,
+        (Request::Pop { .. }, Request::Pop { .. }) => true,
+        _ => false,
+    });
+    // The later check goes last: a flag set in between is made before
+    // the check reads the flags back.
+    if let Some(i) = duplicate {
+        out.remove(i);
+    }
+    out.push_back(request);
+}
+
+fn next_imap(requests: &VecDeque<Request>) -> usize {
+    let mut change = None;
+    for (i, request) in requests.iter().enumerate() {
+        if matches!(
+            request,
+            Request::Files { .. } | Request::Body { urgent: true, .. }
+        ) {
+            return change.unwrap_or(i);
+        }
+        if change.is_none() && (request.changes() || matches!(request, Request::Append { .. })) {
+            change = Some(i);
+        }
+    }
+    0
+}
+
+#[derive(Default)]
+struct FolderCounts {
+    inbox: Option<String>,
+    pending: VecDeque<String>,
+}
+
+impl FolderCounts {
+    fn after_list(&mut self, folders: &[Folder]) {
+        self.inbox = Some(
+            folders
+                .iter()
+                .find(|folder| folder.role == Some(Role::Inbox))
+                .map_or_else(|| "INBOX".to_string(), |folder| folder.name.clone()),
+        );
+        self.pending = folders
+            .iter()
+            .filter(|folder| folder.selectable)
+            .take(MAX_STATUS)
+            .map(|folder| folder.name.clone())
+            .collect();
+    }
+
+    fn syncing(&mut self, folder: &str) {
+        if self.inbox.as_deref() == Some(folder) {
+            self.inbox = None;
+        }
+    }
+
+    fn synced(&mut self, folder: &str) {
+        self.pending.retain(|name| name != folder);
+    }
+
+    fn next(&mut self) -> Option<String> {
+        if self.inbox.is_none() {
+            self.pending.pop_front()
+        } else {
+            None
+        }
+    }
 }
 
 /// Whether an error left the connection unusable (as opposed to the server
@@ -487,15 +626,28 @@ fn report_failure(request: &Request, error: String, sink: &Sink) {
             id: *id,
             error: Some(error),
         }),
-        Request::Body { folder, uid, .. } => sink(Event::Body {
+        Request::Body {
+            folder,
+            uid,
+            uidvalidity,
+            partial,
+            ..
+        } => sink(Event::Body {
             folder: folder.clone(),
             uid: *uid,
+            uidvalidity: *uidvalidity,
+            partial: *partial,
             result: Err(if error == "offline" {
                 "Not downloaded: the account is offline".into()
             } else {
                 error
             }),
         }),
+        Request::Files { id, .. } => sink(Event::Files {
+            id: *id,
+            result: Err(error),
+        }),
+        Request::PrioritizeBody { .. } => {}
         Request::Conversations {
             folder,
             uidvalidity,
@@ -526,6 +678,8 @@ async fn run_imap(
     // Changes asked for while the connection was down, in order, and how
     // many times each broke a connection that was up.
     let mut held: VecDeque<(Request, u32)> = VecDeque::new();
+    let mut requests = VecDeque::new();
+    let mut counts = FolderCounts::default();
     let mut waiting = 0;
     let mut report = |n: usize, sink: &Sink| {
         if n != waiting {
@@ -534,97 +688,150 @@ async fn run_imap(
         }
     };
     loop {
-        let fresh = if held.is_empty() {
-            match rx.recv().await {
-                Some(first) => batch(first, &mut rx),
-                None => break,
+        while let Ok(request) = rx.try_recv() {
+            enqueue(&mut requests, request);
+        }
+        let queued = requests.iter().filter(|r| r.changes()).count();
+        report(held.len() + queued, &sink);
+        let mut retry = false;
+        if requests.is_empty() && (session.is_none() || held.is_empty()) {
+            if rx.is_closed() {
+                break;
             }
-        } else {
-            tokio::select! {
-                next = rx.recv() => match next {
-                    Some(first) => batch(first, &mut rx),
-                    None => break,
-                },
-                _ = tokio::time::sleep(RETRY_EVERY) => VecDeque::new(),
+            if let Some((s, _)) = session.as_mut()
+                && let Some(folder) = counts.next()
+            {
+                match imap::status(s, &folder).await {
+                    Ok((unread, total)) => sink(Event::Counts {
+                        folder,
+                        unread,
+                        total,
+                    }),
+                    Err(e) if broken(&e) => {
+                        session = None;
+                        counts = FolderCounts::default();
+                        failed_at = Some(Instant::now());
+                        sink(Event::State(login_failed(&e)));
+                    }
+                    Err(_) => {}
+                }
+                continue;
             }
-        };
-        // What was held goes first, in the order it was asked for.
-        let mut requests: VecDeque<(Request, u32)> = std::mem::take(&mut held);
-        requests.extend(fresh.into_iter().map(|r| (r, 0)));
-        while let Some((request, tries)) = requests.pop_front() {
-            let queued = requests.iter().filter(|(r, _)| r.changes()).count();
-            report(held.len() + queued + usize::from(request.changes()), &sink);
-            if session.is_none() {
-                let recently = failed_at.is_some_and(|at| at.elapsed() < OFFLINE_FOR);
-                let retrying = !held.is_empty();
-                if (recently || retrying) && !matches!(request, Request::Folders) {
+            let request = if held.is_empty() {
+                rx.recv().await
+            } else {
+                tokio::select! {
+                    next = rx.recv() => next,
+                    _ = tokio::time::sleep(RETRY_EVERY) => {
+                        retry = true;
+                        None
+                    }
+                }
+            };
+            if let Some(request) = request {
+                enqueue(&mut requests, request);
+            } else if !retry {
+                break;
+            }
+            if !retry {
+                continue;
+            }
+        }
+
+        let next = next_imap(&requests);
+        if session.is_none() {
+            let refresh = requests.iter().position(|r| matches!(r, Request::Folders));
+            let recently = failed_at.is_some_and(|at| at.elapsed() < OFFLINE_FOR);
+            if recently && refresh.is_none() && !retry {
+                if let Some(request) = requests.remove(next) {
                     if request.changes() {
-                        held.push_back((request, tries));
+                        held.push_back((request, 0));
                     } else {
                         report_failure(&request, "offline".into(), &sink);
                     }
-                    continue;
                 }
-                sink(Event::State(State::Connecting));
-                match imap_login(&creds, &endpoints.incoming).await {
-                    Ok(s) => {
-                        let idle = s.1.idle;
-                        session = Some(s);
-                        failed_at = None;
-                        sink(Event::State(State::Online));
-                        // Back (for a check): what was held goes before
-                        // anything newer, in order.
-                        while let Some(h) = held.pop_back() {
-                            requests.push_front(h);
-                        }
-                        if idle && !watcher.running() {
-                            watcher.0 = Some(tokio::spawn(watch_inbox(
-                                creds.clone(),
-                                endpoints.incoming.clone(),
-                                sink.clone(),
-                            )));
-                        }
+                continue;
+            }
+            sink(Event::State(State::Connecting));
+            match imap_login(&creds, &endpoints.incoming).await {
+                Ok(s) => {
+                    if s.1.idle && !watcher.running() {
+                        watcher.0 = Some(tokio::spawn(watch_inbox(
+                            creds.clone(),
+                            endpoints.incoming.clone(),
+                            sink.clone(),
+                        )));
                     }
-                    Err(e) => {
-                        failed_at = Some(Instant::now());
-                        sink(Event::State(login_failed(&e)));
+                    session = Some(s);
+                    failed_at = None;
+                    sink(Event::State(State::Online));
+                }
+                Err(e) => {
+                    failed_at = Some(Instant::now());
+                    sink(Event::State(login_failed(&e)));
+                    let request = requests.remove(next);
+                    // One connection attempt serves both the priority download
+                    // and the refresh that allowed it through the cooldown.
+                    if let Some(i) = refresh.filter(|&i| i != next)
+                        && let Some(refresh) = requests.remove(i - usize::from(i > next))
+                    {
+                        report_failure(&refresh, "offline".into(), &sink);
+                    }
+                    if let Some(request) = request {
                         if request.changes() {
-                            held.push_back((request, tries));
+                            held.push_back((request, 0));
                         } else {
                             report_failure(&request, "offline".into(), &sink);
                         }
-                        continue;
                     }
                 }
             }
-            let Some((s, caps)) = session.as_mut() else {
-                continue;
-            };
-            if let Err(e) = handle_imap(request.clone(), s, *caps, &creds, &sink).await {
-                let lost = broken(&e);
-                let error = text::one_line(&format!("{e:#}"), 300);
-                if lost && request.changes() && tries + 1 < MAX_TRIES {
-                    // Made again once the connection is back.
-                    held.push_back((request, tries + 1));
-                } else if lost && request.changes() {
-                    // It fails each time: given up, not left holding
-                    // every later change (and the account) up for good.
-                    report_failure(
-                        &request,
-                        format!("{error} (each of {MAX_TRIES} tries: given up)"),
-                        &sink,
-                    );
+            // Drain requests that arrived while connecting; held writes
+            // always replay before any newer work, even explicit opens.
+            continue;
+        }
+
+        let Some((mut request, tries)) = held
+            .pop_front()
+            .or_else(|| requests.remove(next).map(|request| (request, 0)))
+        else {
+            continue;
+        };
+        if let Err(e) = handle_imap(
+            &mut request,
+            &mut session,
+            &creds,
+            &endpoints.incoming,
+            &sink,
+            &mut counts,
+        )
+        .await
+        {
+            let lost = broken(&e);
+            let error = text::one_line(&format!("{e:#}"), 300);
+            if lost && request.changes() && tries + 1 < MAX_TRIES {
+                held.push_front((request, tries + 1));
+            } else if lost && request.changes() {
+                report_failure(
+                    &request,
+                    format!("{error} (each of {MAX_TRIES} tries: given up)"),
+                    &sink,
+                );
+            } else {
+                report_failure(&request, error.clone(), &sink);
+            }
+            if lost {
+                let state = if session.is_none() {
+                    login_failed(&e)
                 } else {
-                    report_failure(&request, error.clone(), &sink);
-                }
-                if lost {
-                    session = None;
-                    failed_at = Some(Instant::now());
-                    sink(Event::State(State::Offline(error)));
-                }
+                    State::Offline(error)
+                };
+                session = None;
+                counts = FolderCounts::default();
+                failed_at = Some(Instant::now());
+                sink(Event::State(state));
             }
         }
-        report(held.len(), &sink);
     }
     if let Some((s, _)) = session {
         imap::logout(s).await;
@@ -636,14 +843,19 @@ async fn run_imap(
 /// messages under those UIDs: that's refused, not done.
 async fn select_same(s: &mut Session, folder: &str, uidvalidity: u32) -> Result<imap::Selected> {
     let selected = imap::select(s, folder).await?;
-    if uidvalidity != 0 && selected.uidvalidity != uidvalidity {
+    require_validity(folder, uidvalidity, selected.uidvalidity)?;
+    Ok(selected)
+}
+
+fn require_validity(folder: &str, requested: u32, found: u32) -> Result<()> {
+    if requested != 0 && found != requested {
         return Err(imap::Said(format!(
             "{} was made again on the server, so its messages changed: nothing was done",
             shown_folder(folder)
         ))
         .into());
     }
-    Ok(selected)
+    Ok(())
 }
 
 /// A folder's name as an error message shows it.
@@ -655,29 +867,51 @@ fn shown_folder(folder: &str) -> String {
 }
 
 async fn handle_imap(
-    request: Request,
-    s: &mut Session,
-    caps: Caps,
+    request: &mut Request,
+    session: &mut Option<(Session, Caps)>,
     creds: &Credentials,
+    incoming: &Endpoint,
     sink: &Sink,
+    counts: &mut FolderCounts,
 ) -> Result<()> {
-    match request {
-        Request::Folders => {
-            let mut folders = imap::folders(s, creds.account()).await?;
-            for f in folders.iter_mut().filter(|f| f.selectable).take(MAX_STATUS) {
-                if let Ok((unread, total)) = imap::status(s, &f.name).await {
-                    f.unread = unread;
-                    f.total = total;
-                }
+    let (s, caps) = session.as_mut().expect("connected IMAP worker");
+    let caps = *caps;
+    // Other async-imap calls don't expose every tagged response code.
+    // Only carry a selection across exchanges where we inspect them all.
+    if !matches!(
+        request,
+        Request::Body { .. }
+            | Request::Files { .. }
+            | Request::Flag {
+                flag: FlagKind::Seen,
+                ..
             }
-            sink(Event::Folders(folders));
-        }
+    ) {
+        imap::forget_selection(s);
+    }
+    use std::mem::take;
+    match request {
+        Request::Folders => match imap::folders(s, creds.account()).await {
+            Ok(folders) => {
+                counts.after_list(&folders);
+                sink(Event::Folders(folders));
+            }
+            Err(e) if !broken(&e) => {
+                sink(Event::FoldersRefused(text::one_line(
+                    &format!("{e:#}"),
+                    300,
+                )));
+            }
+            Err(e) => return Err(e),
+        },
         Request::Sync {
             folder,
             known,
             count,
         } => {
-            let synced = sync(s, &folder, known, count).await?;
+            counts.syncing(folder);
+            let synced = sync(s, folder, *known, *count).await?;
+            counts.synced(folder);
             sink(Event::Synced(synced));
         }
         Request::Older {
@@ -685,19 +919,19 @@ async fn handle_imap(
             below,
             count,
         } => {
-            imap::select(s, &folder).await?;
-            let mut uids = if below > 1 {
-                imap::search(s, &format!("UID 1:{}", below - 1)).await?
+            imap::select(s, folder).await?;
+            let mut uids = if *below > 1 {
+                imap::search(s, &format!("UID 1:{}", *below - 1)).await?
             } else {
                 Vec::new()
             };
-            uids.retain(|&u| u < below);
-            let keep = uids.len().saturating_sub(count as usize);
+            uids.retain(|&u| u < *below);
+            let keep = uids.len().saturating_sub(*count as usize);
             let uids = &uids[keep..];
             let headers = imap::headers(s, uids).await?;
             let low = uids.first().copied().unwrap_or(1);
             sink(Event::Older {
-                folder,
+                folder: take(folder),
                 headers,
                 low,
             });
@@ -706,24 +940,74 @@ async fn handle_imap(
             folder,
             uid,
             uidvalidity,
+            size,
+            partial,
+            queued,
+            ..
         } => {
-            let result = match select_same(s, &folder, uidvalidity).await {
-                Ok(_) => imap::body(s, uid).await,
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(raw) => sink(Event::Body {
-                    folder,
-                    uid,
-                    result: Ok(raw),
-                }),
-                Err(e) if broken(&e) => return Err(e),
-                Err(e) => sink(Event::Body {
-                    folder,
-                    uid,
-                    result: Err(text::one_line(&format!("{e:#}"), 300)),
-                }),
+            imap_timing::finish(*queued, "queue", None);
+            if *uidvalidity == 0 {
+                return Err(imap::Said(
+                    "Refresh the folder before downloading this message".into(),
+                )
+                .into());
             }
+            let selected = imap::select_read(s, folder, *uidvalidity).await?;
+            require_validity(folder, *uidvalidity, selected)?;
+            let attempted_partial = *partial && (*size == 0 || *size >= PARTIAL_MIN);
+            let projected = if attempted_partial {
+                match imap_mime::read(s, *uid).await {
+                    Err(error) if error.is::<imap::FramingError>() => {
+                        // A guarded projection may end mid-response. Do
+                        // not reuse that connection for the full fetch.
+                        *session = None;
+                        *session = Some(imap_login(creds, incoming).await?);
+                        None
+                    }
+                    result => result?.map(Download::Partial),
+                }
+            } else {
+                None
+            };
+            let body = match projected {
+                Some(body) => Some(body),
+                None => {
+                    let s = &mut session.as_mut().expect("connected IMAP worker").0;
+                    // A refused projection can invalidate the selection.
+                    if attempted_partial {
+                        let current = imap::select_read(s, folder, *uidvalidity).await?;
+                        require_validity(folder, selected, current)?;
+                    }
+                    imap::body(s, *uid, *size).await?.map(Download::Full)
+                }
+            };
+            sink(Event::Body {
+                folder: take(folder),
+                uid: *uid,
+                uidvalidity: selected,
+                partial: *partial,
+                result: Ok(body),
+            });
+        }
+        Request::Files {
+            id,
+            folder,
+            uid,
+            uidvalidity,
+            files,
+        } => {
+            if *uidvalidity == 0 {
+                return Err(
+                    imap::Said("attachments need a known mailbox UIDVALIDITY".into()).into(),
+                );
+            }
+            let selected = imap::select_read(s, folder, *uidvalidity).await?;
+            require_validity(folder, *uidvalidity, selected)?;
+            let files = imap_mime::attachments(s, *uid, files).await?;
+            sink(Event::Files {
+                id: *id,
+                result: Ok(files),
+            });
         }
         Request::Flag {
             folder,
@@ -732,8 +1016,13 @@ async fn handle_imap(
             on,
             uidvalidity,
         } => {
-            select_same(s, &folder, uidvalidity).await?;
-            imap::set_flag(s, &uids, flag, on).await?;
+            if *flag == FlagKind::Seen {
+                let selected = imap::select_read(s, folder, *uidvalidity).await?;
+                require_validity(folder, *uidvalidity, selected)?;
+            } else {
+                select_same(s, folder, *uidvalidity).await?;
+            }
+            imap::set_flag(s, uids, *flag, *on).await?;
         }
         Request::Tag {
             folder,
@@ -742,21 +1031,21 @@ async fn handle_imap(
             on,
             uidvalidity,
         } => {
-            let selected = select_same(s, &folder, uidvalidity).await?;
-            if on {
-                let keyword = tags::keyword(&tag).unwrap_or_default();
+            let selected = select_same(s, folder, *uidvalidity).await?;
+            if *on {
+                let keyword = tags::keyword(tag).unwrap_or_default();
                 // A keyword the folder can't keep would be gone at the
                 // next connection, with no word said.
                 if !selected.keeps(&keyword) {
                     return Err(imap::Said(format!(
                         "{} doesn't keep tags on the server",
-                        shown_folder(&folder)
+                        shown_folder(folder)
                     ))
                     .into());
                 }
-                imap::set_keywords(s, &uids, &[keyword], true).await?;
+                imap::set_keywords(s, uids, &[keyword], true).await?;
             } else {
-                imap::set_keywords(s, &uids, &tags::keywords(&tag), false).await?;
+                imap::set_keywords(s, uids, &tags::keywords(tag), false).await?;
             }
         }
         Request::Move {
@@ -765,24 +1054,24 @@ async fn handle_imap(
             to,
             uidvalidity,
         } => {
-            select_same(s, &folder, uidvalidity).await?;
+            select_same(s, folder, *uidvalidity).await?;
             // Where they'll be, so the move can be undone: from `to`'s
             // UIDNEXT on. Not known if the server doesn't say.
-            let (to_uidvalidity, floor) = match imap::uid_next(s, &to).await {
+            let (to_uidvalidity, floor) = match imap::uid_next(s, to).await {
                 Ok(next) => next,
                 Err(e) if e.is::<imap::Said>() => (0, 0),
                 Err(e) => return Err(e),
             };
-            imap::move_to(s, caps, &uids, &to).await?;
+            imap::move_to(s, caps, uids, to).await?;
             sink(Event::Moved {
-                folder,
-                uidvalidity,
-                uids,
+                folder: take(folder),
+                uidvalidity: *uidvalidity,
+                uids: take(uids),
                 to: to.clone(),
                 to_uidvalidity,
                 floor,
             });
-            sink(Event::Done { folder: to });
+            sink(Event::Done { folder: take(to) });
         }
         Request::MoveBack {
             folder,
@@ -792,14 +1081,14 @@ async fn handle_imap(
             to,
         } => {
             // The folder as it was when they were moved there.
-            select_same(s, &folder, uidvalidity).await?;
-            let uids = imap::find_moved(s, &moved, floor).await?;
+            select_same(s, folder, *uidvalidity).await?;
+            let uids = imap::find_moved(s, moved, *floor).await?;
             if !uids.is_empty() {
-                imap::move_to(s, caps, &uids, &to).await?;
+                imap::move_to(s, caps, &uids, to).await?;
             }
             sink(Event::MovedBack {
-                folder,
-                to,
+                folder: take(folder),
+                to: take(to),
                 moved: uids,
                 asked: moved.len(),
             });
@@ -809,9 +1098,13 @@ async fn handle_imap(
             uids,
             uidvalidity,
         } => {
-            select_same(s, &folder, uidvalidity).await?;
-            let all = imap::delete(s, caps, &uids).await?;
-            sink(Event::Deleted { folder, uids, all });
+            select_same(s, folder, *uidvalidity).await?;
+            let all = imap::delete(s, caps, uids).await?;
+            sink(Event::Deleted {
+                folder: take(folder),
+                uids: take(uids),
+                all,
+            });
         }
         Request::Append {
             folder,
@@ -820,17 +1113,17 @@ async fn handle_imap(
             id,
             ..
         } => {
-            if let Err(e) = imap::append(s, &folder, &raw, flags.clone()).await {
+            if let Err(e) = imap::append(s, folder, raw, flags.clone()).await {
                 // A folder that isn't there yet (Sent, Drafts) is made.
                 if broken(&e) {
                     return Err(e);
                 }
-                imap::create(s, &folder).await?;
-                imap::append(s, &folder, &raw, flags).await?;
+                imap::create(s, folder).await?;
+                imap::append(s, folder, raw, flags.clone()).await?;
             }
             sink(Event::Appended {
-                folder,
-                id,
+                folder: take(folder),
+                id: *id,
                 error: None,
             });
         }
@@ -839,9 +1132,12 @@ async fn handle_imap(
             uids,
             uidvalidity,
         } => {
-            select_same(s, &folder, uidvalidity).await?;
-            let headers = imap::headers(s, &uids).await?;
-            sink(Event::Headers { folder, headers });
+            select_same(s, folder, *uidvalidity).await?;
+            let headers = imap::headers(s, uids).await?;
+            sink(Event::Headers {
+                folder: take(folder),
+                headers,
+            });
         }
         Request::Conversations {
             folder,
@@ -851,14 +1147,14 @@ async fn handle_imap(
             all,
         } => {
             let result = if caps.gmail {
-                Some(conversations(s, &folder, uidvalidity, &uids, &thread_ids, &all).await?)
+                Some(conversations(s, folder, *uidvalidity, uids, thread_ids, all).await?)
             } else {
                 None
             };
             sink(Event::Conversations {
-                folder,
-                uidvalidity,
-                all,
+                folder: take(folder),
+                uidvalidity: *uidvalidity,
+                all: take(all),
                 result: Ok(result),
             });
         }
@@ -867,22 +1163,22 @@ async fn handle_imap(
             query,
             generation,
         } => {
-            let Some(criteria) = imap::search_criteria(&query) else {
+            let Some(criteria) = imap::search_criteria(query) else {
                 return Ok(());
             };
-            let selected = imap::select(s, &folder).await?;
+            let selected = imap::select(s, folder).await?;
             let uids = imap::search(s, &criteria).await?;
             // The newest matches.
             let keep = uids.len().saturating_sub(200);
             let headers = imap::headers(s, &uids[keep..]).await?;
             sink(Event::Searched {
-                folder,
-                generation,
+                folder: take(folder),
+                generation: *generation,
                 uidvalidity: selected.uidvalidity,
                 headers,
             });
         }
-        Request::Pop { .. } => {}
+        Request::Pop { .. } | Request::PrioritizeBody { .. } => {}
     }
     Ok(())
 }
@@ -989,10 +1285,11 @@ async fn sync(s: &mut Session, folder: &str, known: Known, count: u32) -> Result
         known.low
     };
     let high = new_uids.last().copied().unwrap_or(0).max(known.high);
-    let unread = imap::search(s, "UNSEEN")
-        .await
-        .map(|u| u.len())
-        .unwrap_or(0) as u32;
+    let unread = match imap::search(s, "UNSEEN").await {
+        Ok(uids) => uids.len() as u32,
+        Err(e) if !broken(&e) => 0,
+        Err(e) => return Err(e),
+    };
     Ok(Synced {
         folder: folder.to_string(),
         uidvalidity: selected.uidvalidity,
@@ -1049,7 +1346,7 @@ async fn run_pop(
     sink: Sink,
 ) {
     while let Some(first) = rx.recv().await {
-        for request in batch(first, &mut rx) {
+        for request in pop_batch(first, &mut rx) {
             let Request::Pop {
                 seen,
                 remove,
@@ -1237,7 +1534,7 @@ mod tests {
         tx.send(sync("Sent", 1)).unwrap();
         tx.send(Request::Folders).unwrap();
         let first = sync("INBOX", 3);
-        let all = batch(first, &mut rx);
+        let all = pop_batch(first, &mut rx);
         assert_eq!(all.len(), 3, "{all:?}");
         assert!(matches!(&all[2], Request::Folders));
         assert!(
@@ -1253,11 +1550,15 @@ mod tests {
             folder: "INBOX".into(),
             uid,
             uidvalidity: 7,
+            size: 0,
+            partial: false,
+            urgent: false,
+            queued: None,
         };
         for uid in [9, 9, 8, 9] {
             tx.send(body(uid)).unwrap();
         }
-        let all = batch(body(9), &mut rx);
+        let all = pop_batch(body(9), &mut rx);
         let uids: Vec<u32> = (all.iter())
             .map(|r| match r {
                 Request::Body { uid, .. } => *uid,
@@ -1294,14 +1595,360 @@ mod tests {
             folder: "INBOX".into(),
             uid: 9,
             uidvalidity: 7,
+            size: 0,
+            partial: true,
+            urgent: false,
+            queued: None,
         };
         report_failure(&body, "offline".into(), &sink);
         let events = events.lock().unwrap();
         // The reader, a reply and agents' reads wait for this one.
         assert!(
-            matches!(&events[..], [Event::Body { uid: 9, result: Err(e), .. }] if e.contains("offline")),
+            matches!(&events[..], [Event::Body {
+                uid: 9, uidvalidity: 7, partial: true, result: Err(e), ..
+            }] if e.contains("offline")),
             "{events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_sync_and_an_explicit_open_go_before_background_downloads_and_counts() {
+        let (log_tx, mut commands) = unbounded_channel();
+        let endpoint = imap::tests::scripted_endpoint("IMAP4rev1", move |tag, command| {
+            log_tx.send(command.to_string()).unwrap();
+            let response = match command {
+                "LIST \"\" *" => "* LIST () \"/\" INBOX\r\n* LIST () \"/\" Archive\r\n",
+                "SELECT \"INBOX\"" => "* 0 EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n",
+                "UID SEARCH UNSEEN" => "* SEARCH\r\n",
+                "STATUS \"Archive\" (MESSAGES UNSEEN)" => {
+                    "* STATUS Archive (MESSAGES 2 UNSEEN 1)\r\n"
+                }
+                "LOGOUT" => "* BYE closing\r\n",
+                c if c == format!("UID FETCH 1 (UID BODY.PEEK[]<0.{}>)", imap::MAX_MESSAGE + 1) => {
+                    "* 1 FETCH (UID 1 BODY[]<0> {3}\r\none)\r\n"
+                }
+                c if c == format!("UID FETCH 2 (UID BODY.PEEK[]<0.{}>)", imap::MAX_MESSAGE + 1) => {
+                    "* 2 FETCH (UID 2 BODY[]<0> {3}\r\ntwo)\r\n"
+                }
+                _ => panic!("unexpected command: {command}"),
+            };
+            format!("{response}{tag} OK done\r\n").into_bytes()
+        })
+        .await;
+        let account = Arc::new(Account {
+            email: "me@example.org".into(),
+            ..Account::default()
+        });
+        let creds = Credentials::new(account, false);
+        creds.set(crate::secrets::Secret::new("pw")).await;
+        let endpoints = Endpoints {
+            smtp: endpoint.clone(),
+            incoming: endpoint,
+        };
+        let (tx, rx) = unbounded_channel();
+        let from_list = tx.clone();
+        let from_sync = tx.clone();
+        let (events, mut receive) = unbounded_channel();
+        let sink: Sink = Arc::new(move |event| {
+            if matches!(&event, Event::Folders(_)) {
+                from_list
+                    .send(Request::Sync {
+                        folder: "INBOX".into(),
+                        known: Known::default(),
+                        count: 10,
+                    })
+                    .unwrap();
+                for uid in [1, 2] {
+                    from_list
+                        .send(Request::Body {
+                            folder: "INBOX".into(),
+                            uid,
+                            uidvalidity: 7,
+                            size: 3,
+                            partial: false,
+                            urgent: false,
+                            queued: None,
+                        })
+                        .unwrap();
+                }
+            }
+            if matches!(&event, Event::Synced(_)) {
+                // The preview is already queued when the user opens it.
+                from_sync
+                    .send(Request::PrioritizeBody {
+                        folder: "INBOX".into(),
+                        uid: 2,
+                        uidvalidity: 7,
+                    })
+                    .unwrap();
+            }
+            events.send(event).unwrap();
+        });
+        tx.send(Request::Folders).unwrap();
+        let worker = tokio::spawn(run_imap(creds, endpoints, rx, sink));
+        let (folders, synced, downloaded) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut folders = false;
+            let mut synced = false;
+            let mut downloaded = Vec::new();
+            while let Some(event) = receive.recv().await {
+                match event {
+                    Event::Folders(rows) => {
+                        assert!(
+                            rows.iter()
+                                .all(|folder| folder.total == 0 && folder.unread == 0)
+                        );
+                        folders = true;
+                    }
+                    Event::Synced(_) => synced = true,
+                    Event::Body {
+                        uid,
+                        result: Ok(Some(Download::Full(_))),
+                        ..
+                    } => downloaded.push(uid),
+                    Event::Counts {
+                        folder,
+                        unread: 1,
+                        total: 2,
+                    } if folder == "Archive" => break,
+                    Event::State(State::Offline(e)) | Event::Failed { error: e, .. } => {
+                        panic!("{e}")
+                    }
+                    _ => {}
+                }
+            }
+            (folders, synced, downloaded)
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(folders && synced);
+        assert_eq!(downloaded, [2, 1]);
+        let commands: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert_eq!(
+            commands,
+            [
+                "LIST \"\" *".into(),
+                "SELECT \"INBOX\"".into(),
+                "UID SEARCH UNSEEN".into(),
+                "SELECT \"INBOX\"".into(),
+                format!("UID FETCH 2 (UID BODY.PEEK[]<0.{}>)", imap::MAX_MESSAGE + 1),
+                format!("UID FETCH 1 (UID BODY.PEEK[]<0.{}>)", imap::MAX_MESSAGE + 1),
+                "STATUS \"Archive\" (MESSAGES UNSEEN)".into(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_refresh_reconnects_before_an_open_even_during_cooldown() {
+        let endpoint = imap::tests::scripted_connections("IMAP4rev1", 2, |i, tag, command| {
+            if i == 0 {
+                assert_eq!(command, "LIST \"\" *");
+                return Vec::new(); // The old connection is lost.
+            }
+            let reply = match command {
+                "SELECT \"INBOX\"" => "* OK [UIDVALIDITY 7] stable\r\n",
+                c if c == format!("UID FETCH 2 (UID BODY.PEEK[]<0.{}>)", imap::MAX_MESSAGE + 1) => {
+                    "* 2 FETCH (UID 2 BODY[]<0> {3}\r\ntwo)\r\n"
+                }
+                "LIST \"\" *" => "* LIST () \"/\" INBOX\r\n",
+                _ => panic!("unexpected command: {command}"),
+            };
+            format!("{reply}{tag} OK done\r\n").into_bytes()
+        })
+        .await;
+        let creds = Credentials::new(
+            Arc::new(Account {
+                email: "me@example.org".into(),
+                ..Account::default()
+            }),
+            false,
+        );
+        creds.set(crate::secrets::Secret::new("pw")).await;
+        let endpoints = Endpoints {
+            smtp: endpoint.clone(),
+            incoming: endpoint,
+        };
+        let (tx, rx) = unbounded_channel();
+        let after_loss = tx.clone();
+        let (events, mut receive) = unbounded_channel();
+        let retried = std::sync::atomic::AtomicBool::new(false);
+        let sink: Sink = Arc::new(move |event| {
+            if matches!(&event, Event::State(State::Offline(_))) {
+                assert!(!retried.swap(true, std::sync::atomic::Ordering::Relaxed));
+                after_loss.send(Request::Folders).unwrap();
+                after_loss
+                    .send(Request::Body {
+                        folder: "INBOX".into(),
+                        uid: 2,
+                        uidvalidity: 7,
+                        size: 3,
+                        partial: false,
+                        urgent: true,
+                        queued: None,
+                    })
+                    .unwrap();
+            }
+            events.send(event).unwrap();
+        });
+        tx.send(Request::Folders).unwrap();
+        let worker = tokio::spawn(run_imap(creds, endpoints, rx, sink));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut opened = false;
+            loop {
+                match receive.recv().await.unwrap() {
+                    Event::Body { uid: 2, result, .. } => {
+                        let Some(Download::Full(raw)) = result.unwrap() else {
+                            panic!("message didn't download");
+                        };
+                        assert_eq!(raw, b"two");
+                        opened = true;
+                    }
+                    Event::Folders(_) => {
+                        assert!(opened, "refresh overtook the explicit open");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_projection_over_the_framing_limit_retries_the_full_message_only_under_the_same_uidvalidity()
+     {
+        for renewed in [7, 8] {
+            let endpoint =
+                imap::tests::scripted_connections("IMAP4rev1", 2, move |i, tag, command| {
+                    let reply = match (i, command) {
+                        (0, "SELECT \"INBOX\"") => "* OK [UIDVALIDITY 7] stable\r\n".into(),
+                        (0, "UID FETCH 1 (UID BODYSTRUCTURE)") => {
+                            let mut structure =
+                                "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 3 1)".to_owned();
+                            for _ in 0..33 {
+                                structure = format!("({structure} \"MIXED\")");
+                            }
+                            format!("* 1 FETCH (UID 1 BODYSTRUCTURE {structure})\r\n")
+                        }
+                        (1, "SELECT \"INBOX\"") => {
+                            format!("* OK [UIDVALIDITY {renewed}] stable\r\n")
+                        }
+                        (1, c)
+                            if renewed == 7
+                                && c == format!(
+                                    "UID FETCH 1 (UID BODY.PEEK[]<0.{}>)",
+                                    imap::MAX_MESSAGE + 1
+                                ) =>
+                        {
+                            "* 1 FETCH (UID 1 BODY[]<0> {3}\r\none)\r\n".into()
+                        }
+                        _ => panic!("unexpected command on connection {i}: {command}"),
+                    };
+                    format!("{reply}{tag} OK done\r\n").into_bytes()
+                })
+                .await;
+            let creds = Credentials::new(
+                Arc::new(Account {
+                    email: "me@example.org".into(),
+                    ..Account::default()
+                }),
+                false,
+            );
+            creds.set(crate::secrets::Secret::new("pw")).await;
+            let mut session = Some(imap_login(&creds, &endpoint).await.unwrap());
+            let (events, mut received) = unbounded_channel();
+            let sink: Sink = Arc::new(move |event| events.send(event).unwrap());
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_imap(
+                    &mut Request::Body {
+                        folder: "INBOX".into(),
+                        uid: 1,
+                        uidvalidity: 7,
+                        size: PARTIAL_MIN,
+                        partial: true,
+                        urgent: true,
+                        queued: None,
+                    },
+                    &mut session,
+                    &creds,
+                    &endpoint,
+                    &sink,
+                    &mut FolderCounts::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            if renewed == 7 {
+                result.unwrap();
+                assert!(matches!(
+                    received.try_recv().unwrap(),
+                    Event::Body { result: Ok(Some(Download::Full(bytes))), .. } if bytes == b"one"
+                ));
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is::<imap::Said>() && error.to_string().contains("was made again"));
+                assert!(received.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn promoting_a_preview_does_not_jump_an_earlier_change_or_draft_append() {
+        let mut requests = VecDeque::from([
+            Request::Body {
+                folder: "INBOX".into(),
+                uid: 1,
+                uidvalidity: 7,
+                size: 2,
+                partial: true,
+                urgent: false,
+                queued: None,
+            },
+            Request::Flag {
+                folder: "INBOX".into(),
+                uids: vec![1],
+                flag: FlagKind::Seen,
+                on: true,
+                uidvalidity: 7,
+            },
+            Request::Append {
+                folder: "Drafts".into(),
+                raw: Vec::new(),
+                flags: Flags::default(),
+                id: 3,
+                retry: false,
+            },
+        ]);
+        for uid in [1, 2] {
+            enqueue(
+                &mut requests,
+                Request::PrioritizeBody {
+                    folder: "INBOX".into(),
+                    uid,
+                    uidvalidity: 7,
+                },
+            );
+        }
+        assert!(matches!(
+            requests.remove(next_imap(&requests)),
+            Some(Request::Flag { .. })
+        ));
+        assert!(matches!(
+            requests.remove(next_imap(&requests)),
+            Some(Request::Append { .. })
+        ));
+        assert!(matches!(
+            requests.pop_front(),
+            Some(Request::Body {
+                uid: 1,
+                urgent: true,
+                ..
+            })
+        ));
+        assert!(requests.is_empty());
     }
 
     fn gmail_header(
@@ -1519,16 +2166,19 @@ mod tests {
 
     #[tokio::test]
     async fn gmail_unsupported_is_a_correlated_success_without_sending_commands() {
-        let (mut session, caps) = imap::tests::scripted_capabilities("IMAP4rev1", |_, command| {
+        let endpoint = imap::tests::scripted_endpoint("IMAP4rev1", |_, command| {
             panic!("unsupported Gmail command: {command}")
         })
         .await;
+        let (session, caps) = imap::connect(&endpoint, "me", "pw", crate::account::Auth::Password)
+            .await
+            .unwrap();
         assert!(!caps.gmail);
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let kept = events.clone();
         let sink: Sink = Arc::new(move |event| kept.lock().unwrap().push(event));
         let creds = Credentials::new(Arc::new(Account::default()), false);
-        let request = Request::Conversations {
+        let mut request = Request::Conversations {
             folder: "INBOX".into(),
             uidvalidity: 7,
             uids: vec![1],
@@ -1536,9 +2186,16 @@ mod tests {
             all: "All".into(),
         };
         assert!(!request.changes());
-        handle_imap(request, &mut session, caps, &creds, &sink)
-            .await
-            .unwrap();
+        handle_imap(
+            &mut request,
+            &mut Some((session, caps)),
+            &creds,
+            &endpoint,
+            &sink,
+            &mut FolderCounts::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(&events.lock().unwrap()[..], [Event::Conversations {
             folder, uidvalidity: 7, all, result: Ok(None)

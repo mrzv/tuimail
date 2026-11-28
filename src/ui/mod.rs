@@ -561,10 +561,10 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
     let hint = match picker.kind {
         PickerKind::MoveTo { .. } => " `Enter` move here · `Esc` cancel ",
         PickerKind::Links => " `Enter` open · `y` copy · `Esc` close ",
-        PickerKind::Attachments if app.attachment_opener(picker.selected).is_some() => {
+        PickerKind::Attachments { .. } if app.attachment_opener(picker.selected).is_some() => {
             " `Enter` open · `v` all with viewer · `s` save · `Esc` close "
         }
-        PickerKind::Attachments => " `Enter` open · `s` save to Downloads · `Esc` close ",
+        PickerKind::Attachments { .. } => " `Enter` open · `s` save to Downloads · `Esc` close ",
         PickerKind::Tag { .. } => " `Enter` put on or take off · `Esc` cancel ",
         PickerKind::Changes(_) => " `Enter` undo · `Esc` close ",
         PickerKind::FolderVisibility { .. } if picker.items.is_empty() => " `Esc` back ",
@@ -790,21 +790,21 @@ fn confirm(frame: &mut Frame, app: &mut App, area: Rect) {
             " `y` save draft · `n` discard · any other key keeps writing ",
         ),
         Confirm::OpenAttachments { files, .. } => {
-            let text = if let [(_, name)] = files.as_slice() {
+            let text = if let [file] = files.as_slice() {
                 format!(
                     "“{}” is a kind of file that can run things on your computer. Open it only if you trust the sender.",
-                    fit(name, 60)
+                    fit(&file.name, 60)
                 )
             } else {
                 let mut risky = files
                     .iter()
-                    .filter(|(_, name)| !crate::tools::safe_to_open(name));
+                    .filter(|file| !crate::tools::safe_to_open(&file.name));
                 let mut text = format!(
                     "Open {} files together? These can run things on your computer; open them only if you trust the sender:",
                     files.len()
                 );
-                for (_, name) in risky.by_ref().take(4) {
-                    text.push_str(&format!("\n  {}", fit_middle(name, 60)));
+                for file in risky.by_ref().take(4) {
+                    text.push_str(&format!("\n  {}", fit_middle(&file.name, 60)));
                 }
                 let left = risky.count();
                 if left > 0 {

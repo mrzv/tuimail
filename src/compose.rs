@@ -845,7 +845,7 @@ mod tests {
         };
         let id = new_message_id("me@example.org").unwrap();
         let built = build(&draft, &me(), &id, 0, false).unwrap();
-        mail::attachments(&built.raw, &[(0, "report.pdf".into())], |name, bytes| {
+        mail::attachments(&built.raw, [(0, "report.pdf")], |name, bytes| {
             assert_eq!((name, bytes), ("report.pdf", &b"REPORT"[..]));
             Ok(())
         })

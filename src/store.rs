@@ -234,6 +234,17 @@ CREATE TABLE IF NOT EXISTS bodies (
     raw BLOB NOT NULL,
     PRIMARY KEY (account, folder, uid)
 );
+-- A reader projection is not a complete message. Its omitted sections
+-- can only be requested again under the UIDVALIDITY used to fetch it.
+CREATE TABLE IF NOT EXISTS body_parts (
+    account TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    uidvalidity INTEGER NOT NULL,
+    raw BLOB NOT NULL,
+    parts BLOB NOT NULL,
+    PRIMARY KEY (account, folder, uid)
+);
 -- Deletes for good asked for and not yet confirmed by the server: made
 -- again at the next start, so quitting (or a lost connection) never leaves
 -- a message the user deleted on the server, or hidden there but kept.
@@ -531,7 +542,7 @@ impl Store {
         };
         let mut removed = false;
         for name in old.iter().filter(|n| !names.contains(n.as_str())) {
-            for table in ["folders", "messages", "bodies"] {
+            for table in ["folders", "messages", "bodies", "body_parts"] {
                 let column = if table == "folders" { "name" } else { "folder" };
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE account = ?1 AND {column} = ?2"),
@@ -612,7 +623,7 @@ impl Store {
 
     /// Forgets a folder's messages: its UIDs mean other messages now.
     pub fn reset_folder(&self, account: &str, folder: &str) -> Result<()> {
-        for table in ["messages", "bodies"] {
+        for table in ["messages", "bodies", "body_parts"] {
             self.db.execute(
                 &format!("DELETE FROM {table} WHERE account = ?1 AND folder = ?2"),
                 params![account, folder],
@@ -651,6 +662,12 @@ impl Store {
                 message_row,
             )
             .optional()?)
+    }
+
+    pub(crate) fn has_message(&self, account: &str, folder: &str, uid: u32) -> Result<bool> {
+        Ok(self.db.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE account = ?1 AND folder = ?2 AND uid = ?3)",
+        )?.query_row(params![account, folder, uid], |row| row.get(0))?)
     }
 
     /// The account's cached messages matching every search term, newest
@@ -979,7 +996,8 @@ impl Store {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET seen = ?4, flagged = ?5, answered = ?6, draft = ?7,
                      tags = ?8
-                 WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+                 WHERE account = ?1 AND folder = ?2 AND uid = ?3
+                   AND (seen <> ?4 OR flagged <> ?5 OR answered <> ?6 OR draft <> ?7 OR tags <> ?8)",
             )?;
             for (uid, f) in flags {
                 stmt.execute(params![
@@ -1040,7 +1058,7 @@ impl Store {
         folder: &str,
         uids: &[u32],
     ) -> Result<()> {
-        for table in ["messages", "bodies"] {
+        for table in ["messages", "bodies", "body_parts"] {
             let mut stmt = tx.prepare(&format!(
                 "DELETE FROM {table} WHERE account = ?1 AND folder = ?2 AND uid = ?3"
             ))?;
@@ -1062,6 +1080,62 @@ impl Store {
             .optional()?)
     }
 
+    /// Reads a cached IMAP projection, never a substitute for [`Self::body`].
+    pub fn partial(
+        &self,
+        account: &str,
+        folder: &str,
+        uid: u32,
+        uidvalidity: u32,
+    ) -> Result<Option<mail::Partial>> {
+        if uidvalidity == 0 {
+            return Ok(None);
+        }
+        // One entry holds a leaf offset, the part numbers and a SHA-256.
+        // Bound values read from SQLite before allocating or deserializing.
+        let stored: Option<(Vec<u8>, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT raw, parts FROM body_parts WHERE account = ?1 AND folder = ?2 AND uid = ?3
+                   AND uidvalidity = ?4 AND length(raw) <= ?5 AND length(parts) <= ?6",
+                params![
+                    account,
+                    folder,
+                    uid,
+                    uidvalidity,
+                    mail::MAX_PARTIAL_RAW as i64,
+                    (mail::MAX_PARTIAL_PARTS as i64) * 512 + 2,
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|(raw, parts)| mail::Partial::new(raw, serde_json::from_slice(&parts).ok()?)))
+    }
+
+    pub fn save_partial(
+        &self,
+        account: &str,
+        folder: &str,
+        uid: u32,
+        uidvalidity: u32,
+        partial: &mail::Partial,
+    ) -> Result<()> {
+        if uidvalidity == 0 {
+            return Ok(());
+        }
+        let parts = serde_json::to_vec(&partial.parts)?;
+        self.db.execute(
+            "INSERT OR REPLACE INTO body_parts (account, folder, uid, uidvalidity, raw, parts)
+             SELECT m.account, m.folder, m.uid, f.uidvalidity, ?5, ?6
+             FROM messages AS m JOIN folders AS f ON f.account = m.account AND f.name = m.folder
+             WHERE m.account = ?1 AND m.folder = ?2 AND m.uid = ?3 AND f.uidvalidity = ?4
+               AND NOT EXISTS (SELECT 1 FROM bodies WHERE account = ?1 AND folder = ?2 AND uid = ?3)",
+            params![account, folder, uid, uidvalidity, partial.raw, parts],
+        )?;
+        Ok(())
+    }
+
     /// Disproves a possible copy only when both full messages are cached.
     pub fn cached_bodies_differ(
         &self,
@@ -1080,23 +1154,28 @@ impl Store {
         )?)
     }
 
-    /// Keeps a downloaded message, and the start of its text for the list.
-    /// Keeps a downloaded message, unless it's bigger than [`MAX_KEPT_BODY`]
+    /// Keeps a complete message for offline use, unless it's bigger than [`MAX_KEPT_BODY`]
     /// (then it's downloaded again to read). Its preview for the list comes
     /// later ([`Store::set_preview`]): making one may lay out HTML, which
     /// needs the big stack of a background thread.
     pub fn save_body(&self, account: &str, folder: &str, uid: u32, raw: &[u8]) -> Result<()> {
-        if raw.len() <= MAX_KEPT_BODY {
-            self.keep_body(account, folder, uid, raw)?;
+        if raw.len() > MAX_KEPT_BODY {
+            return Ok(());
         }
-        Ok(())
+        self.keep_body(account, folder, uid, raw)
     }
 
     fn keep_body(&self, account: &str, folder: &str, uid: u32, raw: &[u8]) -> Result<()> {
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO bodies (account, folder, uid, raw) VALUES (?1, ?2, ?3, ?4)",
             params![account, folder, uid, raw],
         )?;
+        tx.execute(
+            "DELETE FROM body_parts WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+            params![account, folder, uid],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1639,6 +1718,7 @@ impl Store {
             "folders",
             "messages",
             "bodies",
+            "body_parts",
             "pop_seen",
             "pop_checked",
             "pending_deletes",

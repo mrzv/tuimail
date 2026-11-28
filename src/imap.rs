@@ -2,25 +2,516 @@
 //! in, listing folders, and the handful of commands tuimail sends. Every
 //! command has a time limit; a connection that misses one is dropped.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll, ready};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_imap::imap_proto::{
-    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+    AttributeValue, MailboxDatum, MessageSection, Outcome, Response, ResponseCode, SectionPath,
+    Status, StatusAttribute,
 };
-use async_imap::types::{Fetch, Flag, NameAttribute};
+use async_imap::types::{Fetch, Flag, NameAttribute, UnsolicitedResponse};
 use chrono::Datelike as _;
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::account::{Account, Auth, Security};
 use crate::mail;
 use crate::net::{self, Conn, Endpoint};
 use crate::search::{self, Field, Term};
 use crate::store::{Flags, Folder, Gmail, Header, Role};
-use crate::{tags, text, utf7};
+use crate::{imap_timing, tags, text, utf7};
 
-pub type Session = async_imap::Session<Conn>;
+pub type Session = async_imap::Session<Transport>;
+
+// Bound recursive FETCH data before it reaches async-imap's codec, which
+// can start parsing before the response is complete.
+const STRUCTURE_PARENS: usize = 128;
+const STRUCTURE_DEPTH: u8 = 32;
+
+#[derive(Debug)]
+pub struct Transport {
+    conn: Conn,
+    selected: Option<(String, u32)>,
+    // What could already be buffered after the preceding command's tagged
+    // line. Any such bytes follow at least one LF in the last read.
+    tail: ReadAhead,
+    // Exact read-ahead, once a raw exchange has seen its tagged completion.
+    tagged: bool,
+    buffered: Vec<u8>,
+    guard: Option<ReadGuard>,
+    buffered_only: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReadAhead {
+    bytes: usize,
+    parens: usize,
+    trailing_nuls: usize,
+}
+
+impl ReadAhead {
+    fn after_line(data: &[u8]) -> Self {
+        let tail = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&[][..], |i| &data[i + 1..]);
+        Self {
+            bytes: tail.len(),
+            parens: opening_parens(tail, STRUCTURE_PARENS),
+            trailing_nuls: tail.iter().rev().take_while(|&&b| b == 0).count(),
+        }
+    }
+}
+
+fn opening_parens(data: &[u8], limit: usize) -> usize {
+    data.iter().filter(|&&b| b == b'(').take(limit + 1).count()
+}
+
+#[derive(Clone, Copy)]
+enum Framing {
+    Ordinary,
+    Structure,
+    BodyStructure,
+    Sections,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FramingError(&'static str);
+
+impl std::fmt::Display for FramingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for FramingError {}
+
+// The pinned parser enters its recursive body grammar only immediately
+// after this attribute name. Check every possible entry, even inside
+// apparent text: the codec also accepts unrecognized FETCH attributes
+// whose fallback syntax does not have the usual quoting rules.
+#[derive(Debug, Default)]
+struct StructureDepth {
+    matched: usize,
+    bodies: Vec<BodyDepth>,
+}
+
+impl StructureDepth {
+    fn read(&mut self, data: &[u8]) -> Result<(), FramingError> {
+        const START: &[u8] = b"BODYSTRUCTURE (";
+        for &byte in data {
+            self.bodies.retain_mut(|body| body.read(byte));
+            if self.bodies.iter().any(|body| body.depth > STRUCTURE_DEPTH) {
+                return Err(FramingError("IMAP body structure is too deep"));
+            }
+            self.matched = if byte.eq_ignore_ascii_case(&START[self.matched]) {
+                self.matched + 1
+            } else {
+                // B occurs only at the start of the prefix.
+                usize::from(byte.eq_ignore_ascii_case(&b'B'))
+            };
+            if self.matched == START.len() {
+                if self.bodies.len() == STRUCTURE_DEPTH as usize {
+                    return Err(FramingError("too many possible IMAP body structures"));
+                }
+                self.bodies.push(BodyDepth {
+                    depth: 1,
+                    token: BodyToken::Syntax,
+                });
+                self.matched = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BodyDepth {
+    depth: u8,
+    token: BodyToken,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BodyToken {
+    Syntax,
+    Quoted,
+    Escape,
+    Length(Option<u32>),
+    Cr(u32),
+    Lf(u32),
+    Literal(u32),
+}
+
+impl BodyDepth {
+    // None of the recursive grammar crosses a line break except through
+    // a literal. Stop tracking a closed or lexically impossible candidate.
+    fn read(&mut self, byte: u8) -> bool {
+        use BodyToken::*;
+        self.token = match (self.token, byte) {
+            (Syntax, b'(') => {
+                self.depth += 1;
+                Syntax
+            }
+            (Syntax, b')') => {
+                self.depth -= 1;
+                Syntax
+            }
+            (Syntax, b'"') => Quoted,
+            (Syntax, b'{') => Length(None),
+            (Quoted, b'\\') => Escape,
+            (Quoted, b'"') => Syntax,
+            (Escape, b'"' | b'\\') => Quoted,
+            (Syntax | Quoted, b'\r' | b'\n' | 0) => return false,
+            (Syntax | Quoted, _) => self.token,
+            (Length(n), b'0'..=b'9') => {
+                let Some(n) = n
+                    .unwrap_or(0)
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add(u32::from(byte - b'0')))
+                else {
+                    return false;
+                };
+                Length(Some(n))
+            }
+            (Length(Some(n)), b'}') => Cr(n),
+            (Cr(n), b'\r') => Lf(n),
+            (Lf(0), b'\n') | (Literal(1), _) => Syntax,
+            (Lf(n), b'\n') => Literal(n),
+            (Literal(n), _) => Literal(n - 1),
+            _ => return false,
+        };
+        self.depth != 0
+    }
+}
+
+#[derive(Debug)]
+struct ReadGuard {
+    bytes: usize,
+    framing: GuardFraming,
+}
+
+#[derive(Debug)]
+enum GuardFraming {
+    Ordinary,
+    Structure(usize),
+    BodyStructure(SectionFraming, StructureDepth),
+    Sections(SectionFraming, usize),
+}
+
+impl ReadGuard {
+    fn read(&mut self, data: &[u8]) -> Result<(), FramingError> {
+        self.bytes = self
+            .bytes
+            .checked_sub(data.len())
+            .ok_or(FramingError("too much data returned by IMAP"))?;
+        match &mut self.framing {
+            GuardFraming::Ordinary => Ok(()),
+            GuardFraming::Structure(opens) => count_opens(data, opens),
+            GuardFraming::BodyStructure(framing, depth) => {
+                depth.read(data)?;
+                framing.read(data, self.bytes, None)
+            }
+            GuardFraming::Sections(framing, opens) => framing.read(data, self.bytes, Some(opens)),
+        }
+    }
+}
+
+fn count_opens(data: &[u8], opens: &mut usize) -> Result<(), FramingError> {
+    *opens = opens
+        .checked_sub(opening_parens(data, *opens))
+        .ok_or(FramingError("too much IMAP body structure"))?;
+    Ok(())
+}
+
+// Bound literal lengths before the codec can reserve their buffers. Only
+// proven BODY section data bypasses the Sections recursion budget.
+#[derive(Debug, Default)]
+struct SectionFraming {
+    line: Vec<u8>,
+    probe: Vec<u8>,
+    literal: usize,
+    continuation: bool,
+    quoted: Option<Quote>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Quote {
+    Text,
+    Escape,
+}
+
+impl SectionFraming {
+    fn read(
+        &mut self,
+        mut data: &[u8],
+        budget: usize,
+        mut opens: Option<&mut usize>,
+    ) -> Result<(), FramingError> {
+        while !data.is_empty() {
+            if self.literal != 0 {
+                let skip = data.len().min(self.literal);
+                self.literal -= skip;
+                data = &data[skip..];
+                continue;
+            }
+            if self.quoted.is_some() {
+                data = self.after_quote(data)?;
+                continue;
+            }
+            let sections = opens.is_some();
+            let delimiter = data
+                .iter()
+                .position(|&byte| byte == b'\n' || (sections && byte == b'"'));
+            let (chunk, rest) = data.split_at(delimiter.unwrap_or(data.len()));
+            if let Some(opens) = opens.as_deref_mut() {
+                count_opens(chunk, opens)?;
+            }
+            if self.line.len() + chunk.len() + 2 > 64 * 1024 {
+                return Err(FramingError("too much IMAP FETCH framing"));
+            }
+            self.line.extend_from_slice(chunk);
+            let Some((&end, rest)) = rest.split_first() else {
+                break;
+            };
+            data = rest;
+            if end == b'"' {
+                if (self.line.ends_with(b"] ") || self.line.ends_with(b"> "))
+                    && section_value(&mut self.probe, &self.line, self.continuation)
+                {
+                    // Keep the prefix usable for the next value probe
+                    // without counting or copying the quoted payload.
+                    self.line.extend_from_slice(b"\"\"");
+                    self.quoted = Some(Quote::Text);
+                } else {
+                    self.line.push(end);
+                }
+            } else {
+                self.line.push(end);
+                let line = self.line.strip_suffix(b"\r\n").ok_or_else(bad_framing)?;
+                let literal = line.strip_suffix(b"}").and_then(|prefix| {
+                    let open = prefix.iter().rposition(|&byte| byte == b'{')?;
+                    let number = &prefix[open + 1..];
+                    (!number.is_empty() && number.iter().all(u8::is_ascii_digit))
+                        .then(|| (&prefix[..open], number))
+                });
+                self.continuation = if let Some((prefix, number)) = literal
+                    && (self.continuation
+                        || is_fetch(line)
+                        || !matches!(Response::parse(&self.line), Ok(([], _))))
+                {
+                    // Non-FETCH status text can end in "{123}" without
+                    // declaring a literal. Only parse that line above if
+                    // its prefix cannot enter the recursive FETCH grammar.
+                    let size = ascii_number(number).ok_or_else(bad_framing)? as usize;
+                    if size > budget.saturating_add(rest.len()) {
+                        return Err(FramingError("too much data returned by IMAP FETCH"));
+                    }
+                    if sections && !section_value(&mut self.probe, prefix, self.continuation) {
+                        return Err(bad_framing());
+                    }
+                    self.literal = size;
+                    true
+                } else {
+                    false
+                };
+                self.line.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn after_quote<'a>(&mut self, data: &'a [u8]) -> Result<&'a [u8], FramingError> {
+        for (i, &byte) in data.iter().enumerate() {
+            self.quoted = Some(match (self.quoted, byte) {
+                (Some(Quote::Text), b'"') => {
+                    self.quoted = None;
+                    return Ok(&data[i + 1..]);
+                }
+                (Some(Quote::Text), b'\\') => Quote::Escape,
+                (Some(Quote::Escape), b'\\' | b'"') => Quote::Text,
+                (Some(Quote::Text), 0 | b'\r' | b'\n') => return Err(bad_framing()),
+                (Some(Quote::Text), _) => Quote::Text,
+                _ => return Err(bad_framing()),
+            });
+        }
+        Ok(&[])
+    }
+}
+
+fn bad_framing() -> FramingError {
+    FramingError("unexpected IMAP section data framing")
+}
+
+fn is_fetch(line: &[u8]) -> bool {
+    let mut words = line.splitn(4, |&byte| byte == b' ');
+    words.next() == Some(b"*")
+        && words.next().is_some_and(|n| ascii_number(n).is_some())
+        && words
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"FETCH"))
+}
+
+fn ascii_number(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+// Probe the prefix with an empty BODY section literal, which takes the
+// same nstring position as a quoted section. The skipped data never
+// reaches the probe; structural bytes were already bounded.
+fn section_value(probe: &mut Vec<u8>, line: &[u8], continuation: bool) -> bool {
+    probe.clear();
+    if continuation {
+        let Some(rest) = line.strip_prefix(b" ") else {
+            return false;
+        };
+        probe.extend_from_slice(b"* 1 FETCH (");
+        probe.extend_from_slice(rest);
+    } else {
+        probe.extend_from_slice(line);
+    }
+    let body = probe.len() + b"{0}\r\n".len();
+    probe.extend_from_slice(b"{0}\r\n)\r\n");
+    matches!(
+        Response::parse(probe),
+        Ok(([], Response::Fetch(_, attrs)))
+            if matches!(attrs.last(), Some(AttributeValue::BodySection { data: Some(data), .. })
+                if data.as_ptr() == probe[body..].as_ptr())
+    )
+}
+
+impl Transport {
+    fn new(conn: Conn) -> Self {
+        Self {
+            conn,
+            selected: None,
+            tail: ReadAhead::default(),
+            tagged: false,
+            buffered: Vec::new(),
+            guard: None,
+            buffered_only: false,
+        }
+    }
+
+    fn guard(&mut self, bytes: usize, framing: Framing) -> Result<()> {
+        let needs_boundary = matches!(framing, Framing::BodyStructure | Framing::Sections);
+        if needs_boundary && !self.tagged {
+            bail!("unknown IMAP response boundary before downloading the message");
+        }
+        let mut guard = ReadGuard {
+            bytes,
+            framing: match framing {
+                Framing::Ordinary => GuardFraming::Ordinary,
+                Framing::Structure => GuardFraming::Structure(STRUCTURE_PARENS),
+                Framing::BodyStructure => GuardFraming::BodyStructure(
+                    SectionFraming::default(),
+                    StructureDepth::default(),
+                ),
+                Framing::Sections => {
+                    GuardFraming::Sections(SectionFraming::default(), STRUCTURE_PARENS)
+                }
+            },
+        };
+        if self.tagged {
+            guard.read(&self.buffered)?;
+        } else {
+            guard.bytes = guard
+                .bytes
+                .checked_sub(self.tail.bytes)
+                .context("too much buffered data before IMAP command")?;
+            if let GuardFraming::Structure(opens) = &mut guard.framing {
+                *opens = opens
+                    .checked_sub(self.tail.parens)
+                    .context("too much IMAP structure was buffered before FETCH")?;
+            }
+        }
+        self.tagged = false;
+        self.guard = Some(guard);
+        Ok(())
+    }
+
+    fn saw_tag(&mut self, raw: &[u8], outcome: &Outcome<'_>) -> Result<(), FramingError> {
+        self.buffered.clear();
+        if self.tail.bytes != 0 {
+            // The codec's owner includes zero-filled unused capacity.
+            // The tag ended in the last read that supplied bytes. At
+            // most bytes after that read's first LF can still be buffered,
+            // and any real trailing NULs came from that same read.
+            let rest = if matches!(outcome.code, Some(ResponseCode::BadCharset(Some(_)))) {
+                // BADCHARSET's list can contain literals in a tagged reply.
+                let Ok((rest, Response::Done { .. })) = Response::parse(raw) else {
+                    return Err(bad_framing());
+                };
+                rest
+            } else {
+                let lf = raw
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .ok_or_else(bad_framing)?;
+                &raw[lf + 1..]
+            };
+            let rest = &rest[..rest.len().min(self.tail.bytes)];
+            let end =
+                rest.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1) + self.tail.trailing_nuls;
+            self.buffered
+                .extend_from_slice(rest.get(..end).ok_or_else(bad_framing)?);
+        }
+        self.tagged = true;
+        Ok(())
+    }
+}
+
+impl AsyncRead for Transport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.buffered_only {
+            return Poll::Pending;
+        }
+        let start = buf.filled().len();
+        ready!(Pin::new(&mut this.conn).poll_read(cx, buf))?;
+        let data = &buf.filled()[start..];
+        if let Some(guard) = &mut this.guard {
+            guard.read(data).map_err(io::Error::other)?;
+        } else {
+            this.tagged = false;
+        }
+        this.tail = ReadAhead::after_line(data);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Transport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.guard.is_none() {
+            this.tagged = false;
+        }
+        Pin::new(&mut this.conn).poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_shutdown(cx)
+    }
+}
 
 /// How long a command may take; fetching a message's text, longer.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
@@ -68,17 +559,29 @@ impl std::error::Error for Said {}
 
 async fn timed<T>(
     limit: Duration,
-    what: &str,
+    what: &'static str,
     f: impl Future<Output = async_imap::error::Result<T>>,
 ) -> Result<T> {
     use async_imap::error::Error;
-    match tokio::time::timeout(limit, f).await {
+    let start = imap_timing::start();
+    let result = tokio::time::timeout(limit, f).await;
+    imap_timing::finish(start, what, None);
+    match result {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e @ (Error::No(_) | Error::Bad(_) | Error::Validate(_) | Error::Append))) => {
             bail!(Said(format!(
                 "{what}: {}",
                 text::one_line(&e.to_string(), 300)
             )))
+        }
+        Ok(Err(Error::Io(e))) => {
+            if let Some(error) = e
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FramingError>())
+            {
+                return Err(anyhow!(*error).context(what));
+            }
+            bail!("{what}: io: {}", text::one_line(&e.to_string(), 300));
         }
         Ok(Err(e)) => bail!("{what}: {}", text::one_line(&e.to_string(), 300)),
         Err(_) => bail!("{what}: the server stopped answering"),
@@ -103,7 +606,7 @@ pub async fn connect(
 ) -> Result<(Session, Caps)> {
     net::check_login(user, secret)?;
     let conn = net::connect(endpoint).await?;
-    let mut client = async_imap::Client::new(conn);
+    let mut client = async_imap::Client::new(Transport::new(conn));
     let greeting = tokio::time::timeout(TIMEOUT, client.read_response())
         .await
         .map_err(|_| anyhow!("{} didn't greet", endpoint.shown()))??
@@ -123,8 +626,8 @@ pub async fn connect(
         )
         .await?;
         // Whatever the server sent before TLS is dropped with the client.
-        let tcp = client.into_inner().into_plain()?;
-        client = async_imap::Client::new(net::start_tls(tcp, endpoint).await?);
+        let tcp = client.into_inner().conn.into_plain()?;
+        client = async_imap::Client::new(Transport::new(net::start_tls(tcp, endpoint).await?));
     }
     let login = async {
         match auth {
@@ -203,37 +706,45 @@ pub async fn logout(mut session: Session) {
 
 /// The account's folders, with what each is for.
 pub async fn folders(session: &mut Session, account: &Account) -> Result<Vec<Folder>> {
-    let names: Vec<async_imap::types::Name> = timed(TIMEOUT, "LIST", async {
-        session.list(Some(""), Some("*")).await?.try_collect().await
-    })
-    .await?;
     let mut said = Vec::new();
-    let mut folders: Vec<Folder> = names
-        .iter()
-        .take(2000)
-        .map(|name| {
-            let attributes = name.attributes();
-            let raw = name.name().to_string();
-            let shown = utf7::decode(&raw).unwrap_or_else(|| raw.clone());
-            let selectable = !attributes
-                .iter()
-                .any(|a| matches!(a, NameAttribute::NoSelect))
-                && !attributes.iter().any(|a| {
-                    matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
+    let mut folders = Vec::new();
+    exchange(
+        session,
+        "LIST \"\" *",
+        Exchange {
+            responses: 10_000,
+            bytes: 8 << 20,
+            framing: Framing::Ordinary,
+            ..Exchange::small("LIST")
+        },
+        |parsed, _| {
+            if let Response::MailboxData(MailboxDatum::List(data)) = parsed
+                && folders.len() < 2000
+            {
+                let attributes = &data.name_attributes;
+                let raw = data.name.as_ref();
+                let shown = utf7::decode(raw).unwrap_or_else(|| raw.to_string());
+                let delimiter = data.delimiter.as_deref();
+                let selectable = !attributes.iter().any(|a| {
+                    matches!(a, NameAttribute::NoSelect)
+                        || matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
                 });
-            let role = role_of(&raw, &shown, name.delimiter(), attributes);
-            said.push(role.map(|(_, by)| by));
-            Folder {
-                role: role.map(|(role, _)| role),
-                shown: text::one_line(&shown, 200),
-                name: raw,
-                delimiter: name.delimiter().map(|d| text::one_line(d, 2)),
-                selectable,
-                unread: 0,
-                total: 0,
+                let role = role_of(raw, &shown, delimiter, attributes);
+                said.push(role.map(|(_, by)| by));
+                folders.push(Folder {
+                    role: role.map(|(role, _)| role),
+                    shown: text::one_line(&shown, 200),
+                    name: raw.to_string(),
+                    delimiter: delimiter.map(|d| text::one_line(d, 2)),
+                    selectable,
+                    unread: 0,
+                    total: 0,
+                });
             }
-        })
-        .collect();
+            Ok(())
+        },
+    )
+    .await?;
     apply_overrides(&mut folders, &mut said, account);
     dedupe_roles(&mut folders, &said);
     Ok(folders)
@@ -391,29 +902,167 @@ fn dedupe_roles(folders: &mut [Folder], said: &[Option<RoleFrom>]) {
 
 /// A folder's unread and total counts, from STATUS.
 pub async fn status(session: &mut Session, folder: &str) -> Result<(u32, u32)> {
-    let mailbox = timed(
-        TIMEOUT,
-        "STATUS",
-        session.status(folder, "(MESSAGES UNSEEN)"),
+    let mut unread = 0;
+    let mut total = 0;
+    mailbox_status(
+        session,
+        folder,
+        "MESSAGES UNSEEN",
+        |attribute| match attribute {
+            StatusAttribute::Messages(value) => total = *value,
+            StatusAttribute::Unseen(value) => unread = *value,
+            _ => {}
+        },
     )
     .await?;
-    Ok((mailbox.unseen.unwrap_or(0), mailbox.exists))
+    Ok((unread, total))
 }
 
 /// A folder's UIDVALIDITY and UIDNEXT, from STATUS: before a move, so the
 /// messages it puts there can be told from mail that was there, or comes
 /// later.
 pub async fn uid_next(session: &mut Session, folder: &str) -> Result<(u32, u32)> {
-    let mailbox = timed(
-        TIMEOUT,
-        "STATUS",
-        session.status(folder, "(UIDVALIDITY UIDNEXT)"),
+    let mut validity = 0;
+    let mut next = 0;
+    mailbox_status(
+        session,
+        folder,
+        "UIDVALIDITY UIDNEXT",
+        |attribute| match attribute {
+            StatusAttribute::UidValidity(value) => validity = *value,
+            StatusAttribute::UidNext(value) => next = *value,
+            _ => {}
+        },
     )
     .await?;
-    Ok((
-        mailbox.uid_validity.unwrap_or(0),
-        mailbox.uid_next.unwrap_or(0),
+    Ok((validity, next))
+}
+
+async fn mailbox_status(
+    session: &mut Session,
+    folder: &str,
+    items: &str,
+    mut accept: impl FnMut(&StatusAttribute),
+) -> Result<()> {
+    let command = format!("STATUS {} ({items})", quote_folder(folder)?);
+    exchange(session, &command, Exchange::small("STATUS"), |parsed, _| {
+        if let Response::MailboxData(MailboxDatum::Status { mailbox, status }) = parsed
+            && same_folder(mailbox, folder)
+        {
+            for attribute in status {
+                accept(attribute);
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+fn quote_folder(folder: &str) -> Result<String> {
+    if folder.contains(['\r', '\n', '\0']) {
+        bail!(Said("the mailbox name can't go in an IMAP command".into()));
+    }
+    Ok(format!(
+        "\"{}\"",
+        folder.replace('\\', "\\\\").replace('"', "\\\"")
     ))
+}
+
+fn same_folder(a: &str, b: &str) -> bool {
+    a == b || a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX")
+}
+
+fn changed_validity(attributes: &[StatusAttribute], validity: u32) -> bool {
+    attributes
+        .iter()
+        .any(|attr| matches!(attr, StatusAttribute::UidValidity(uid) if *uid != validity))
+}
+
+fn closed(outcome: &Outcome<'_>) -> bool {
+    // imap-proto doesn't model the RFC 7162 CLOSED code.
+    outcome
+        .information
+        .as_deref()
+        .and_then(|info| info.as_bytes().get(..8))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"[CLOSED]"))
+}
+
+fn invalidates(parsed: &Response<'_>, folder: &str, validity: u32) -> bool {
+    match parsed {
+        Response::Data { status, outcome }
+        | Response::Done {
+            status, outcome, ..
+        } => {
+            matches!(status, Status::Bye | Status::PreAuth)
+                || closed(outcome)
+                || matches!(outcome.code, Some(ResponseCode::UidValidity(uid)) if uid != validity)
+        }
+        Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+            same_folder(mailbox, folder) && changed_validity(status, validity)
+        }
+        _ => false,
+    }
+}
+
+pub fn forget_selection(session: &mut Session) {
+    session.get_mut().selected = None;
+}
+
+/// UID reads and Seen changes can reuse a confirmed selection. A fresh
+/// SELECT for other commands still obtains their complete mailbox metadata.
+pub async fn select_read(session: &mut Session, folder: &str, validity: u32) -> Result<u32> {
+    drain(session);
+    if validity != 0
+        && session.get_ref().tagged
+        && session.get_ref().buffered.is_empty()
+        && session
+            .get_ref()
+            .selected
+            .as_ref()
+            .is_some_and(|(name, uid)| same_folder(name, folder) && *uid == validity)
+    {
+        return Ok(validity);
+    }
+    forget_selection(session);
+    let command = format!("SELECT {}", quote_folder(folder)?);
+    let mut selected = None;
+    let mut reported_change = false;
+    exchange(session, &command, Exchange::small("SELECT"), |parsed, _| {
+        if let Response::Data {
+            status: Status::Ok,
+            outcome,
+        }
+        | Response::Done {
+            status: Status::Ok,
+            outcome,
+            ..
+        } = parsed
+        {
+            if closed(outcome) {
+                // QRESYNC may close the old mailbox before announcing the new one.
+                reported_change |= selected.is_some() || matches!(parsed, Response::Done { .. });
+            } else if let Some(ResponseCode::UidValidity(uid)) = outcome.code {
+                reported_change |= uid == 0 || selected.is_some_and(|previous| previous != uid);
+                selected = Some(uid);
+            }
+        } else if let Response::MailboxData(MailboxDatum::Status { mailbox, status }) = parsed
+            && same_folder(mailbox, folder)
+            && validity != 0
+            && changed_validity(status, validity)
+        {
+            reported_change = true;
+        }
+        Ok(())
+    })
+    .await?;
+    if reported_change {
+        bail!(Said("the selected mailbox changed during SELECT".into()));
+    }
+    if let Some(uid) = selected {
+        session.get_mut().selected = Some((folder.to_string(), uid));
+    }
+    Ok(selected.unwrap_or(0))
 }
 
 /// What SELECT says about a folder.
@@ -441,6 +1090,7 @@ impl Selected {
 }
 
 pub async fn select(session: &mut Session, folder: &str) -> Result<Selected> {
+    forget_selection(session);
     drain(session);
     let mailbox = timed(TIMEOUT, "SELECT", session.select(folder)).await?;
     let permanent = &mailbox.permanent_flags;
@@ -462,7 +1112,23 @@ pub async fn select(session: &mut Session, folder: &str) -> Result<Selected> {
 /// Drops what the server said that no command asked for: kept, it would
 /// stay in memory as long as the session (up to 100 of any size).
 fn drain(session: &mut Session) {
-    while session.unsolicited_responses.try_recv().is_ok() {}
+    while let Ok(response) = session.unsolicited_responses.try_recv() {
+        let invalidate = session
+            .get_ref()
+            .selected
+            .as_ref()
+            .is_some_and(|(folder, uid)| match response {
+                UnsolicitedResponse::Status {
+                    mailbox,
+                    attributes,
+                } => same_folder(&mailbox, folder) && changed_validity(&attributes, *uid),
+                UnsolicitedResponse::Other(data) => invalidates(data.parsed(), folder, *uid),
+                _ => false,
+            });
+        if invalidate {
+            forget_selection(session);
+        }
+    }
 }
 
 /// A FETCH's answers, at most `max` of them and `max_bytes` of message
@@ -470,7 +1136,7 @@ fn drain(session: &mut Session) {
 /// either, the connection is dropped (an error that isn't [`Said`]), since
 /// what's still coming would be read as the next command's answer.
 async fn collect(
-    what: &str,
+    what: &'static str,
     timeout: Duration,
     stream: impl futures::Future<
         Output = async_imap::error::Result<
@@ -655,8 +1321,7 @@ pub async fn headers(session: &mut Session, uids: &[u32]) -> Result<Vec<Header>>
 }
 
 /// Gmail's FETCH has no public thread-id accessor in async-imap. Use its
-/// public command/response API and re-exported parser without retaining
-/// unsolicited responses. Interrupted exchanges drop the connection.
+/// public command/response API and re-exported parser.
 async fn gmail_command(
     session: &mut Session,
     command: &str,
@@ -664,18 +1329,124 @@ async fn gmail_command(
     remaining_bytes: &mut usize,
     mut accept: impl FnMut(&Response<'_>) -> Result<()>,
 ) -> Result<()> {
+    let limits = Exchange {
+        responses: max_responses,
+        bytes: *remaining_bytes,
+        framing: Framing::Ordinary,
+        ..Exchange::small("Gmail conversations")
+    };
+    let read = exchange(session, command, limits, |parsed, _| accept(parsed)).await?;
+    *remaining_bytes -= read;
+    Ok(())
+}
+
+struct Exchange {
+    label: &'static str,
+    timeout: Duration,
+    responses: usize,
+    bytes: usize,
+    framing: Framing,
+    require_selection: bool,
+}
+
+impl Exchange {
+    fn small(label: &'static str) -> Self {
+        Self {
+            label,
+            timeout: TIMEOUT,
+            responses: 256,
+            bytes: 1 << 20,
+            framing: Framing::Structure,
+            require_selection: false,
+        }
+    }
+}
+
+// Consume complete unsolicited responses that the codec already has
+// before sending a command that depends on the selected UIDVALIDITY.
+// Incomplete replies are left for the exchange; never wait on the socket
+// here. The guard has already checked the exact buffered bytes.
+fn check_selected(session: &mut Session, max_responses: usize) -> Result<usize> {
+    let changed = || Said("the selected mailbox changed before the IMAP command".into());
+    if session.get_ref().selected.is_none() {
+        bail!(changed());
+    }
+    if session.get_ref().buffered.is_empty() {
+        return Ok(0);
+    }
+    session.get_mut().buffered_only = true;
+    let result = (|| {
+        let mut count = 0;
+        while let Some(response) = session.read_response().now_or_never() {
+            count += 1;
+            if count > max_responses {
+                bail!("the server sent too many IMAP responses");
+            }
+            let response = response?.context("the IMAP connection ended")?;
+            let parsed = response.parsed();
+            if matches!(
+                parsed,
+                Response::Data {
+                    status: Status::Bye | Status::PreAuth,
+                    ..
+                } | Response::Done { .. }
+                    | Response::Continue(_)
+            ) {
+                bail!("the server sent an unexpected response between IMAP commands");
+            }
+            if session
+                .get_ref()
+                .selected
+                .as_ref()
+                .is_some_and(|(folder, uid)| invalidates(parsed, folder, *uid))
+            {
+                forget_selection(session);
+                bail!(changed());
+            }
+        }
+        Ok(count)
+    })();
+    session.get_mut().buffered_only = false;
+    result
+}
+
+/// A serialized, bounded exchange. Only a matching tagged completion can
+/// make a refusal safe to report without giving up the connection.
+async fn exchange(
+    session: &mut Session,
+    command: &str,
+    limits: Exchange,
+    mut accept: impl FnMut(&Response<'_>, &[u8]) -> Result<()>,
+) -> Result<usize> {
     drain(session);
-    timed(TIMEOUT, "Gmail conversations", async {
+    session.get_mut().guard(limits.bytes, limits.framing)?;
+    let result = timed(limits.timeout, limits.label, async {
+        let mut count = if limits.require_selection {
+            match check_selected(session, limits.responses) {
+                Ok(count) => count,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            0
+        };
         let id = session.run_command(command).await?;
-        let mut count = 0usize;
+        let mut invalidated = false;
         while let Some(response) = session.read_response().await? {
             count += 1;
-            let bytes = response.borrow_owner().len();
-            if count > max_responses || bytes > *remaining_bytes {
-                return Ok(Err(anyhow!("the server sent too much conversation data")));
+            if count > limits.responses {
+                return Ok(Err(anyhow!("the server sent too many IMAP responses")));
             }
-            *remaining_bytes -= bytes;
-            match response.parsed() {
+            let parsed = response.parsed();
+            if session
+                .get_ref()
+                .selected
+                .as_ref()
+                .is_some_and(|(folder, uid)| invalidates(parsed, folder, *uid))
+            {
+                forget_selection(session);
+                invalidated = true;
+            }
+            match parsed {
                 Response::Done {
                     tag,
                     status,
@@ -684,31 +1455,152 @@ async fn gmail_command(
                     if tag != &id {
                         return Ok(Err(anyhow!("the server answered a different command")));
                     }
+                    if let Err(error) = session.get_mut().saw_tag(response.borrow_owner(), outcome)
+                    {
+                        return Ok(Err(error.into()));
+                    }
                     let words =
                         || format!("code: {:?}, info: {:?}", outcome.code, outcome.information);
                     return match status {
-                        Status::Ok => Ok(Ok(())),
+                        Status::Ok if invalidated && limits.require_selection => Ok(Err(anyhow!(
+                            Said("the selected mailbox changed during the IMAP command".into())
+                        ))),
+                        Status::Ok => Ok(accept(parsed, response.borrow_owner())),
                         Status::No => Err(async_imap::error::Error::No(words())),
                         Status::Bad => Err(async_imap::error::Error::Bad(words())),
                         _ => Err(async_imap::error::Error::ConnectionLost),
                     };
                 }
                 Response::Data {
-                    status: Status::Bye,
+                    status: Status::Bye | Status::PreAuth,
                     ..
-                } => {
-                    return Err(async_imap::error::Error::ConnectionLost);
                 }
-                parsed => {
-                    if let Err(error) = accept(parsed) {
-                        return Ok(Err(error));
+                | Response::Continue(_) => return Err(async_imap::error::Error::ConnectionLost),
+                _ => {
+                    if let Err(error) = accept(parsed, response.borrow_owner()) {
+                        return Ok(Err(anyhow!("{error:#}")));
                     }
                 }
             }
         }
         Err(async_imap::error::Error::ConnectionLost)
     })
-    .await?
+    .await;
+    let remaining = session
+        .get_mut()
+        .guard
+        .take()
+        .map_or(0, |guard| guard.bytes);
+    result??;
+    Ok(limits.bytes - remaining)
+}
+
+pub async fn fetch_parts(
+    session: &mut Session,
+    command: &str,
+    max_bytes: usize,
+    structure: bool,
+    mut accept: impl FnMut(&Response<'_>, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut mislabeled = false;
+    exchange(
+        session,
+        command,
+        Exchange {
+            label: if structure {
+                "BODYSTRUCTURE"
+            } else {
+                "FETCH parts"
+            },
+            timeout: if structure { TIMEOUT } else { BODY_TIMEOUT },
+            responses: 160,
+            bytes: max_bytes,
+            framing: if structure {
+                Framing::BodyStructure
+            } else {
+                Framing::Sections
+            },
+            require_selection: true,
+        },
+        |parsed, raw| {
+            if let Response::Fetch(_, attrs) = parsed
+                && attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        AttributeValue::BodySection {
+                            section: Some(SectionPath::Full(MessageSection::Header)),
+                            index: None,
+                            data: Some(data),
+                        } if !exact_header(raw, data)
+                    )
+                })
+            {
+                mislabeled = true;
+                return Ok(());
+            }
+            accept(parsed, raw)
+        },
+    )
+    .await?;
+    if mislabeled {
+        bail!(Said(
+            "the server did not send the whole message header".into()
+        ));
+    }
+    Ok(())
+}
+
+fn value_prefix<'a>(raw: &'a [u8], data: &[u8]) -> Option<&'a [u8]> {
+    (data.as_ptr() as usize)
+        .checked_sub(raw.as_ptr() as usize)
+        .and_then(|offset| raw.get(..offset))
+}
+
+// imap-proto borrows the contents of both literals and quoted strings without
+// unescaping the latter. Literal data, including backslashes, stays untouched.
+pub(crate) fn section_bytes<'a>(raw: &[u8], data: &'a [u8]) -> Cow<'a, [u8]> {
+    if !value_prefix(raw, data).is_some_and(|prefix| prefix.ends_with(b"\"")) {
+        return Cow::Borrowed(data);
+    }
+    let Some(first) = data.iter().position(|&b| b == b'\\') else {
+        return Cow::Borrowed(data);
+    };
+    let mut decoded = Vec::with_capacity(data.len() - 1);
+    decoded.extend_from_slice(&data[..first]);
+    let mut tail = &data[first..];
+    while let Some((&escaped, rest)) = tail.get(1..).and_then(|tail| tail.split_first()) {
+        // A quoted string was already accepted by the codec: each escape
+        // is followed by exactly one quote or backslash.
+        decoded.push(escaped);
+        let Some(next) = rest.iter().position(|&b| b == b'\\') else {
+            decoded.extend_from_slice(rest);
+            break;
+        };
+        decoded.extend_from_slice(&rest[..next]);
+        tail = &rest[next..];
+    }
+    Cow::Owned(decoded)
+}
+
+// imap-proto aliases HEADER.FIELDS(.NOT) to HEADER. Locate the spelling
+// immediately before the parser's borrowed payload, not inside the mail.
+fn exact_header(raw: &[u8], data: &[u8]) -> bool {
+    let Some(prefix) = value_prefix(raw, data) else {
+        return false;
+    };
+    let before_value = if let Some(before_length) = prefix.strip_suffix(b"}\r\n") {
+        before_length
+            .iter()
+            .rposition(|&b| b == b'{')
+            .map(|i| &before_length[..i])
+    } else {
+        prefix.strip_suffix(b"\"")
+    };
+    const HEADER: &[u8] = b"BODY[HEADER] ";
+    before_value.is_some_and(|prefix| {
+        prefix.len() >= HEADER.len()
+            && prefix[prefix.len() - HEADER.len()..].eq_ignore_ascii_case(HEADER)
+    })
 }
 
 fn gmail_uid(attrs: &[AttributeValue<'_>]) -> Option<u32> {
@@ -1003,42 +1895,96 @@ pub async fn flags(session: &mut Session, low: u32, high: u32) -> Result<Vec<(u3
 }
 
 /// A whole message, without marking it read; `None` if it's gone.
-pub async fn body(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
-    let size = collect(
-        "FETCH",
-        TIMEOUT,
-        session.uid_fetch(uid.to_string(), "(UID RFC822.SIZE)"),
-        16,
-        1 << 20,
-    )
-    .await?;
-    let Some(size) = size.iter().find(|f| f.uid == Some(uid)).map(|f| f.size) else {
-        return Ok(None);
+pub async fn body(session: &mut Session, uid: u32, size: u32) -> Result<Option<Vec<u8>>> {
+    let size = if size == 0 {
+        let mut found = None;
+        exchange(
+            session,
+            &format!("UID FETCH {uid} (UID RFC822.SIZE)"),
+            Exchange {
+                framing: Framing::Sections,
+                require_selection: true,
+                ..Exchange::small("FETCH size")
+            },
+            |parsed, _| {
+                if let Response::Fetch(_, attrs) = parsed
+                    && requested_uid(attrs, uid)
+                {
+                    let size = attrs.iter().find_map(|attr| match attr {
+                        AttributeValue::Rfc822Size(n) => Some(*n),
+                        _ => None,
+                    });
+                    found = size.or(found).or(Some(0));
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        let Some(size) = found else {
+            return Ok(None);
+        };
+        size
+    } else {
+        size
     };
-    if size.unwrap_or(0) > MAX_MESSAGE {
+    if size > MAX_MESSAGE {
         bail!(Said(format!(
             "the message is {}, too big to download",
-            mail::size(size.unwrap_or(0) as usize)
+            mail::size(size as usize)
         )));
     }
-    // The size the server gave is only its word: the bytes that come are
-    // held to the cap too.
-    let fetched = collect(
-        "FETCH",
-        BODY_TIMEOUT,
-        session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])"),
-        16,
-        MAX_MESSAGE as usize + (1 << 20),
+    let mut body = None;
+    let mut too_big = false;
+    let start = imap_timing::start();
+    let result = exchange(
+        session,
+        &format!("UID FETCH {uid} (UID BODY.PEEK[]<0.{}>)", MAX_MESSAGE + 1),
+        Exchange {
+            label: "FETCH body",
+            timeout: BODY_TIMEOUT,
+            responses: 17,
+            bytes: MAX_MESSAGE as usize + (1 << 20),
+            framing: Framing::Sections,
+            require_selection: true,
+        },
+        |parsed, raw| {
+            if let Response::Fetch(_, attrs) = parsed
+                && requested_uid(attrs, uid)
+            {
+                for attr in attrs {
+                    if let AttributeValue::BodySection {
+                        section: None,
+                        index: Some(0),
+                        data: Some(bytes),
+                    } = attr
+                    {
+                        let bytes = section_bytes(raw, bytes);
+                        if bytes.len() > MAX_MESSAGE as usize {
+                            too_big = true;
+                        } else if body.is_none() {
+                            body = Some(bytes.into_owned());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
     )
-    .await?;
-    let body = fetched
-        .iter()
-        .find(|f| f.uid == Some(uid))
-        .and_then(|f| f.body());
-    if body.is_some_and(|b| b.len() > MAX_MESSAGE as usize) {
+    .await;
+    imap_timing::finish(start, "body bytes", body.as_ref().map(Vec::len));
+    result?;
+    if too_big {
         bail!(Said("the message is too big to download".into()));
     }
-    Ok(body.map(<[u8]>::to_vec))
+    Ok(body)
+}
+
+fn requested_uid(attrs: &[AttributeValue<'_>], uid: u32) -> bool {
+    let mut uids = attrs.iter().filter_map(|attr| match attr {
+        AttributeValue::Uid(n) => Some(*n),
+        _ => None,
+    });
+    uid != 0 && uids.next() == Some(uid) && uids.next().is_none()
 }
 
 /// Which flag a key changes.
@@ -1060,6 +2006,23 @@ impl FlagKind {
 }
 
 pub async fn set_flag(session: &mut Session, uids: &[u32], flag: FlagKind, on: bool) -> Result<()> {
+    if flag == FlagKind::Seen {
+        let sign = if on { '+' } else { '-' };
+        for set in uid_sets(uids) {
+            exchange(
+                session,
+                &format!("UID STORE {set} {sign}FLAGS.SILENT (\\Seen)"),
+                Exchange {
+                    framing: Framing::Sections,
+                    require_selection: true,
+                    ..Exchange::small("STORE")
+                },
+                |_, _| Ok(()),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     store_flags(session, uids, flag.imap(), on).await
 }
 
@@ -1320,57 +2283,322 @@ pub(crate) mod tests {
 
     pub(crate) async fn scripted_capabilities(
         capabilities: &'static str,
-        mut answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static,
+        answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static,
     ) -> (Session, Caps) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            write.write_all(b"* OK ready\r\n").await.unwrap();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
-                let reply = if command.starts_with("LOGIN") {
-                    format!("{tag} OK done\r\n").into_bytes()
-                } else if command.starts_with("CAPABILITY") {
-                    format!("* CAPABILITY {capabilities}\r\n{tag} OK done\r\n").into_bytes()
-                } else {
-                    answer(tag, command)
-                };
-                if write.write_all(&reply).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let endpoint = Endpoint {
-            host: "127.0.0.1".into(),
-            port,
-            security: Security::None,
-            tls: net::tls_config(None).unwrap(),
-        };
+        let endpoint = scripted_endpoint(capabilities, answer).await;
         connect(&endpoint, "me", "pw", Auth::Password)
             .await
             .unwrap()
     }
 
+    pub(crate) async fn scripted_endpoint(
+        capabilities: &'static str,
+        mut answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static,
+    ) -> Endpoint {
+        scripted_connections(capabilities, 1, move |_, tag, command| answer(tag, command)).await
+    }
+
+    pub(crate) async fn scripted_connections(
+        capabilities: &'static str,
+        count: usize,
+        mut answer: impl FnMut(usize, &str, &str) -> Vec<u8> + Send + 'static,
+    ) -> Endpoint {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for i in 0..count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                write.write_all(b"* OK ready\r\n").await.unwrap();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+                    let reply = if command.starts_with("LOGIN") {
+                        format!("{tag} OK done\r\n").into_bytes()
+                    } else if command.starts_with("CAPABILITY") {
+                        format!("* CAPABILITY {capabilities}\r\n{tag} OK done\r\n").into_bytes()
+                    } else {
+                        answer(i, tag, command)
+                    };
+                    if reply.is_empty() || write.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Endpoint {
+            host: "127.0.0.1".into(),
+            port,
+            security: Security::None,
+            tls: net::tls_config(None).unwrap(),
+        }
+    }
+
     #[tokio::test]
     async fn a_message_bigger_than_the_cap_is_refused_whatever_size_the_server_gives() {
         let (mut session, _) = scripted(|tag, command| {
-            if command.contains("BODY.PEEK") {
-                let big = MAX_MESSAGE as usize + (2 << 20);
-                let mut out = format!("* 1 FETCH (UID 1 BODY[] {{{big}}}\r\n").into_bytes();
-                out.resize(out.len() + big, b'a');
-                out.extend(format!(")\r\n{tag} OK done\r\n").as_bytes());
-                out
-            } else {
-                // No RFC822.SIZE: the size can't be checked beforehand.
-                format!("* 1 FETCH (UID 1)\r\n{tag} OK done\r\n").into_bytes()
-            }
+            let reply = match command {
+                "SELECT \"INBOX\"" => format!("* OK [UIDVALIDITY 7] stable\r\n{tag} OK done\r\n"),
+                "UID FETCH 1 (UID RFC822.SIZE)" => {
+                    // No RFC822.SIZE: the size can't be checked beforehand.
+                    format!("* 1 FETCH (UID 1)\r\n{tag} OK done\r\n")
+                }
+                command if command.contains("BODY.PEEK") => {
+                    let big = MAX_MESSAGE as usize + (2 << 20);
+                    format!("* 1 FETCH (UID 1 BODY[]<0> {{{big}}}\r\n")
+                }
+                _ => panic!("unexpected command: {command}"),
+            };
+            reply.into_bytes()
         })
         .await;
-        assert!(body(&mut session, 1).await.is_err());
+        select_read(&mut session, "INBOX", 7).await.unwrap();
+        assert!(body(&mut session, 1, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn known_sizes_use_one_bounded_fetch_and_selection_is_reused_or_renewed() {
+        let mut step = 0;
+        let (mut session, _) = scripted_capabilities("IMAP4rev1", move |tag, command| {
+            let reply = match step {
+                0 => {
+                    assert_eq!(command, "SELECT \"INBOX\"");
+                    "* OK [UIDVALIDITY 7] stable\r\n".into()
+                }
+                1 => {
+                    assert_eq!(
+                        command,
+                        format!("UID FETCH 1 (UID BODY.PEEK[]<0.{}>)", MAX_MESSAGE + 1)
+                    );
+                    // Parentheses and CRLF in a literal aren't BODYSTRUCTURE.
+                    let raw = format!("{}\r\nhello", "(".repeat(1024));
+                    format!("* 1 FETCH (BODY[]<0> {{{}}}\r\n{raw} UID 1)\r\n", raw.len())
+                }
+                2 => {
+                    assert_eq!(command, "UID STORE 1 +FLAGS.SILENT (\\Seen)");
+                    String::new()
+                }
+                3 => {
+                    assert_eq!(
+                        command,
+                        format!("UID FETCH 2 (UID BODY.PEEK[]<0.{}>)", MAX_MESSAGE + 1)
+                    );
+                    // The only answers have a different UID or partial origin.
+                    "* 1 FETCH (UID 1 BODY[]<0> {3}\r\nold)\r\n\
+                     * 2 FETCH (UID 2 BODY[]<3> {3}\r\nold)\r\n"
+                        .into()
+                }
+                4 => {
+                    assert_eq!(command, "SELECT \"Archive\"");
+                    "* OK [UIDVALIDITY 9] stable\r\n".into()
+                }
+                5 => {
+                    assert_eq!(command, "STATUS \"Archive\" (MESSAGES UNSEEN)");
+                    "* STATUS Archive (MESSAGES 2 UNSEEN 1 UIDVALIDITY 10)\r\n".into()
+                }
+                6 => {
+                    assert_eq!(command, "SELECT \"Archive\"");
+                    "* OK [UIDVALIDITY 10] changed\r\n".into()
+                }
+                _ => panic!("unexpected command: {command}"),
+            };
+            step += 1;
+            format!("{reply}{tag} OK done\r\n").into_bytes()
+        })
+        .await;
+        assert_eq!(select_read(&mut session, "INBOX", 7).await.unwrap(), 7);
+        let raw = body(&mut session, 1, 1234).await.unwrap().unwrap();
+        assert!(raw.ends_with(b"\r\nhello"));
+        assert_eq!(select_read(&mut session, "inbox", 7).await.unwrap(), 7);
+        set_flag(&mut session, &[1], FlagKind::Seen, true)
+            .await
+            .unwrap();
+        assert_eq!(select_read(&mut session, "INBOX", 7).await.unwrap(), 7);
+        assert!(body(&mut session, 2, 3).await.unwrap().is_none());
+        assert_eq!(select_read(&mut session, "Archive", 9).await.unwrap(), 9);
+        assert_eq!(status(&mut session, "Archive").await.unwrap(), (1, 2));
+        assert_eq!(select_read(&mut session, "Archive", 9).await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn conflicting_select_generations_cannot_be_used_for_uid_reads() {
+        let mut step = 0;
+        let (mut session, _) = scripted_capabilities("IMAP4rev1", move |tag, command| {
+            assert_eq!(command, "SELECT \"INBOX\"");
+            let reply = match step {
+                0 => format!("* OK [UIDVALIDITY 8] first\r\n{tag} OK [UIDVALIDITY 7] done\r\n"),
+                1 => format!(
+                    "* OK [CLOSED] old mailbox\r\n* NO [UIDVALIDITY 8] ignored\r\n\
+                             * OK [UIDVALIDITY 7] first\r\n{tag} OK [UIDVALIDITY 7] done\r\n"
+                ),
+                _ => panic!("unexpected command: {command}"),
+            };
+            step += 1;
+            reply.into_bytes()
+        })
+        .await;
+        assert!(
+            select_read(&mut session, "INBOX", 7)
+                .await
+                .unwrap_err()
+                .is::<Said>()
+        );
+        assert_eq!(select_read(&mut session, "INBOX", 7).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn fetch_handles_unsolicited_read_ahead_and_status_text_ending_in_braces() {
+        let (mut session, _) = scripted(|tag, command| {
+            match command {
+                "SELECT \"INBOX\"" => {
+                    format!("* OK [UIDVALIDITY 7] stable\r\n{tag} OK selected\r\n* 2 EXI")
+                }
+                c if c == format!("UID FETCH 1 (UID BODY.PEEK[]<0.{}>)", MAX_MESSAGE + 1) => {
+                    format!(
+                        "STS\r\n* OK progress {{1}}\r\n* 1 FETCH (UID 1 BODY[]<0> {{3}}\r\none)\r\n\
+                         {tag} OK fetched {{1}}\r\n"
+                    )
+                }
+                c if c == format!("UID FETCH 2 (UID BODY.PEEK[]<0.{}>)", MAX_MESSAGE + 1) => {
+                    format!("{tag} NO unavailable {{1}}\r\n")
+                }
+                _ => panic!("unexpected command: {command}"),
+            }
+            .into_bytes()
+        })
+        .await;
+        assert_eq!(select_read(&mut session, "INBOX", 7).await.unwrap(), 7);
+        assert_eq!(
+            body(&mut session, 1, 3).await.unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
+        assert!(body(&mut session, 2, 3).await.unwrap_err().is::<Said>());
+    }
+
+    #[tokio::test]
+    async fn a_buffered_mailbox_change_prevents_the_next_uid_command() {
+        for probe_size in [false, true] {
+            let (sent, mut commands) = tokio::sync::mpsc::unbounded_channel();
+            let (mut session, _) = scripted(move |tag, command| {
+                sent.send(command.to_owned()).unwrap();
+                let change = "* OK [UIDVALIDITY 8] rebuilt\r\n";
+                match command {
+                    "SELECT \"INBOX\"" => {
+                        let tail = if probe_size { "" } else { change };
+                        format!("* OK [UIDVALIDITY 7] stable\r\n{tag} OK selected\r\n{tail}")
+                    }
+                    "UID FETCH 1 (UID RFC822.SIZE)" if probe_size => {
+                        format!("* 1 FETCH (UID 1 RFC822.SIZE 3)\r\n{tag} OK done\r\n{change}")
+                    }
+                    "SELECT \"Archive\"" => {
+                        format!("* OK [UIDVALIDITY 9] stable\r\n{tag} OK selected\r\n")
+                    }
+                    _ => format!("{tag} OK done\r\n"),
+                }
+                .into_bytes()
+            })
+            .await;
+            select_read(&mut session, "INBOX", 7).await.unwrap();
+            let error = if probe_size {
+                body(&mut session, 1, 0).await.unwrap_err()
+            } else {
+                set_flag(&mut session, &[1], FlagKind::Seen, true)
+                    .await
+                    .unwrap_err()
+            };
+            assert!(error.is::<Said>(), "{error:#}");
+            assert_eq!(select_read(&mut session, "Archive", 9).await.unwrap(), 9);
+            assert_eq!(commands.try_recv().unwrap(), "SELECT \"INBOX\"");
+            if probe_size {
+                assert_eq!(
+                    commands.try_recv().unwrap(),
+                    "UID FETCH 1 (UID RFC822.SIZE)"
+                );
+            }
+            assert_eq!(commands.try_recv().unwrap(), "SELECT \"Archive\"");
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_body_sections_can_be_long_and_contain_parentheses() {
+        const COMMAND: &str = "UID FETCH 1 (UID BODY.PEEK[1]<0.80000> BODY.PEEK[2]<0.4>)";
+        let text = format!("{} \"quote\" \\", "(".repeat(70_000));
+        let raw = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let (mut session, _) = scripted(move |tag, command| match command {
+            "SELECT \"INBOX\"" => {
+                format!("* OK [UIDVALIDITY 7] stable\r\n{tag} OK selected\r\n").into_bytes()
+            }
+            COMMAND => format!(
+                "* 1 FETCH (UID 1 BODY[1]<0> \"{raw}\" BODY[2]<0> {{3}}\r\na\\b)\r\n{tag} OK done\r\n"
+            )
+            .into_bytes(),
+            _ => panic!("unexpected command: {command}"),
+        })
+        .await;
+        select_read(&mut session, "INBOX", 7).await.unwrap();
+        let mut bodies = Vec::new();
+        fetch_parts(&mut session, COMMAND, 96 << 10, false, |response, raw| {
+            if let Response::Fetch(_, attrs) = response {
+                for attr in attrs {
+                    if let AttributeValue::BodySection {
+                        data: Some(data), ..
+                    } = attr
+                    {
+                        bodies.push(section_bytes(raw, data).into_owned());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            bodies[0] == text.as_bytes(),
+            "quoted body did not round-trip"
+        );
+        assert_eq!(bodies[1], b"a\\b");
+    }
+
+    #[tokio::test]
+    async fn a_wide_body_structure_with_attachment_names_still_downloads() {
+        const COMMAND: &str = "UID FETCH 1 (UID BODYSTRUCTURE)";
+        let (mut session, _) = scripted(|tag, command| {
+            match command {
+                "SELECT \"INBOX\"" => {
+                    format!("* OK [UIDVALIDITY 7] stable\r\n{tag} OK selected\r\n")
+                }
+                COMMAND => {
+                    let name = format!("{}{}.bin", ")".repeat(64), "(".repeat(64));
+                    let part = format!(
+                        "(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" {{{}}}\r\n{name}) \
+                         NIL NIL \"BASE64\" 65536 NIL (\"ATTACHMENT\" (\"FILENAME\" \"file.bin\")))",
+                        name.len(),
+                    );
+                    format!(
+                        "* 1 FETCH (UID 1 BODYSTRUCTURE ({} \"MIXED\" (\"BOUNDARY\" \"many\")))\r\n\
+                         {tag} OK fetched\r\n",
+                        part.repeat(32),
+                    )
+                }
+                _ => panic!("unexpected command: {command}"),
+            }
+            .into_bytes()
+        })
+        .await;
+        select_read(&mut session, "INBOX", 7).await.unwrap();
+        let mut structure = false;
+        fetch_parts(&mut session, COMMAND, 32 << 10, true, |response, _| {
+            if let Response::Fetch(_, attrs) = response {
+                structure |= attrs
+                    .iter()
+                    .any(|a| matches!(a, AttributeValue::BodyStructure(_)));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(structure);
     }
 
     #[tokio::test]

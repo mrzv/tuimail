@@ -37,7 +37,7 @@ use crate::store::{self, Change, Changed, Flags, Folder, Known, Message, Role, S
 use crate::theme::{self, Colors};
 use crate::ui::reader::{BodySelection, BodyView};
 use crate::worker::{self, Endpoints, Request, State, Worker};
-use crate::{contacts, net, tags, text, tools};
+use crate::{contacts, imap_timing, net, tags, text, tools};
 
 /// The longest search or path typed or pasted, in characters.
 const MAX_PROMPT: usize = 4096;
@@ -120,6 +120,7 @@ pub enum AppEvent {
     },
     /// Attachments taken out of a message: saved, or to open together.
     Extracted {
+        source: Kept,
         open: bool,
         /// The user said yes to opening these files.
         confirmed: bool,
@@ -425,9 +426,9 @@ pub(crate) struct ReplyOriginal {
 }
 
 impl ReplyOriginal {
-    fn new(parsed: Parsed, plain: bool) -> Self {
+    fn new(parsed: Arc<Parsed>, plain: bool) -> Self {
         Self {
-            parsed: Arc::new(parsed),
+            parsed,
             body: None,
             focused: false,
             width: 0,
@@ -635,13 +636,42 @@ impl AccountState {
     }
 }
 
+/// A displayable message is not necessarily a complete MIME message.
+#[derive(Clone)]
+enum ReadSource {
+    Whole(Arc<Vec<u8>>),
+    Sections(Arc<mail::Partial>),
+}
+
+impl ReadSource {
+    fn whole(raw: Vec<u8>) -> Self {
+        Self::Whole(Arc::new(raw))
+    }
+
+    fn raw(&self) -> &[u8] {
+        match self {
+            Self::Whole(raw) => raw,
+            Self::Sections(message) => &message.raw,
+        }
+    }
+
+    fn parsed(&self) -> Option<Arc<Parsed>> {
+        match self {
+            Self::Whole(raw) => mail::parse(raw).map(Arc::new),
+            Self::Sections(message) => Some(Arc::clone(&message.parsed)),
+        }
+    }
+}
+
 /// The message being read.
 pub struct Reader {
     pub account: usize,
     pub folder: String,
     pub uid: u32,
     pub message: Message,
-    pub raw: Option<Arc<Vec<u8>>>,
+    source: Option<ReadSource>,
+    /// If downloading, whether that request may defer attachments.
+    loading: Option<bool>,
     pub parsed: Option<Arc<Parsed>>,
     pub body: Option<Body>,
     pub(crate) layout_generation: u64,
@@ -791,7 +821,10 @@ pub enum PickerKind {
         targets: Vec<String>,
     },
     Links,
-    Attachments,
+    Attachments {
+        source: Kept,
+        files: Vec<mail::Attachment>,
+    },
     /// Changes to undo, by id, in the items' order.
     Changes(Vec<i64>),
     FolderVisibility {
@@ -933,7 +966,8 @@ pub enum Confirm {
     /// discards it.
     CloseComposer,
     OpenAttachments {
-        files: Vec<(u32, String)>,
+        source: Kept,
+        files: Vec<mail::Attachment>,
         opener: Option<AttachmentOpener>,
     },
     RemoveAccount(usize),
@@ -1010,6 +1044,34 @@ enum Pending {
     Reply { all: bool },
     Forward,
     EditDraft(u64),
+}
+
+impl Pending {
+    fn allows_sections(&self) -> bool {
+        matches!(self, Self::Reply { .. })
+    }
+}
+
+struct PendingDraft {
+    key: (usize, String, u32),
+    action: Pending,
+    partial: bool,
+}
+
+struct Extraction {
+    source: Kept,
+    message: ReadSource,
+    files: Vec<mail::Attachment>,
+    dir: PathBuf,
+    open: bool,
+    confirmed: bool,
+    opener: Option<AttachmentOpener>,
+}
+
+impl Extraction {
+    fn deferred(file: &mail::Attachment) -> Option<&mail::PartRef> {
+        file.remote.as_ref().filter(|part| !part.downloaded)
+    }
 }
 
 pub struct App {
@@ -1105,8 +1167,10 @@ pub struct App {
     deletes_waiting: VecDeque<Confirm>,
     pub help: Option<HelpMenu>,
     pub status: Option<Status>,
-    pending: Option<((usize, String, u32), Pending)>,
+    pending: Option<PendingDraft>,
     pending_send: Option<PendingSend>,
+    pending_extraction: Option<(u64, Extraction)>,
+    next_extraction: u64,
     next_draft_edit: u64,
     /// Flags changed here, and when.
     local_flags: HashMap<(usize, String, u32), Instant>,
@@ -1150,9 +1214,8 @@ fn agent_date(timestamp: i64) -> Option<String> {
 /// A message for an agent: `header` with who it's from and to, its
 /// subject, attachments and text, links shown by their site only. Lays out
 /// HTML: only on a big-stack thread (`mail::in_background`).
-fn agent_text(raw: &[u8], max: usize, mut out: serde_json::Value) -> agent::Answer {
-    let parsed = mail::parse(raw).ok_or("This message couldn't be read")?;
-    let text = agent::hide_links(&mail::plain_text(&parsed));
+fn agent_text(parsed: &Parsed, max: usize, mut out: serde_json::Value) -> serde_json::Value {
+    let text = agent::hide_links(&mail::plain_text(parsed));
     let cut = text.chars().count() > max;
     // Everything the sender wrote, links by their site only.
     let addresses = |list: &[Addr]| {
@@ -1170,7 +1233,7 @@ fn agent_text(raw: &[u8], max: usize, mut out: serde_json::Value) -> agent::Answ
         .collect();
     out["text"] = serde_json::json!(text::first_chars(&text, max));
     out["cut"] = serde_json::json!(cut);
-    Ok(out)
+    out
 }
 
 impl App {
@@ -1289,6 +1352,8 @@ impl App {
             status: None,
             pending: None,
             pending_send: None,
+            pending_extraction: None,
+            next_extraction: 0,
             next_draft_edit: 0,
             local_flags: HashMap::new(),
             local_removed: HashMap::new(),
@@ -1481,7 +1546,7 @@ impl App {
     pub(crate) fn after_draw(&mut self) {
         let width = self.reader_width.get();
         if let Some(reader) = &self.reader
-            && reader.raw.is_some()
+            && reader.source.is_some()
             && reader.pending.is_none()
             && reader.width != width
         {
@@ -1728,12 +1793,19 @@ impl App {
             self.pop_check(i);
             return;
         }
-        let inbox = self.accounts[i].inbox();
-        // Every folder's counts take a command each: not every time.
-        if all || self.accounts[i].checks.is_multiple_of(FOLDERS_EVERY) {
-            self.send(i, Request::Folders);
-        }
+        let list = all || self.accounts[i].checks.is_multiple_of(FOLDERS_EVERY);
         self.accounts[i].checks = self.accounts[i].checks.wrapping_add(1);
+        if list {
+            // On startup LIST creates cache entries and identifies the inbox.
+            // Counts run separately, after the inbox sync queued on its reply.
+            self.send(i, Request::Folders);
+        } else {
+            self.sync_checked_folders(i);
+        }
+    }
+
+    fn sync_checked_folders(&mut self, i: usize) {
+        let inbox = self.accounts[i].inbox();
         self.sync_folder(i, &inbox);
         if let Place::Folder { account, folder } = self.place.clone()
             && account == i
@@ -1932,6 +2004,40 @@ impl App {
         }
     }
 
+    fn download_body(&self, key: &(usize, String, u32), size: u32, partial: bool, urgent: bool) {
+        self.send(
+            key.0,
+            Request::Body {
+                folder: key.1.clone(),
+                uid: key.2,
+                uidvalidity: self.uidvalidity(key.0, &key.1),
+                size,
+                partial,
+                urgent,
+                queued: imap_timing::start(),
+            },
+        );
+    }
+
+    fn prioritize_body(&self, key: &(usize, String, u32)) {
+        self.send(
+            key.0,
+            Request::PrioritizeBody {
+                folder: key.1.clone(),
+                uid: key.2,
+                uidvalidity: self.uidvalidity(key.0, &key.1),
+            },
+        );
+    }
+
+    fn prioritize_reader(&self) {
+        if let Some(reader) = &self.reader
+            && reader.loading.is_some()
+        {
+            self.prioritize_body(&reader.key());
+        }
+    }
+
     fn account_index(&self, id: &str) -> Option<usize> {
         self.accounts.iter().position(|a| a.id == id)
     }
@@ -2049,12 +2155,16 @@ impl App {
                 _ => self.error("That message can't be read"),
             },
             AppEvent::Extracted {
+                source,
                 open,
                 confirmed,
                 opener,
                 result,
             } => match result {
                 Ok(paths) => {
+                    if open && self.attachment_source(&source).is_none() {
+                        return self.error("That message changed before its files could be opened");
+                    }
                     // Recheck every saved name before opening any of them.
                     if open
                         && !confirmed
@@ -2190,16 +2300,24 @@ impl App {
             }
             E::Folders(folders) => {
                 let id = self.accounts[i].id.clone();
-                if self.store.set_folders(&id, &folders).is_ok() {
-                    for f in &folders {
-                        let _ = self.store.set_counts(&id, &f.name, f.unread, f.total);
+                if let Err(e) = self.store.set_folders(&id, &folders) {
+                    self.sync_checked_folders(i);
+                    return self.error(format!("Couldn't keep the folder list: {e:#}"));
+                }
+                let previous = std::mem::replace(
+                    &mut self.accounts[i].folders,
+                    self.store.folders(&id).unwrap_or_default(),
+                );
+                let present: HashSet<_> = folders.iter().map(|f| f.name.as_str()).collect();
+                for folder in previous {
+                    if !present.contains(folder.name.as_str()) {
+                        self.forget_folder_uids(i, &folder.name);
                     }
                 }
-                self.accounts[i].folders = self.store.folders(&id).unwrap_or_default();
                 // Deletes waiting in a folder the server no longer has went
                 // with it: not asked for again at every start.
                 for (folder, _, uids) in self.store.pending_deletes(&id).unwrap_or_default() {
-                    if !folders.iter().any(|f| f.name == folder) {
+                    if !present.contains(folder.as_str()) {
                         let _ = self.store.done_deletes(&id, &folder, &uids);
                     }
                 }
@@ -2214,9 +2332,21 @@ impl App {
                     };
                     self.clear_search();
                 }
-                self.sync_thread_folders(i);
+                self.sync_checked_folders(i);
                 self.reload();
             }
+            E::FoldersRefused(error) => {
+                self.sync_checked_folders(i);
+                self.error(format!(
+                    "{}: listing folders failed: {error}",
+                    self.account_name(i)
+                ));
+            }
+            E::Counts {
+                folder,
+                unread,
+                total,
+            } => self.set_folder_counts(i, &folder, unread, total),
             E::Synced(synced) => self.on_synced(i, synced),
             E::Older {
                 folder,
@@ -2241,53 +2371,11 @@ impl App {
             E::Body {
                 folder,
                 uid,
+                uidvalidity,
+                partial,
                 result,
-            } => {
-                let id = self.accounts[i].id.clone();
-                let key = (i, folder.clone(), uid);
-                self.agent_downloads.remove(&key);
-                match result {
-                    Ok(Some(raw)) => {
-                        let _ = self.store.save_body(&id, &folder, uid, &raw);
-                        for read in self.agent_reads_for(&key) {
-                            self.agent_render(read.key, raw.clone(), read.max, read.reply);
-                        }
-                        let raw = Arc::new(raw);
-                        self.make_previews(i, folder, vec![(uid, raw.clone())]);
-                        if self.reader.as_ref().is_some_and(|r| r.key() == key) {
-                            if let Some(reader) = self.reader.as_mut() {
-                                reader.raw = Some(raw.clone());
-                            }
-                            self.render();
-                        }
-                        if let Some((pending_key, _)) = &self.pending
-                            && *pending_key == key
-                            && let Some((_, pending)) = self.pending.take()
-                        {
-                            self.draft_from(key.clone(), raw, pending);
-                        }
-                    }
-                    Ok(None) => {
-                        let gone = "This message is gone from the server";
-                        for read in self.agent_reads_for(&key) {
-                            let _ = read.reply.send(Err(gone.into()));
-                        }
-                        if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
-                            reader.error = Some(gone.into());
-                        }
-                        self.drop_pending(&key, gone);
-                    }
-                    Err(e) => {
-                        for read in self.agent_reads_for(&key) {
-                            let _ = read.reply.send(Err(e.clone()));
-                        }
-                        if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
-                            reader.error = Some(e.clone());
-                        }
-                        self.drop_pending(&key, &e);
-                    }
-                }
-            }
+            } => self.on_body((i, folder, uid), uidvalidity, partial, result),
+            E::Files { id, result } => self.on_files(i, id, result),
             E::Searched {
                 folder,
                 generation,
@@ -2457,6 +2545,100 @@ impl App {
         }
     }
 
+    fn on_body(
+        &mut self,
+        key: (usize, String, u32),
+        uidvalidity: u32,
+        partial: bool,
+        result: Result<Option<worker::Download>, String>,
+    ) {
+        let (i, folder, uid) = &key;
+        if self.uidvalidity(*i, folder) != uidvalidity {
+            return;
+        }
+        let id = &self.accounts[*i].id;
+        let result = result.and_then(|download| {
+            download
+                .filter(|_| self.store.has_message(id, folder, *uid).unwrap_or(false))
+                .ok_or_else(|| "This message is gone from the server".into())
+        });
+        let source = match result {
+            Ok(download) => {
+                let cache = imap_timing::start();
+                let source = match download {
+                    worker::Download::Full(raw) => {
+                        let _ = self.store.save_body(id, folder, *uid, &raw);
+                        ReadSource::whole(raw)
+                    }
+                    worker::Download::Partial(message) => {
+                        let _ = self
+                            .store
+                            .save_partial(id, folder, *uid, uidvalidity, &message);
+                        ReadSource::Sections(Arc::new(message))
+                    }
+                };
+                imap_timing::finish(cache, "cache-write", Some(source.raw().len()));
+                if let Some(reader) = self.reader.as_mut().filter(|r| {
+                    r.account == *i
+                        && r.folder == *folder
+                        && r.uid == *uid
+                        && r.source.is_none()
+                        && (r.loading == Some(partial) || matches!(source, ReadSource::Whole(_)))
+                }) {
+                    reader.source = Some(source.clone());
+                    reader.loading = None;
+                    reader.error = None;
+                    self.render();
+                }
+                self.make_previews(*i, folder.clone(), vec![(*uid, source.clone())]);
+                Ok(source)
+            }
+            Err(error) => {
+                if let Some(reader) = self
+                    .reader
+                    .as_mut()
+                    .filter(|r| r.key() == key && r.loading == Some(partial))
+                {
+                    reader.loading = None;
+                    reader.error = Some(error.clone());
+                }
+                Err(error)
+            }
+        };
+        // An agent requests the complete message on a cache miss. A failed
+        // preview doesn't end its separate request or its download accounting.
+        if !partial || source.is_ok() {
+            self.agent_downloads.remove(&key);
+            for read in self.agent_reads_for(&key) {
+                match &source {
+                    Ok(source) => self.agent_render(read.key, source.clone(), read.max, read.reply),
+                    Err(error) => {
+                        let _ = read.reply.send(Err(error.clone()));
+                    }
+                }
+            }
+        }
+        if self.pending.as_ref().is_some_and(|draft| {
+            draft.key == key
+                && match &source {
+                    Ok(ReadSource::Whole(_)) => true,
+                    Ok(ReadSource::Sections(_)) => draft.action.allows_sections(),
+                    Err(_) => draft.partial == partial,
+                }
+        }) {
+            let PendingDraft { action, .. } = self.pending.take().unwrap();
+            match source {
+                Ok(source) => self.draft_from(key, source, action),
+                Err(error) => {
+                    if matches!(action, Pending::EditDraft(_)) {
+                        self.cancel_draft_edit();
+                    }
+                    self.error(format!("Not opened in the composer: {error}"));
+                }
+            }
+        }
+    }
+
     fn on_conversations(
         &mut self,
         i: usize,
@@ -2605,21 +2787,31 @@ impl App {
             .conversations
             .discarded
             .retain(|(f, _), _| f != folder);
-        if self.pending.as_ref().is_some_and(|(k, _)| stale(k)) {
+        if self.pending.as_ref().is_some_and(|draft| stale(&draft.key)) {
             self.pending = None;
         }
-        self.accounts[i].conversations.invalidate();
-    }
-
-    /// A reply, forward or draft waiting for this message's text, which
-    /// didn't come: dropped, saying why, so it doesn't open much later.
-    fn drop_pending(&mut self, key: &(usize, String, u32), why: &str) {
-        if self.pending.as_ref().is_some_and(|(k, _)| k == key) {
-            if matches!(self.pending.take(), Some((_, Pending::EditDraft(_)))) {
-                self.cancel_draft_edit();
-            }
-            self.error(format!("Not opened in the composer: {why}"));
+        self.agent_downloads.retain(|key, _| !stale(key));
+        for read in self.agent_reads.extract_if(.., |r| stale(&r.key)) {
+            let _ = read
+                .reply
+                .send(Err("The mailbox changed; search again".into()));
         }
+        let account = &self.accounts[i].id;
+        let stale_source = |s: &Kept| &s.account == account && s.folder == folder;
+        if self.picker.as_ref().is_some_and(
+            |p| matches!(&p.kind, PickerKind::Attachments { source, .. } if stale_source(source)),
+        ) {
+            self.picker = None;
+        }
+        if self
+            .pending_extraction
+            .as_ref()
+            .is_some_and(|(_, e)| stale_source(&e.source))
+        {
+            self.pending_extraction = None;
+            self.error("That message changed while its files were downloading");
+        }
+        self.accounts[i].conversations.invalidate();
     }
 
     /// The server changed `folder` (mail moved or added there).
@@ -2633,7 +2825,7 @@ impl App {
     }
 
     /// Makes the list's previews of these messages in the background.
-    fn make_previews(&self, i: usize, folder: String, messages: Vec<(u32, Arc<Vec<u8>>)>) {
+    fn make_previews(&self, i: usize, folder: String, messages: Vec<(u32, ReadSource)>) {
         if messages.is_empty() {
             return;
         }
@@ -2644,7 +2836,15 @@ impl App {
             move || {
                 messages
                     .into_iter()
-                    .map(|(uid, raw)| (uid, mail::preview_of(&raw)))
+                    .map(|(uid, source)| {
+                        let preview = match source {
+                            ReadSource::Whole(raw) => mail::preview_of(&raw),
+                            ReadSource::Sections(message) => {
+                                store::preview(&mail::plain_text(&message.parsed))
+                            }
+                        };
+                        (uid, preview)
+                    })
                     .collect::<Vec<_>>()
             },
             move |previews| {
@@ -2726,15 +2926,7 @@ impl App {
                 high: s.high,
             },
         );
-        let _ = self.store.set_counts(&id, &s.folder, s.unread, s.total);
-        if let Some(f) = self.accounts[i]
-            .folders
-            .iter_mut()
-            .find(|f| f.name == s.folder)
-        {
-            f.unread = s.unread;
-            f.total = s.total;
-        }
+        self.set_folder_counts(i, &s.folder, s.unread, s.total);
         // New unread mail in an inbox checked before is announced.
         let inbox = self.accounts[i].inbox() == s.folder;
         if inbox && before.high > 0 && !s.reset {
@@ -2747,6 +2939,17 @@ impl App {
         }
         if self.shows(i, &s.folder) {
             self.reload();
+        }
+    }
+
+    fn set_folder_counts(&mut self, i: usize, name: &str, unread: u32, total: u32) {
+        let account = &mut self.accounts[i];
+        if let Some(folder) = account.folders.iter_mut().find(|f| f.name == name)
+            && (folder.unread != unread || folder.total != total)
+        {
+            let _ = self.store.set_counts(&account.id, name, unread, total);
+            folder.unread = unread;
+            folder.total = total;
         }
     }
 
@@ -2769,7 +2972,7 @@ impl App {
             {
                 added.push(uid);
                 summaries.push(mail::summarize(&raw));
-                previews.push((uid, Arc::new(raw)));
+                previews.push((uid, ReadSource::whole(raw)));
             }
         }
         self.make_previews(i, "INBOX".into(), previews);
@@ -3673,13 +3876,14 @@ impl App {
                 }
                 return self.edit_reader_draft();
             }
-            if enter && reader.raw.is_none() && reader.error.is_some() {
+            if enter && reader.source.is_none() && reader.error.is_some() {
                 let thread = reader.thread.take();
                 let plain = reader.plain;
                 return self.open_message(index, mode, thread, plain);
             }
             if enter {
                 self.focus = Focus::Reader;
+                self.prioritize_reader();
                 self.mark_reader_read();
             }
             return;
@@ -3842,11 +4046,15 @@ impl App {
             }
         }
         if let Some(reader) = &mut self.reader {
+            let loading = reader.loading.is_some();
             reader.plain = Some(!reader.plain.unwrap_or(self.settings.prefer_plain));
             if reader.thread.is_some() {
                 reader.keep_reply_position = reader.body.is_some() && reader.error.is_none();
             } else {
                 reader.set_scroll(0);
+            }
+            if loading {
+                self.prioritize_reader();
             }
             self.render();
         }
@@ -3871,23 +4079,20 @@ impl App {
         let item = &self.items[index];
         let account = item.account;
         let uid = item.message.uid;
-        let id = &self.accounts[account].id;
-        let raw = self
-            .store
-            .body(id, &item.message.folder, uid)
-            .ok()
-            .flatten()
-            .map(Arc::new);
-        let have = raw.is_some();
         let enter = mode != OpenMode::Preview;
         let edit = mode == OpenMode::EditDraft;
+        let partial = !self.is_draft(account, &item.message);
+        let source = self.cached_source(account, &item.message.folder, uid, partial);
+        let have = source.is_some();
+        let loading = (!have && !self.demo && !self.accounts[account].is_pop()).then_some(partial);
         let focus_reader = enter && (!edit || thread.is_some());
         self.reader = Some(Reader {
             account,
             folder: item.message.folder.clone(),
             uid,
             message: item.message.clone(),
-            raw,
+            source,
+            loading,
             parsed: None,
             body: None,
             layout_generation: 0,
@@ -3912,28 +4117,51 @@ impl App {
         if focus_reader {
             self.focus = Focus::Reader;
         }
-        if mode == OpenMode::Read {
-            self.mark_reader_read();
-        }
         if have {
             self.render();
-        } else if self.demo || self.accounts[account].is_pop() {
-            if let Some(reader) = self.reader.as_mut() {
+        } else if let Some(reader) = self.reader.as_mut() {
+            if loading.is_some() {
+                let key = reader.key();
+                let size = reader.message.size;
+                self.download_body(&key, size, partial, enter);
+            } else {
                 reader.error = Some("This message's text isn't on this computer".into());
             }
-        } else if let Some(reader) = &self.reader {
-            self.send(
-                account,
-                Request::Body {
-                    folder: reader.folder.clone(),
-                    uid,
-                    uidvalidity: self.uidvalidity(account, &reader.folder),
-                },
-            );
+        }
+        if mode == OpenMode::Read {
+            self.mark_reader_read();
         }
         if edit {
             self.edit_reader_draft();
         }
+    }
+
+    fn cached_source(
+        &self,
+        account: usize,
+        folder: &str,
+        uid: u32,
+        partial: bool,
+    ) -> Option<ReadSource> {
+        let id = &self.accounts[account].id;
+        let cache = imap_timing::start();
+        let source = self
+            .store
+            .body(id, folder, uid)
+            .ok()
+            .flatten()
+            .map(ReadSource::whole);
+        let source = if partial && source.is_none() {
+            self.store
+                .partial(id, folder, uid, self.uidvalidity(account, folder))
+                .ok()
+                .flatten()
+                .map(|message| ReadSource::Sections(Arc::new(message)))
+        } else {
+            source
+        };
+        imap_timing::finish(cache, "cache-read", source.as_ref().map(|s| s.raw().len()));
+        source
     }
 
     /// Lays out the reader's message for the reader's width, in the
@@ -3947,7 +4175,7 @@ impl App {
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
-        let Some(raw) = reader.raw.clone() else {
+        let Some(source) = reader.source.clone() else {
             return;
         };
         // A link picker indexes the body being replaced.
@@ -3969,8 +4197,17 @@ impl App {
         let tx = self.tx.clone();
         mail::in_background(
             move || {
-                let parsed = parsed_before.or_else(|| mail::parse(&raw).map(Arc::new))?;
+                let parsed = if let Some(parsed) = parsed_before {
+                    parsed
+                } else {
+                    let parse = imap_timing::start();
+                    let parsed = source.parsed();
+                    imap_timing::finish(parse, "reader-parse", Some(source.raw().len()));
+                    parsed?
+                };
+                let layout = imap_timing::start();
                 let body = mail::render(&parsed, usize::from(width), options);
+                imap_timing::finish(layout, "reader-layout", Some(source.raw().len()));
                 Some((parsed, body))
             },
             move |result| {
@@ -4049,7 +4286,11 @@ impl App {
         if let Some(reader) = &mut self.reader {
             reader.draft_edit = None;
         }
-        if matches!(self.pending, Some((_, Pending::EditDraft(_)))) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|draft| matches!(draft.action, Pending::EditDraft(_)))
+        {
             self.pending = None;
         }
     }
@@ -4059,7 +4300,9 @@ impl App {
     fn cancel_left_draft_edit(&mut self) {
         let edit = self.reader.as_ref().and_then(|r| r.draft_edit);
         if edit.is_some() && !self.viewing_draft()
-            || matches!(self.pending, Some((_, Pending::EditDraft(id))) if Some(id) != edit)
+            || self.pending.as_ref().is_some_and(
+                |draft| matches!(draft.action, Pending::EditDraft(id) if Some(id) != edit),
+            )
         {
             self.cancel_draft_edit();
         }
@@ -5588,9 +5831,9 @@ impl App {
             .unwrap_or(agent::TEXT_CHARS)
             .clamp(200, agent::MAX_TEXT_CHARS);
         let id = self.accounts[key.0].id.clone();
-        match self.store.body(&id, &key.1, key.2) {
-            Ok(Some(raw)) => self.agent_render(key, raw, max, reply),
-            _ if self.accounts[key.0].is_pop() || self.demo => {
+        match self.cached_source(key.0, &key.1, key.2, true) {
+            Some(source) => self.agent_render(key, source, max, reply),
+            None if self.accounts[key.0].is_pop() || self.demo => {
                 let _ = reply.send(Err("This message's text isn't on this computer".into()));
             }
             _ => {
@@ -5616,14 +5859,7 @@ impl App {
                     }
                     self.agent_fetched.push_back((Instant::now(), size));
                     self.agent_downloads.insert(key.clone(), Instant::now());
-                    self.send(
-                        key.0,
-                        Request::Body {
-                            folder: key.1.clone(),
-                            uid: key.2,
-                            uidvalidity: self.uidvalidity(key.0, &key.1),
-                        },
-                    );
+                    self.download_body(&key, size as u32, false, false);
                 }
                 self.agent_reads.push(AgentRead {
                     key,
@@ -5649,7 +5885,7 @@ impl App {
     fn agent_render(
         &self,
         key: (usize, String, u32),
-        raw: Vec<u8>,
+        source: ReadSource,
         max: usize,
         reply: tokio::sync::oneshot::Sender<agent::Answer>,
     ) {
@@ -5669,7 +5905,10 @@ impl App {
             "starred": message.as_ref().map(|m| m.flags.flagged),
         });
         mail::in_background(
-            move || agent_text(&raw, max, header),
+            move || {
+                let parsed = source.parsed().ok_or("This message couldn't be read")?;
+                Ok(agent_text(&parsed, max, header))
+            },
             move |done| {
                 let _ =
                     reply.send(done.unwrap_or_else(|| Err("This message couldn't be read".into())));
@@ -6066,43 +6305,64 @@ impl App {
     /// Starts a reply or forward from `key`, once its text is here.
     fn start_from(&mut self, key: (usize, String, u32), pending: Pending) {
         self.cancel_draft_edit();
-        let raw = self
+        self.pending = None;
+        let partial = pending.allows_sections();
+        let source = self
             .reader
             .as_ref()
             .filter(|r| r.key() == key)
-            .and_then(|r| r.raw.clone())
-            .or_else(|| {
-                self.store
-                    .body(&self.accounts[key.0].id, &key.1, key.2)
-                    .ok()
-                    .flatten()
-                    .map(Arc::new)
-            });
-        self.start_from_raw(key, raw, pending);
+            .and_then(|r| r.source.as_ref())
+            .filter(|source| partial || matches!(source, ReadSource::Whole(_)))
+            .cloned()
+            .or_else(|| self.cached_source(key.0, &key.1, key.2, partial));
+        self.start_from_source(key, source, pending);
     }
 
-    fn start_from_raw(
+    fn start_from_source(
         &mut self,
         key: (usize, String, u32),
-        raw: Option<Arc<Vec<u8>>>,
+        source: Option<ReadSource>,
         pending: Pending,
     ) {
-        if let Some(raw) = raw {
-            return self.draft_from(key, raw, pending);
+        if let Some(source) = source {
+            return self.draft_from(key, source, pending);
         }
         if self.demo || self.accounts[key.0].is_pop() {
             return self.error("That message isn't downloaded");
         }
         self.info("Downloading the message…");
-        self.send(
-            key.0,
-            Request::Body {
-                folder: key.1.clone(),
-                uid: key.2,
-                uidvalidity: self.uidvalidity(key.0, &key.1),
-            },
-        );
-        self.pending = Some((key, pending));
+        let allow_sections = pending.allows_sections();
+        let loading = self
+            .reader
+            .as_ref()
+            .filter(|r| r.key() == key)
+            .and_then(|r| r.loading)
+            .filter(|&partial| allow_sections || !partial);
+        let partial = loading.unwrap_or(allow_sections);
+        if loading.is_some() {
+            self.prioritize_body(&key);
+        } else {
+            let size = self
+                .store
+                .message(&self.accounts[key.0].id, &key.1, key.2)
+                .ok()
+                .flatten()
+                .map_or(0, |message| message.size);
+            if let Some(reader) = self
+                .reader
+                .as_mut()
+                .filter(|r| r.key() == key && r.source.is_none() && r.loading.is_none())
+            {
+                reader.loading = Some(partial);
+                reader.error = None;
+            }
+            self.download_body(&key, size, partial, true);
+        }
+        self.pending = Some(PendingDraft {
+            key,
+            action: pending,
+            partial,
+        });
     }
 
     fn edit_reader_draft(&mut self) {
@@ -6112,26 +6372,21 @@ impl App {
         }
         reader.marked_read = true;
         let key = reader.key();
-        let raw = reader.raw.clone();
-        if raw.is_none() && (self.demo || self.accounts[reader.account].is_pop()) {
+        let source = reader
+            .source
+            .as_ref()
+            .filter(|s| matches!(s, ReadSource::Whole(_)))
+            .cloned();
+        if source.is_none() && (self.demo || self.accounts[reader.account].is_pop()) {
             return self.error("That message isn't downloaded");
         }
         self.next_draft_edit += 1;
         reader.draft_edit = Some(self.next_draft_edit);
         let pending = Pending::EditDraft(self.next_draft_edit);
-        if raw.is_none() && reader.error.is_none() {
-            // The preview already asked for the body.
-            self.info("Downloading the message…");
-            self.pending = Some((key, pending));
-        } else {
-            if raw.is_none() {
-                reader.error = None;
-            }
-            self.start_from_raw(key, raw, pending);
-        }
+        self.start_from_source(key, source, pending);
     }
 
-    fn draft_from(&mut self, key: (usize, String, u32), raw: Arc<Vec<u8>>, pending: Pending) {
+    fn draft_from(&mut self, key: (usize, String, u32), message: ReadSource, pending: Pending) {
         let account = self.accounts[key.0].account.clone();
         let source = self.kept(&key);
         let plain = self
@@ -6149,7 +6404,7 @@ impl App {
             move || {
                 Some(match pending {
                     Pending::Reply { all } => {
-                        let parsed = mail::parse(&raw)?;
+                        let parsed = message.parsed()?;
                         let draft = compose::reply(&parsed, &account, all);
                         (
                             Kind::Reply,
@@ -6159,13 +6414,19 @@ impl App {
                         )
                     }
                     Pending::Forward => {
-                        let (parsed, contents) = mail::parse_with_contents(&raw)?;
+                        let ReadSource::Whole(raw) = &message else {
+                            return None;
+                        };
+                        let (parsed, contents) = mail::parse_with_contents(raw)?;
                         let lost = contents.lost();
                         let draft = compose::forward(&parsed, contents.files, &account);
                         (Kind::Forward, draft, None, lost)
                     }
                     Pending::EditDraft(_) => {
-                        let (parsed, contents) = mail::parse_with_contents(&raw)?;
+                        let ReadSource::Whole(raw) = &message else {
+                            return None;
+                        };
+                        let (parsed, contents) = mail::parse_with_contents(raw)?;
                         let lost = contents.lost();
                         let draft = compose::from_saved(&parsed, contents);
                         (Kind::Draft, draft, None, lost)
@@ -6445,7 +6706,7 @@ impl App {
             };
             let id = self.accounts[i].id.clone();
             if let Ok(uid) = self.store.add_local(&id, &folder, &sent.raw, seen, None) {
-                self.make_previews(i, folder.clone(), vec![(uid, Arc::new(sent.raw))]);
+                self.make_previews(i, folder.clone(), vec![(uid, ReadSource::whole(sent.raw))]);
             }
             self.refresh_counts(i, &folder);
             if self.shows(i, &folder) {
@@ -6518,7 +6779,7 @@ impl App {
                 Ok(uid) => uid,
                 Err(e) => return self.error(format!("Not saved in Drafts: {e:#}")),
             };
-            self.make_previews(i, folder.clone(), vec![(uid, Arc::new(built.raw))]);
+            self.make_previews(i, folder.clone(), vec![(uid, ReadSource::whole(built.raw))]);
             self.refresh_counts(i, &folder);
             if self.shows(i, &folder) {
                 self.reload();
@@ -6725,7 +6986,10 @@ impl App {
 
     /// `A`: the message's attachments.
     fn pick_attachment(&mut self) {
-        let Some(parsed) = self.reader.as_ref().and_then(|r| r.parsed.as_ref()) else {
+        let Some(reader) = &self.reader else {
+            return;
+        };
+        let Some(parsed) = &reader.parsed else {
             return;
         };
         if parsed.attachments.is_empty() {
@@ -6737,7 +7001,10 @@ impl App {
             .map(|a| format!("{}  ({}, {})", a.name, a.mime, mail::size(a.size)))
             .collect();
         self.picker = Some(Picker {
-            kind: PickerKind::Attachments,
+            kind: PickerKind::Attachments {
+                source: self.kept(&reader.key()),
+                files: parsed.attachments.clone(),
+            },
             title: " Attachments ".into(),
             items,
             labels: Vec::new(),
@@ -6747,22 +7014,21 @@ impl App {
 
     /// The configured viewer of an attachment picker row, if any.
     pub fn attachment_opener(&self, index: usize) -> Option<&AttachmentOpener> {
-        let attachment = self
-            .reader
-            .as_ref()?
-            .parsed
-            .as_ref()?
-            .attachments
-            .get(index)?;
-        self.settings.attachment_opener(Path::new(&attachment.name))
+        let PickerKind::Attachments { files, .. } = &self.picker.as_ref()?.kind else {
+            return None;
+        };
+        self.settings
+            .attachment_opener(Path::new(&files.get(index)?.name))
     }
 
     /// Opens one attachment, or every file sharing its complete viewer rule.
     fn view_attachments(&mut self, index: usize, all: bool) {
-        let Some(parsed) = self.reader.as_ref().and_then(|r| r.parsed.as_ref()) else {
+        let Some(PickerKind::Attachments { source, files }) =
+            self.picker.as_ref().map(|picker| &picker.kind)
+        else {
             return;
         };
-        let Some(attachment) = parsed.attachments.get(index) else {
+        let Some(attachment) = files.get(index) else {
             return;
         };
         let opener = self.attachment_opener(index);
@@ -6770,35 +7036,65 @@ impl App {
             return self.info("No viewer configured for this file");
         }
         let files = if all {
-            parsed
-                .attachments
+            files
                 .iter()
                 .filter(|a| self.settings.attachment_opener(Path::new(&a.name)) == opener)
-                .map(|a| (a.index, a.name.clone()))
-                .collect::<Vec<_>>()
+                .cloned()
+                .collect()
         } else {
-            vec![(attachment.index, attachment.name.clone())]
+            vec![attachment.clone()]
         };
         let opener = if all { opener.cloned() } else { None };
+        let source = source.clone();
         self.picker = None;
-        if files.iter().any(|(_, name)| !tools::safe_to_open(name)) {
-            self.confirm(Confirm::OpenAttachments { files, opener });
+        if files.iter().any(|file| !tools::safe_to_open(&file.name)) {
+            self.confirm(Confirm::OpenAttachments {
+                source,
+                files,
+                opener,
+            });
         } else {
-            self.extract(files, true, false, opener);
+            self.extract(source, files, true, false, opener);
         }
+    }
+
+    fn attachment_source(&self, source: &Kept) -> Option<usize> {
+        let i = self.account_index(&source.account)?;
+        (self.uidvalidity(i, &source.folder) == source.uidvalidity
+            && self
+                .store
+                .has_message(&source.account, &source.folder, source.uid)
+                .unwrap_or(false))
+        .then_some(i)
     }
 
     /// Saves the listed files from one parse, opening them only once the
     /// whole batch is ready. A viewer keeps its files in our private folder.
     fn extract(
         &mut self,
-        files: Vec<(u32, String)>,
+        source: Kept,
+        files: Vec<mail::Attachment>,
         open: bool,
         confirmed: bool,
         opener: Option<AttachmentOpener>,
     ) {
-        let Some(raw) = self.reader.as_ref().and_then(|r| r.raw.clone()) else {
-            return;
+        let Some(i) = self.attachment_source(&source) else {
+            return self.error("That message changed since its files were listed");
+        };
+        let Some(reader) = self.reader.as_ref().filter(|r| {
+            (r.account, r.folder.as_str(), r.uid) == (i, source.folder.as_str(), source.uid)
+        }) else {
+            return self.error("That message changed since its files were listed");
+        };
+        let Some(message) = reader.source.clone() else {
+            return self.error("That message changed since its files were listed");
+        };
+        if !reader.parsed.as_ref().is_some_and(|parsed| {
+            files
+                .iter()
+                .all(|file| parsed.attachments.get(file.index as usize) == Some(file))
+        }) {
+            return self.error("That message changed since its files were listed");
         };
         if self.demo {
             return self.info("The demo's files are made up: nothing is saved");
@@ -6811,16 +7107,106 @@ impl App {
         let Some(dir) = dir else {
             return self.error("No folder to save in");
         };
+        let deferred = files
+            .iter()
+            .filter_map(|file| Some((file.name.clone(), Extraction::deferred(file)?.clone())))
+            .collect::<Vec<_>>();
+        let extraction = Extraction {
+            source,
+            message,
+            files,
+            dir,
+            open,
+            confirmed,
+            opener,
+        };
+        if deferred.is_empty() {
+            self.save_extraction(extraction, Vec::new());
+        } else if self.pending_extraction.is_some() {
+            self.info("An attachment download is already in progress");
+        } else {
+            let source = &extraction.source;
+            self.next_extraction += 1;
+            let id = self.next_extraction;
+            self.send(
+                i,
+                Request::Files {
+                    id,
+                    folder: source.folder.clone(),
+                    uid: source.uid,
+                    uidvalidity: source.uidvalidity,
+                    files: deferred,
+                },
+            );
+            self.pending_extraction = Some((id, extraction));
+            self.info("Downloading attachments…");
+        }
+    }
+
+    fn on_files(&mut self, i: usize, id: u64, result: Result<Vec<mail::File>, String>) {
+        if !self
+            .pending_extraction
+            .as_ref()
+            .is_some_and(|(pending, extraction)| {
+                *pending == id && extraction.source.account == self.accounts[i].id
+            })
+        {
+            return;
+        }
+        let (_, extraction) = self.pending_extraction.take().unwrap();
+        if self.attachment_source(&extraction.source) != Some(i) {
+            return self.error("That message changed while its files were downloading");
+        }
+        match result {
+            Ok(files) => self.save_extraction(extraction, files),
+            Err(error) => self.error(error),
+        }
+    }
+
+    fn save_extraction(&self, extraction: Extraction, downloaded: Vec<mail::File>) {
+        let Extraction {
+            source,
+            message,
+            files,
+            dir,
+            open,
+            confirmed,
+            opener,
+        } = extraction;
         let tx = self.tx.clone();
         mail::in_background(
             move || {
-                mail::attachments(&raw, &files, |name, bytes| {
-                    tools::save_new(&dir, name, bytes).map_err(|e| format!("{e:#}"))
-                })
+                let mut remote = files
+                    .iter()
+                    .filter(|file| Extraction::deferred(file).is_some());
+                if downloaded.iter().any(|file| {
+                    !remote.next().is_some_and(|expected| {
+                        file.name == expected.name && file.mime == expected.mime
+                    })
+                }) || remote.next().is_some()
+                {
+                    return Err("The server's attachments don't match the files listed".into());
+                }
+                let mut downloaded = downloaded.iter();
+                let mut selected = files.iter();
+                mail::attachments(
+                    message.raw(),
+                    files.iter().map(|file| (file.index, file.name.as_str())),
+                    |name, bytes| {
+                        let file = selected.next().expect("one result per listed file");
+                        let bytes = if Extraction::deferred(file).is_some() {
+                            &downloaded.next().expect("checked remote files").bytes
+                        } else {
+                            bytes
+                        };
+                        tools::save_new(&dir, name, bytes).map_err(|e| format!("{e:#}"))
+                    },
+                )
             },
             move |result| {
                 let result = result.unwrap_or_else(|| Err("That attachment can't be read".into()));
                 let _ = tx.send(AppEvent::Extracted {
+                    source,
                     open,
                     confirmed,
                     opener,
@@ -7881,9 +8267,11 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => picker.selected = 0,
             KeyCode::Char('G') | KeyCode::End => picker.selected = last,
-            KeyCode::Char('v') if picker.kind == PickerKind::Attachments => {
+            code @ (KeyCode::Enter | KeyCode::Char('v'))
+                if matches!(picker.kind, PickerKind::Attachments { .. }) =>
+            {
                 let n = picker.selected;
-                self.view_attachments(n, true);
+                self.view_attachments(n, code == KeyCode::Char('v'));
             }
             KeyCode::Enter | KeyCode::Char(' ' | 's' | 'y')
                 if match picker.kind {
@@ -7968,15 +8356,9 @@ impl App {
                             }
                         }
                     }
-                    (PickerKind::Attachments, KeyCode::Enter) => self.view_attachments(n, false),
-                    (PickerKind::Attachments, KeyCode::Char('s')) => {
-                        let attachment = self
-                            .reader
-                            .as_ref()
-                            .and_then(|r| r.parsed.as_ref())
-                            .and_then(|p| p.attachments.get(n).cloned());
-                        if let Some(a) = attachment {
-                            self.extract(vec![(a.index, a.name)], false, false, None);
+                    (PickerKind::Attachments { source, files }, KeyCode::Char('s')) => {
+                        if let Some(file) = files.into_iter().nth(n) {
+                            self.extract(source, vec![file], false, false, None);
                         }
                     }
                     _ => {}
@@ -8089,9 +8471,11 @@ impl App {
                 self.composer = None;
                 self.info("Discarded");
             }
-            Confirm::OpenAttachments { files, opener } if yes => {
-                self.extract(files, true, true, opener)
-            }
+            Confirm::OpenAttachments {
+                source,
+                files,
+                opener,
+            } if yes => self.extract(source, files, true, true, opener),
             Confirm::OpenLink { url, .. } if yes => self.open_link(&url),
             Confirm::RemoveAccount(i) if yes => self.remove_account(i),
             Confirm::Quit { .. } if yes => self.quit = true,
@@ -8128,6 +8512,13 @@ impl App {
         self.reader = None;
         for read in std::mem::take(&mut self.agent_reads) {
             let _ = read.reply.send(Err("The account was removed".into()));
+        }
+        if self
+            .pending_extraction
+            .as_ref()
+            .is_some_and(|(_, e)| e.source.account == id)
+        {
+            self.pending_extraction = None;
         }
         self.agent_downloads.clear();
         self.marked.clear();
@@ -10181,7 +10572,9 @@ pub mod tests {
             worker::Event::Body {
                 folder: "INBOX".into(),
                 uid: uids[1],
-                result: Ok(Some(DRAFT_CONVERSATION[1].to_vec())),
+                uidvalidity: 0,
+                partial: false,
+                result: Ok(Some(worker::Download::Full(DRAFT_CONVERSATION[1].to_vec()))),
             },
         );
 
@@ -10307,7 +10700,9 @@ pub mod tests {
             worker::Event::Body {
                 folder: drafts.clone(),
                 uid: old,
-                result: Ok(Some(DRAFT_CONVERSATION[1].to_vec())),
+                uidvalidity: 19,
+                partial: false,
+                result: Ok(Some(worker::Download::Full(DRAFT_CONVERSATION[1].to_vec()))),
             },
         );
         app.demo = true;
@@ -10975,12 +11370,18 @@ pub mod tests {
         let mut app = app();
         with_mail(&mut app);
         let key = app.items[0].key();
-        app.pending = Some((key.clone(), Pending::Reply { all: false }));
+        app.pending = Some(PendingDraft {
+            key: key.clone(),
+            action: Pending::Reply { all: false },
+            partial: true,
+        });
         app.on_worker(
             0,
             worker::Event::Body {
                 folder: key.1,
                 uid: key.2,
+                uidvalidity: 0,
+                partial: true,
                 result: Err("Not downloaded: the account is offline".into()),
             },
         );
@@ -11824,8 +12225,19 @@ pub mod tests {
         let other = b"From: a@b.c\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nx\r\n\
 --b\r\nContent-Type: application/octet-stream; name=\"run.desktop\"\r\n\r\nx\r\n--b--\r\n";
-        app.reader.as_mut().unwrap().raw = Some(Arc::new(other.to_vec()));
-        app.extract(vec![(0, "photo.jpg".into())], true, false, None);
+        let reader = app.reader.as_mut().unwrap();
+        let file = mail::Attachment {
+            index: 0,
+            name: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: 1,
+            remote: None,
+        };
+        Arc::make_mut(reader.parsed.as_mut().unwrap()).attachments = vec![file.clone()];
+        reader.source = Some(ReadSource::whole(other.to_vec()));
+        let key = reader.key();
+        let source = app.kept(&key);
+        app.extract(source, vec![file], true, false, None);
         app.wait_until(|a| a.status.as_ref().is_some_and(|s| s.error))
             .await;
         let status = app.status.as_ref().unwrap().text.clone();
@@ -11849,7 +12261,7 @@ pub mod tests {
         raw.push_str("--b--\r\n");
         let reader = app.reader.as_mut().unwrap();
         reader.parsed = Some(Arc::new(mail::parse(raw.as_bytes()).unwrap()));
-        reader.raw = Some(Arc::new(raw.into_bytes()));
+        reader.source = Some(ReadSource::whole(raw.into_bytes()));
     }
 
     #[cfg(unix)]
