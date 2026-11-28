@@ -5,16 +5,16 @@
 **Your mail, at the speed of your keyboard.**
 
 A terminal email client (TUI): IMAP and POP3 to read, SMTP to send, several accounts side by side.<br>
-Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from the internet when you read.
+Arrow keys or vim keys. Passwords in your system's keychain. No remote images or tracking pixels when you read.
 
 [![Release](https://img.shields.io/github/v/release/erictran308/tuimail)](https://github.com/erictran308/tuimail/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/tuimail.svg)](https://crates.io/crates/tuimail)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 
-**[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Google Contacts](#google-contacts)** · **[Settings](#settings)** · **[AI agents](#ai-agents-mcp)** · **[Privacy](#privacy-and-security)**
+**[Get started](#get-started)** · **[Keys](#keys)** · **[Writing](#writing)** · **[Accounts](#accounts)** · **[Google Contacts](#google-contacts)** · **[Settings](#settings)** · **[AI agents](#ai-agents-mcp)** · **[Privacy](#privacy-and-security)**
 
-<img src="docs/hero.png" alt="tuimail: a sidebar with All inboxes and two accounts' folders, beside the work inbox's messages with stars, replies and attachments marked, and Alice's message 'Lunch tomorrow?' open in the reader: its sender, the attached menu, an underlined link and quotes colored by depth">
+<img src="docs/hero.png" alt="tuimail demo: account folders, an inbox with colored sender names and dates, and Alice's message beside it with a blue link and a Plain text label on the reader border">
 
 <sub>The demo's made-up mail: <code>tuimail --demo</code></sub>
 
@@ -27,14 +27,14 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 - **IMAP, POP3 and SMTP.** IMAP accounts keep mail on the server, in its folders; POP3 accounts download the inbox and keep Sent, Drafts, Archive and Trash on your computer. Both send through SMTP, with TLS or STARTTLS.
 - **New mail at once.** Where the server can (IMAP IDLE), new mail shows the moment it arrives, with a notification through your terminal. Elsewhere tuimail checks every few minutes, and `R` checks now.
 - **Several accounts.** Each in the sidebar with its folders, and **All inboxes** together at the top. Write from any of them (`←` `→` on From).
-- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` opens, `gg` / `G`, `Ctrl-d` / `Ctrl-u`. `?` lists every key, and `O` opens the settings.
-- **Reading made calm.** HTML mail is shown as text (bold, italics, links numbered), with nothing it points to fetched: no tracking pixels, no "read" receipts by image. Quotes are colored by depth. The reader's top border shows **HTML** or **Plain text**. `H` switches between them when both are available, `o` lists the links, and `A` the attachments.
+- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` opens, `gg` / `G`, `Ctrl-d` / `Ctrl-u`. `F3` finds commands for where you are, `?` lists the keys, and `O` opens the settings.
+- **Reading made calm.** HTML mail is laid out as styled text. Quotes are colored by depth and trailing quotes can be hidden. Calendar invitation details appear inline. The reader's top border shows **HTML** or **Plain text**; `H` switches between them when both are available.
 - **Faster IMAP opens.** Opening a message takes priority over queued background checks, and the inbox is checked before refreshing other folders' counts. For supported multipart messages with large attachments, tuimail loads the text first. A deferred attachment is downloaded when you open or save it; forwarding still retrieves the complete message.
-- **Writing in place, or in your editor.** To, Cc, Bcc and Subject with addresses completed from people you've written to or heard from; the text in place, or `Ctrl-e` for `$EDITOR`. Drop a file on the window to attach it. Replies quote, forwards carry the attachments, drafts go to Drafts and open again where you left them.
+- **Writing in place, or in your editor.** Complete addresses from people you've written to or heard from. [Write a reply beside the original](#writing), compose in Markdown, or use `Ctrl-e` for your editor. Browse for files or drop them on the window to attach them.
 - **Quick to tidy.** `d` deletes (to Trash), `e` archives, `!` marks junk, `m` moves anywhere, `s` stars, `u` marks read or unread, `t` tags. `Space` marks several messages for any of these at once, and `z` undoes the last of them (`Z` lists them, to undo any). `U` unsubscribes from a mailing list.
 - **Conversations.** Replies sit under what they answer, the conversation with the newest message first. In settings (`O`), **Complete Gmail threads (All Mail and Sent)** adds the whole Gmail conversation when a member appears in Inbox, All inboxes or another folder. It requires Gmail's IMAP extensions and its All Mail folder: only matching headers are fetched as conversations come on screen, not the whole mailbox; bodies load when opened, and label copies appear once. Sent members use the Sent icon even when fetched from All Mail; other supplemental All Mail members use the All Mail icon. **Include Sent in threads** also adds related messages already cached from Sent and checks IMAP Sent along with the inbox. It works independently or alongside Gmail completion, including while that lookup is pending. Both options are off by default, and search still shows only its matches. Without the Gmail option, threads come from reply headers, the same for every server and POP3. Turn conversations off for a plain newest-first list.
 - **Tags.** Put `work`, `receipts` or any word on a message with `t`. IMAP accounts keep them on the server as keywords, spelled the way Thunderbird spells its tags, so the two show each other's; POP3 accounts keep them on your computer. (Gmail keeps them too, but its website shows only its labels.)
-- **Search.** `/` finds mail by sender, recipients, subject or text: at once in what's on your computer, then on the server, which searches whole messages. `tag:work` finds what's tagged.
+- **Structured search.** Combine words or phrases with filters for sender, recipient, subject, tag and date. IMAP folder search checks both the cache and whole messages on the server.
 - **AI agents, on your terms.** Claude Code, Claude Desktop, Cursor or any MCP client can read and sort your mail through `tuimail mcp`: mark, star, tag, move, mark spam, move to Trash. Each change asks you first (unless you say not to), shows on the screen and undoes with `z`. Agents can't delete anything for good, send, or open links.
 - **Works offline.** Headers and the text of opened messages are cached for offline reading, subject to size limits. Attachments that were deferred need a connection unless you've saved them separately.
 - **Set up in a minute.** Type your address and password: the servers fill in for Gmail, iCloud, Outlook, Yahoo, Fastmail, Proton (through its Bridge), Zoho, GMX, WEB.DE, Yandex, Mail.ru, Posteo, mailbox.org and more, or are guessed for others. tuimail logs in to check before saving.
@@ -42,6 +42,8 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 - **Private by design.** No account with anyone but your mail provider, no telemetry, no servers in between. Your mail, accounts and settings stay on your computer, readable only by you.
 
 ## Get started
+
+The install commands below use the latest release, which may not include everything described here. To run the current checkout, see [Development](#development).
 
 **1. Install tuimail.** If you have Rust and [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), that's one command, on any system:
 
@@ -155,7 +157,7 @@ Inbox and All inboxes conversations include related drafts from the same account
 
 To start with conversations collapsed, turn on **Collapse threads into conversations by default** in `O`. Changing the default resets individual `v` choices. The setting has no effect when threading is off or when viewing search results.
 
-Writing:
+### Writing
 
 | Key | Action |
 | --- | --- |
@@ -176,7 +178,7 @@ In a wide terminal, replies show the original beside the composer. Press `F2` to
 
 New messages start in plain text. Markdown sends formatted HTML alongside a plain-text alternative and keeps the editable source in Drafts. It supports CommonMark and strikethrough. Raw HTML stays literal, images become their alt text, and only web and email links are emitted. It never reads files or fetches images. If sharing a file, attach it explicitly.
 
-Turn on **Undo send** in `O` for five seconds to press `Esc` after approving a send. Canceling returns to the same editable draft. Nothing reaches SMTP until the window ends; this cannot recall a sent email.
+Turn on **Undo send** in `O` for a five-second countdown before sending. The countdown starts after any send confirmation. Press `Esc` during it to return to the same editable draft. Nothing reaches SMTP until the countdown ends; this cannot recall a sent email.
 
 ## Accounts
 
@@ -197,6 +199,8 @@ smtp_security = "tls"
 password = "keychain"              # "keychain", "ask" (each start) or "command"
 signature = "Sam"
 ```
+
+Leave `name` empty to show the email address in the sidebar. **Your name** in the setup screen fills `display_name`, which appears in outgoing mail as `Sam Taylor <me@example.org>`. If `display_name` is empty, the `From` header contains only the address.
 
 More keys: `username` and `smtp_username` (if not the address), `password_command` (below), `save_sent` (copy sent mail to Sent; off by default for Gmail and Outlook, which do it themselves), `certificate` (a server certificate to trust, for Proton Mail Bridge or your own server), `leave_on_server` (POP3, on by default), and `sent_folder`, `drafts_folder`, `trash_folder`, `archive_folder`, `junk_folder` when the server doesn't say which folder is which.
 
@@ -411,7 +415,7 @@ What an agent reads goes to its AI provider, as anything else you show it. AI ag
 
 ## Privacy and security
 
-- **Nothing fetched to read.** HTML is turned into text on your computer; pictures are shown by their description, never downloaded, so senders can't tell when you read their mail.
+- **No remote content while reading.** Tuimail downloads mail from your mail server, but it does not fetch external resources referenced by the message, such as tracking pixels. HTML is laid out on your computer and images are shown by their description.
 - **Signing in keeps no password.** With Microsoft or Google, you sign in on their page in your browser; tuimail keeps only the sign-in's token, in your keychain, and gets short-lived ones with it as needed. The browser comes back to tuimail on this computer only, and a sign-in is good only to the tuimail that asked for it (PKCE).
 - **Passwords stay out of files.** They're in your system's keychain (macOS Keychain, Windows Credential Manager, the Secret Service on Linux), asked for at each start, or printed by your own command. Never in `accounts.toml`, never on a command line.
 - **TLS, checked.** Connections use TLS (or STARTTLS, which must succeed before anything is sent) and your system's trusted certificates. An unencrypted connection is allowed only to a server on your own computer, at its loopback address; on Linux, only if that server runs as you or the system. On a computer shared with other accounts, prefer STARTTLS with `certificate` (as for Proton Mail Bridge): there, any account could answer on a free port.

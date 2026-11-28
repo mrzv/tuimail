@@ -6,8 +6,8 @@
 """Draws one frame of `tuimail --demo`, as exported by the
 `export_hero_screen` test, the way Ghostty shows it: every cell's character
 in JetBrains Mono, box lines and blocks drawn as Ghostty draws them, Nerd
-Font icons at Ghostty's size, links underlined. As tuitube's tools/hero.py,
-without the pictures."""
+Font icons at Ghostty's size, and text styled as exported. Adapted from
+tuitube's tools/hero.py."""
 
 import json
 import os
